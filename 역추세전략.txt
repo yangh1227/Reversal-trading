@@ -1,0 +1,454 @@
+//@version=5
+strategy("SR ALGO Combined Strategy", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=10, pyramiding=3)
+
+// ═══════════════════════════════════════════
+// 슈퍼트렌드 설정
+// ═══════════════════════════════════════════
+atrPeriod        = input(10, "ATR Length", group="슈퍼트렌드")
+factor           = input.float(3.0, "Factor", step=0.01, group="슈퍼트렌드")
+zone_sensitivity = input.float(1.0, "레버리지 존 감도", minval=0.1, maxval=10.0, step=0.1, group="슈퍼트렌드")
+show_history     = input.bool(true, "레버리지 변경 기록 표시", group="슈퍼트렌드")
+
+// ═══════════════════════════════════════════
+// QIP 설정
+// ═══════════════════════════════════════════
+sensitivity_mode = input.string("5-Normal", "📡 QIP 감도 모드", options=["1-Ultra Fine Max", "2-Ultra Fine", "3-Fine Max", "4-Fine", "5-Normal", "6-Broad Min", "7-Broad", "8-Broad Max", "9-Ultra Broad", "10-Ultra Broad Max"], group="⚙️ QIP 설정")
+zz_len_raw       = input.int(5,   "ZigZag Pivot 기본 길이", minval=2, maxval=50, group="⚙️ QIP 설정")
+atr_mult_raw     = input.float(1.5, "ATR 필터 배수", minval=0.1, maxval=5.0, step=0.1, group="⚙️ QIP 설정")
+use_volume       = input.bool(true,  "📊 Volume 필터", group="⚙️ QIP 설정")
+use_rsi_div      = input.bool(true,  "📈 RSI 다이버전스", group="⚙️ QIP 설정")
+use_macd_div     = input.bool(false, "📉 MACD 다이버전스", group="⚙️ QIP 설정")
+use_ema_conf     = input.bool(true,  "〰️ EMA 방향 확인", group="⚙️ QIP 설정")
+min_score        = input.int(2, "최소 복합 점수", minval=1, maxval=5, group="⚙️ QIP 설정")
+qip_rsi_len      = input.int(14, "RSI 길이", group="⚙️ QIP 설정")
+vol_ma_len       = input.int(20, "Volume MA 길이", group="⚙️ QIP 설정")
+qip_ema_fast     = input.int(21, "EMA Fast", group="⚙️ QIP 설정")
+qip_ema_slow     = input.int(55, "EMA Slow", group="⚙️ QIP 설정")
+
+qip_use_rsi_zone = input.bool(true, "RSI 존 필터 사용", group="📊 QIP RSI 존 필터")
+qip_rsi_bull_max = input.int(40, "상승 변곡 RSI 상한 (이하일 때만)", minval=10, maxval=60, group="📊 QIP RSI 존 필터")
+qip_rsi_bear_min = input.int(60, "하락 변곡 RSI 하한 (이상일 때만)", minval=40, maxval=90, group="📊 QIP RSI 존 필터")
+
+// ═══════════════════════════════════════════
+// QTP 설정
+// ═══════════════════════════════════════════
+qtp_sensitivity   = input.int(60, "QTP 감도 (1~100)", minval=1, maxval=100, group="⚙️ QTP 설정")
+qtp_ema_fast_len  = input.int(20, "Fast EMA", minval=1, group="⚙️ QTP 설정")
+qtp_ema_slow_len  = input.int(50, "Slow EMA", minval=2, group="⚙️ QTP 설정")
+qtp_use_trend     = input.bool(true, "추세 필터 사용", group="⚙️ QTP 설정")
+qtp_rsi_len       = input.int(14, "RSI Length", minval=2, group="⚙️ QTP 설정")
+qtp_stoch_len     = input.int(14, "Stoch Length", minval=2, group="⚙️ QTP 설정")
+qtp_atr_len       = input.int(14, "ATR Length", minval=1, group="⚙️ QTP 설정")
+qtp_dev_lookback  = input.int(50, "Deviation Lookback", minval=10, group="⚙️ QTP 설정")
+qtp_vol_len       = input.int(20, "Volume SMA Length", minval=2, group="⚙️ QTP 설정")
+qtp_min_pvt_left  = input.int(2, "Min Pivot Left", minval=1, maxval=20, group="⚙️ QTP 설정")
+qtp_max_pvt_left  = input.int(8, "Max Pivot Left", minval=1, maxval=30, group="⚙️ QTP 설정")
+
+qtp_use_rsi_zone  = input.bool(true, "RSI 존 필터 사용", group="📊 QTP RSI 존 필터")
+qtp_rsi_bull_max  = input.int(30, "상승 변곡 RSI 상한 (이하일 때만)", minval=10, maxval=50, group="📊 QTP RSI 존 필터")
+qtp_rsi_bear_min  = input.int(70, "하락 변곡 RSI 하한 (이상일 때만)", minval=50, maxval=90, group="📊 QTP RSI 존 필터")
+
+// 신호 선택
+use_qip    = input.bool(true,  "QIP 신호 사용", group="🎯 신호 선택", tooltip="Quant Inflection Point 신호 활성화")
+use_qtp    = input.bool(true,  "QTP 신호 사용", group="🎯 신호 선택", tooltip="Quant Turning Point 신호 활성화")
+beast_mode = input.bool(false, "🦁 비스트 모드 (1x 스킵 / 2x 50% + 3x 50%)", group="🎯 신호 선택", tooltip="활성화 시 1x 존 진입을 건너뛰고, 2x 존에서 자본의 50%, 3x 존에서 자본의 50% 진입")
+
+// ═══════════════════════════════════════════
+// 시각화
+// ═══════════════════════════════════════════
+show_labels  = input.bool(true, "🏷️ 레이블 표시", group="🎨 시각화")
+show_zigzag  = input.bool(true, "〰️ ZigZag 라인", group="🎨 시각화")
+show_score   = input.bool(true, "🔢 점수 표시", group="🎨 시각화")
+bull_col     = input.color(#00E5FF, "🔵 상승 색상", group="🎨 시각화")
+bear_col     = input.color(#FF1744, "🔴 하락 색상", group="🎨 시각화")
+neutral_col  = input.color(#FFD600, "🟡 중립 색상", group="🎨 시각화")
+
+// ═══════════════════════════════════════════
+// 슈퍼트렌드 계산
+// ═══════════════════════════════════════════
+[supertrend, direction] = ta.supertrend(factor, atrPeriod)
+atr_st   = ta.atr(atrPeriod)
+dist     = math.abs(close - supertrend)
+dist_atr = dist / atr_st
+
+zone3_thresh = 0.5 * zone_sensitivity
+zone2_thresh = 1.0 * zone_sensitivity
+lev_zone     = dist_atr < zone3_thresh ? 3 : dist_atr < zone2_thresh ? 2 : 1
+
+is_long_trend  = direction < 0
+is_short_trend = direction > 0
+
+trend_to_long  = is_long_trend  and not is_long_trend[1]
+trend_to_short = is_short_trend and not is_short_trend[1]
+
+// ═══════════════════════════════════════════
+// QIP 계산
+// ═══════════════════════════════════════════
+sens_mult = sensitivity_mode == "1-Ultra Fine Max" ? 0.3 : sensitivity_mode == "2-Ultra Fine" ? 0.5 : sensitivity_mode == "3-Fine Max" ? 0.65 : sensitivity_mode == "4-Fine" ? 0.8 : sensitivity_mode == "5-Normal" ? 1.0 : sensitivity_mode == "6-Broad Min" ? 1.25 : sensitivity_mode == "7-Broad" ? 1.5 : sensitivity_mode == "8-Broad Max" ? 1.75 : sensitivity_mode == "9-Ultra Broad" ? 2.0 : 2.5
+zz_left   = math.max(2, math.round(zz_len_raw * sens_mult))
+atr_mult  = atr_mult_raw / sens_mult
+atr_val   = ta.atr(14)
+
+[macd_raw, _, _] = ta.macd(close, 12, 26, 9)
+
+pivot_h = ta.pivothigh(high, zz_left, 1)
+pivot_l = ta.pivotlow(low,  zz_left, 1)
+
+ph_confirmed = not na(pivot_h)
+pl_confirmed = not na(pivot_l)
+
+ph_valid = ph_confirmed and (pivot_h - ta.lowest(low, zz_left * 2)[1] > atr_val[1] * atr_mult)
+pl_valid = pl_confirmed and (ta.highest(high, zz_left * 2)[1] - pivot_l > atr_val[1] * atr_mult)
+
+qip_rsi_val = ta.rsi(close, qip_rsi_len)[1]
+vol_ma      = ta.sma(volume, vol_ma_len)[1]
+vol_curr    = volume[1]
+qip_ema_f   = ta.ema(close, qip_ema_fast)[1]
+qip_ema_s   = ta.ema(close, qip_ema_slow)[1]
+macd_line   = macd_raw[1]
+
+qip_rsi_bull_ok = not qip_use_rsi_zone or qip_rsi_val <= qip_rsi_bull_max
+qip_rsi_bear_ok = not qip_use_rsi_zone or qip_rsi_val >= qip_rsi_bear_min
+
+prev_pl_rsi   = ta.valuewhen(pl_confirmed, ta.rsi(close, qip_rsi_len)[1], 1)
+prev_ph_rsi   = ta.valuewhen(ph_confirmed, ta.rsi(close, qip_rsi_len)[1], 1)
+prev_pl_val   = ta.valuewhen(pl_confirmed, pivot_l, 1)
+prev_ph_val   = ta.valuewhen(ph_confirmed, pivot_h, 1)
+prev_pl_macd  = ta.valuewhen(pl_confirmed, macd_raw[1], 1)
+prev_ph_macd  = ta.valuewhen(ph_confirmed, macd_raw[1], 1)
+
+bull_div      = pl_valid and qip_rsi_val > prev_pl_rsi and pivot_l < prev_pl_val
+bear_div      = ph_valid and qip_rsi_val < prev_ph_rsi and pivot_h > prev_ph_val
+bull_macd_div = pl_valid and macd_line > prev_pl_macd and pivot_l < prev_pl_val
+bear_macd_div = ph_valid and macd_line < prev_ph_macd and pivot_h > prev_ph_val
+
+bull_score = 0
+bull_score := pl_valid                                 ? bull_score + 1 : bull_score
+bull_score := use_rsi_div  and bull_div                ? bull_score + 1 : bull_score
+bull_score := use_macd_div and bull_macd_div           ? bull_score + 1 : bull_score
+bull_score := use_volume   and vol_curr > vol_ma * 1.2 ? bull_score + 1 : bull_score
+bull_score := use_ema_conf and qip_ema_f > qip_ema_s   ? bull_score + 1 : bull_score
+
+bear_score = 0
+bear_score := ph_valid                                 ? bear_score + 1 : bear_score
+bear_score := use_rsi_div  and bear_div                ? bear_score + 1 : bear_score
+bear_score := use_macd_div and bear_macd_div           ? bear_score + 1 : bear_score
+bear_score := use_volume   and vol_curr > vol_ma * 1.2 ? bear_score + 1 : bear_score
+bear_score := use_ema_conf and qip_ema_f < qip_ema_s   ? bear_score + 1 : bear_score
+
+qip_final_bull = use_qip and pl_valid and bull_score >= min_score and qip_rsi_bull_ok
+qip_final_bear = use_qip and ph_valid and bear_score >= min_score and qip_rsi_bear_ok
+
+// ═══════════════════════════════════════════
+// QTP 계산
+// ═══════════════════════════════════════════
+qtp_sens        = qtp_sensitivity / 100.0
+qtp_pivot_left  = int(math.round(qtp_max_pvt_left - (qtp_max_pvt_left - qtp_min_pvt_left) * qtp_sens))
+qtp_rsi_upper   = 70 - math.round(10 * qtp_sens)
+qtp_rsi_lower   = 30 + math.round(10 * qtp_sens)
+qtp_stoch_upper = 80 - math.round(10 * qtp_sens)
+qtp_stoch_lower = 20 + math.round(10 * qtp_sens)
+qtp_score_thr   = 55 - math.round(15 * qtp_sens)
+
+qtp_ema_fast_val = ta.ema(close, qtp_ema_fast_len)
+qtp_ema_slow_val = ta.ema(close, qtp_ema_slow_len)
+qtp_atr          = ta.atr(qtp_atr_len)
+qtp_rsi          = ta.rsi(close, qtp_rsi_len)
+qtp_stoch        = ta.stoch(close, high, low, qtp_stoch_len)
+qtp_vol_sma      = ta.sma(volume, qtp_vol_len)
+
+qtp_basis  = ta.ema(close, qtp_dev_lookback)
+qtp_dev    = qtp_atr > 0 ? (close - qtp_basis) / qtp_atr : 0.0
+qtp_d_mean = ta.sma(qtp_dev, qtp_dev_lookback)
+qtp_d_std  = ta.stdev(qtp_dev, qtp_dev_lookback)
+qtp_zDev   = qtp_d_std != 0 ? (qtp_dev - qtp_d_mean) / qtp_d_std : 0.0
+
+qtp_body       = math.abs(close - open)
+qtp_range      = high - low
+qtp_upper_wick = high - math.max(open, close)
+qtp_lower_wick = math.min(open, close) - low
+
+qtp_bull_rev  = qtp_range > 0 and qtp_lower_wick > qtp_body * 1.2 and close > open
+qtp_bear_rev  = qtp_range > 0 and qtp_upper_wick > qtp_body * 1.2 and close < open
+qtp_vol_spike = volume > qtp_vol_sma * (1.1 + 0.5 * qtp_sens)
+qtp_up_trend  = qtp_ema_fast_val > qtp_ema_slow_val
+qtp_dn_trend  = qtp_ema_fast_val < qtp_ema_slow_val
+qtp_roc1      = close - close[1]
+qtp_roc2      = close[1] - close[2]
+
+float qtp_bot_score = 0.0
+float qtp_top_score = 0.0
+
+qtp_bot_score += qtp_rsi[1] < qtp_rsi_lower  ? 18 : 0
+qtp_top_score += qtp_rsi[1] > qtp_rsi_upper  ? 18 : 0
+qtp_bot_score += qtp_stoch[1] < qtp_stoch_lower ? 12 : 0
+qtp_top_score += qtp_stoch[1] > qtp_stoch_upper ? 12 : 0
+qtp_bot_score += qtp_zDev[1] < -(1.0 + (1.0 - qtp_sens) * 0.8) ? 22 : 0
+qtp_top_score += qtp_zDev[1] >  (1.0 + (1.0 - qtp_sens) * 0.8) ? 22 : 0
+qtp_bot_score += qtp_bull_rev[1] ? 16 : 0
+qtp_top_score += qtp_bear_rev[1] ? 16 : 0
+qtp_bot_score += (qtp_vol_spike[1] and close[1] > low[1])  ? 10 : 0
+qtp_top_score += (qtp_vol_spike[1] and close[1] < high[1]) ? 10 : 0
+qtp_bot_score += (qtp_roc2[1] < 0 and qtp_roc1[1] > qtp_roc2[1]) ? 10 : 0
+qtp_top_score += (qtp_roc2[1] > 0 and qtp_roc1[1] < qtp_roc2[1]) ? 10 : 0
+
+if qtp_use_trend
+    qtp_bot_score += qtp_up_trend[1] ? 8 : 0
+    qtp_top_score += qtp_dn_trend[1] ? 8 : 0
+
+qtp_bot_score := math.min(qtp_bot_score, 100)
+qtp_top_score := math.min(qtp_top_score, 100)
+
+qtp_rsi_bull_ok = not qtp_use_rsi_zone or qtp_rsi[1] <= qtp_rsi_bull_max
+qtp_rsi_bear_ok = not qtp_use_rsi_zone or qtp_rsi[1] >= qtp_rsi_bear_min
+
+qtp_pLow  = ta.pivotlow(low,  qtp_pivot_left, 1)
+qtp_pHigh = ta.pivothigh(high, qtp_pivot_left, 1)
+
+qtp_final_bull = use_qtp and not na(qtp_pLow)  and qtp_bot_score >= qtp_score_thr and qtp_rsi_bull_ok
+qtp_final_bear = use_qtp and not na(qtp_pHigh) and qtp_top_score >= qtp_score_thr and qtp_rsi_bear_ok
+
+// ═══════════════════════════════════════════
+// 통합 신호 (QIP OR QTP)
+// ═══════════════════════════════════════════
+final_bull = qip_final_bull or qtp_final_bull
+final_bear = qip_final_bear or qtp_final_bear
+
+// ═══════════════════════════════════════════
+// 피라미딩 존 추적
+// ═══════════════════════════════════════════
+var bool long_zone1_used  = false
+var bool long_zone2_used  = false
+var bool long_zone3_used  = false
+var bool short_zone1_used = false
+var bool short_zone2_used = false
+var bool short_zone3_used = false
+var int  last_long_zone   = 0
+var int  last_short_zone  = 0
+
+if strategy.position_size == 0
+    long_zone1_used  := false
+    long_zone2_used  := false
+    long_zone3_used  := false
+    short_zone1_used := false
+    short_zone2_used := false
+    short_zone3_used := false
+    last_long_zone   := 0
+    last_short_zone  := 0
+
+// ═══════════════════════════════════════════
+// 진입 조건
+// ═══════════════════════════════════════════
+// 첫 진입: 어느 존이든 가능 (last_zone == 0)
+// 추가 진입: 반드시 직전 진입 존 + 1만 가능 (역추세 물타기 순차 진입)
+// 비스트 모드: 1x 존 진입 완전 스킵
+can_long_z1  = not beast_mode and is_long_trend  and final_bull and lev_zone == 1 and not long_zone1_used  and last_long_zone == 0
+can_long_z2  = is_long_trend  and final_bull and lev_zone == 2 and not long_zone2_used  and (last_long_zone == 0 or last_long_zone == 1)
+can_long_z3  = is_long_trend  and final_bull and lev_zone == 3 and not long_zone3_used  and (last_long_zone == 0 or last_long_zone == 2)
+can_short_z1 = not beast_mode and is_short_trend and final_bear and lev_zone == 1 and not short_zone1_used and last_short_zone == 0
+can_short_z2 = is_short_trend and final_bear and lev_zone == 2 and not short_zone2_used and (last_short_zone == 0 or last_short_zone == 1)
+can_short_z3 = is_short_trend and final_bear and lev_zone == 3 and not short_zone3_used and (last_short_zone == 0 or last_short_zone == 2)
+
+// ═══════════════════════════════════════════
+// 전략 실행
+// ═══════════════════════════════════════════
+
+// 손절: 슈퍼트렌드 방향 전환
+if trend_to_short and strategy.position_size > 0
+    strategy.close_all(comment="손절-추세전환")
+    long_zone1_used := false
+    long_zone2_used := false
+    long_zone3_used := false
+    last_long_zone  := 0
+
+if trend_to_long and strategy.position_size < 0
+    strategy.close_all(comment="손절-추세전환")
+    short_zone1_used := false
+    short_zone2_used := false
+    short_zone3_used := false
+    last_short_zone  := 0
+
+// 익절: 반대 변곡 신호
+if final_bear and strategy.position_size > 0
+    strategy.close_all(comment="익절-하락변곡")
+    long_zone1_used := false
+    long_zone2_used := false
+    long_zone3_used := false
+    last_long_zone  := 0
+
+if final_bull and strategy.position_size < 0
+    strategy.close_all(comment="익절-상승변곡")
+    short_zone1_used := false
+    short_zone2_used := false
+    short_zone3_used := false
+    last_short_zone  := 0
+
+// 비스트 모드 수량 계산 (자본의 50%)
+beast_qty = strategy.equity * 0.5 / close
+
+// 롱 진입
+if can_long_z1
+    strategy.entry("Long Z1", strategy.long, comment="롱 1x")
+    long_zone1_used := true
+    last_long_zone  := 1
+if can_long_z2
+    if beast_mode
+        strategy.entry("Long Z2", strategy.long, qty=beast_qty, comment="🦁 비스트 2x 50%")
+    else
+        strategy.entry("Long Z2", strategy.long, comment="롱 2x")
+    long_zone2_used := true
+    last_long_zone  := 2
+if can_long_z3
+    if beast_mode
+        beast_qty_z3 = last_long_zone == 0 ? strategy.equity / close : beast_qty
+        beast_cmt_z3 = last_long_zone == 0 ? "🦁 비스트 3x 100%" : "🦁 비스트 3x 50%"
+        strategy.entry("Long Z3", strategy.long, qty=beast_qty_z3, comment=beast_cmt_z3)
+    else
+        strategy.entry("Long Z3", strategy.long, comment="롱 3x")
+    long_zone3_used := true
+    last_long_zone  := 3
+
+// 숏 진입
+if can_short_z1
+    strategy.entry("Short Z1", strategy.short, comment="숏 1x")
+    short_zone1_used := true
+    last_short_zone  := 1
+if can_short_z2
+    if beast_mode
+        strategy.entry("Short Z2", strategy.short, qty=beast_qty, comment="🦁 비스트 2x 50%")
+    else
+        strategy.entry("Short Z2", strategy.short, comment="숏 2x")
+    short_zone2_used := true
+    last_short_zone  := 2
+if can_short_z3
+    if beast_mode
+        beast_qty_z3s = last_short_zone == 0 ? strategy.equity / close : beast_qty
+        beast_cmt_z3s = last_short_zone == 0 ? "🦁 비스트 3x 100%" : "🦁 비스트 3x 50%"
+        strategy.entry("Short Z3", strategy.short, qty=beast_qty_z3s, comment=beast_cmt_z3s)
+    else
+        strategy.entry("Short Z3", strategy.short, comment="숏 3x")
+    short_zone3_used := true
+    last_short_zone  := 3
+
+// ═══════════════════════════════════════════
+// 슈퍼트렌드 시각화
+// ═══════════════════════════════════════════
+st_col    = is_long_trend ? color.new(color.green, 0) : color.new(color.red, 0)
+zone_col3 = #FF1744
+zone_col2 = #FF9100
+zone_col1 = #00E5FF
+cur_col   = lev_zone == 3 ? zone_col3 : lev_zone == 2 ? zone_col2 : zone_col1
+
+plot(supertrend, "Supertrend", color=st_col, linewidth=2)
+
+sign       = is_long_trend ? 1.0 : -1.0
+zone2_line = supertrend + sign * zone2_thresh * atr_st
+zone3_line = supertrend + sign * zone3_thresh * atr_st
+
+plot(zone2_line, "2x Zone", color=color.new(zone_col2, 50), linewidth=1)
+plot(zone3_line, "3x Zone", color=color.new(zone_col3, 50), linewidth=1)
+
+bgcolor(lev_zone == 3 ? color.new(zone_col3, 88) : lev_zone == 2 ? color.new(zone_col2, 88) : color.new(zone_col1, 92))
+
+var int prev_zone = na
+zone_changed = not na(prev_zone) and lev_zone != prev_zone
+lev_up       = zone_changed and lev_zone > prev_zone[1]
+prev_zone   := lev_zone
+
+if show_history and zone_changed
+    from_z  = prev_zone[1]
+    to_z    = lev_zone
+    to_col  = to_z == 3 ? zone_col3 : to_z == 2 ? zone_col2 : zone_col1
+    arrow   = lev_up ? "↑" : "↓"
+    lbl_txt = arrow + " " + str.tostring(from_z) + "x → " + str.tostring(to_z) + "x"
+    y_pos   = is_long_trend ? supertrend - atr_st * 0.8 : supertrend + atr_st * 0.8
+    l_style = is_long_trend ? label.style_label_up : label.style_label_down
+    label.new(bar_index, y_pos, lbl_txt, style=l_style, color=color.new(to_col, 20), textcolor=color.white, size=size.small)
+
+var label cur_zone_lbl = na
+if not na(cur_zone_lbl)
+    label.delete(cur_zone_lbl)
+    cur_zone_lbl := na
+lev_txt      = lev_zone == 3 ? "🔥 3x ZONE" : lev_zone == 2 ? "⚡ 2x ZONE" : "✦ 1x ZONE"
+cur_zone_lbl := label.new(bar_index, supertrend, lev_txt, style=label.style_label_left, color=color.new(cur_col, 20), textcolor=color.white, size=size.normal)
+
+// ═══════════════════════════════════════════
+// QIP 레이블 + ZigZag
+// ═══════════════════════════════════════════
+var float last_zz_price = na
+var int   last_zz_bar   = na
+var bool  last_zz_bull  = na
+
+if (qip_final_bull or qip_final_bear) and show_zigzag
+    cur_price = qip_final_bull ? pivot_l : pivot_h
+    cur_bar   = bar_index - 1
+    if not na(last_zz_price)
+        line.new(last_zz_bar, last_zz_price, cur_bar, cur_price, color=last_zz_bull ? bull_col : bear_col, width=2)
+    last_zz_price := cur_price
+    last_zz_bar   := cur_bar
+    last_zz_bull  := qip_final_bull
+
+score_to_star(s) =>
+    s >= 5 ? "★★★★★" : s == 4 ? "★★★★☆" : s == 3 ? "★★★☆☆" : s == 2 ? "★★☆☆☆" : "★☆☆☆☆"
+
+if qip_final_bull and show_labels
+    lbl_txt = show_score ? "▲ QIP 상승\n" + score_to_star(bull_score) + " (" + str.tostring(bull_score) + "/5)\nRSI " + str.tostring(qip_rsi_val, "#.#") : "▲ QIP 상승"
+    label.new(bar_index - 1, pivot_l, text=lbl_txt, style=label.style_label_up, color=color.new(bull_col, 0), textcolor=color.white, size=bull_score >= 4 ? size.normal : size.small)
+
+if qip_final_bear and show_labels
+    lbl_txt = show_score ? "▼ QIP 하락\n" + score_to_star(bear_score) + " (" + str.tostring(bear_score) + "/5)\nRSI " + str.tostring(qip_rsi_val, "#.#") : "▼ QIP 하락"
+    label.new(bar_index - 1, pivot_h, text=lbl_txt, style=label.style_label_down, color=color.new(bear_col, 0), textcolor=color.white, size=bear_score >= 4 ? size.normal : size.small)
+
+// ═══════════════════════════════════════════
+// QTP 레이블
+// ═══════════════════════════════════════════
+if qtp_final_bull and show_labels
+    lbl_txt = show_score ? "▲ QTP BOT\nScore: " + str.tostring(math.round(qtp_bot_score)) + "\nRSI " + str.tostring(math.round(qtp_rsi[1])) : "▲ QTP BOT"
+    label.new(bar_index - 1, low[1] - qtp_atr[1] * 0.3, lbl_txt, style=label.style_label_up, color=color.new(color.teal, 0), textcolor=color.white, size=size.small)
+
+if qtp_final_bear and show_labels
+    lbl_txt = show_score ? "▼ QTP TOP\nScore: " + str.tostring(math.round(qtp_top_score)) + "\nRSI " + str.tostring(math.round(qtp_rsi[1])) : "▼ QTP TOP"
+    label.new(bar_index - 1, high[1] + qtp_atr[1] * 0.3, lbl_txt, style=label.style_label_down, color=color.new(color.purple, 0), textcolor=color.white, size=size.small)
+
+// EMA
+plot(ta.ema(close, qip_ema_fast), "QIP EMA Fast", color=color.new(bull_col, 60), linewidth=1)
+plot(ta.ema(close, qip_ema_slow), "QIP EMA Slow", color=color.new(bear_col, 60), linewidth=1)
+
+// ═══════════════════════════════════════════
+// 대시보드
+// ═══════════════════════════════════════════
+var table dash = table.new(position.top_right, 2, 12, border_width=1, border_color=color.new(color.gray, 60), bgcolor=color.new(color.black, 75), frame_width=1, frame_color=color.new(color.gray, 60))
+
+if barstate.islast
+    table.clear(dash, 0, 0, 1, 11)
+    table.cell(dash, 0, 0, "SR ALGO", bgcolor=color.new(color.gray, 50), text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 0, is_long_trend ? "▲ 롱추세" : "▼ 숏추세", bgcolor=color.new(color.gray, 50), text_color=is_long_trend ? color.green : color.red, text_size=size.small)
+    table.cell(dash, 0, 1, "현재 존",   text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 1, str.tostring(lev_zone) + "x ZONE", text_color=cur_col, text_size=size.small)
+    table.cell(dash, 0, 2, "거리(ATR)", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 2, str.tostring(dist_atr, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 3, "포지션",    text_color=color.silver, text_size=size.small)
+    pos_txt = strategy.position_size > 0 ? "▲ LONG" : strategy.position_size < 0 ? "▼ SHORT" : "없음"
+    pos_col = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray
+    table.cell(dash, 1, 3, pos_txt, text_color=pos_col, text_size=size.small)
+    table.cell(dash, 0, 4, "1x 존", text_color=color.silver, text_size=size.small)
+    z1u = strategy.position_size > 0 ? long_zone1_used : short_zone1_used
+    table.cell(dash, 1, 4, z1u ? "✓ 사용" : "○ 대기", text_color=z1u ? zone_col1 : color.gray, text_size=size.small)
+    table.cell(dash, 0, 5, "2x 존", text_color=color.silver, text_size=size.small)
+    z2u = strategy.position_size > 0 ? long_zone2_used : short_zone2_used
+    table.cell(dash, 1, 5, z2u ? "✓ 사용" : "○ 대기", text_color=z2u ? zone_col2 : color.gray, text_size=size.small)
+    table.cell(dash, 0, 6, "3x 존", text_color=color.silver, text_size=size.small)
+    z3u = strategy.position_size > 0 ? long_zone3_used : short_zone3_used
+    table.cell(dash, 1, 6, z3u ? "✓ 사용" : "○ 대기", text_color=z3u ? zone_col3 : color.gray, text_size=size.small)
+    rsi_now = ta.rsi(close, qip_rsi_len)
+    rsi_col = rsi_now > 70 ? bear_col : rsi_now < 30 ? bull_col : color.white
+    table.cell(dash, 0, 7, "RSI",      text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 7, str.tostring(rsi_now, "#.#"), text_color=rsi_col, text_size=size.small)
+    table.cell(dash, 0, 8, "QIP 감도", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 8, sensitivity_mode, text_color=neutral_col, text_size=size.small)
+    table.cell(dash, 0, 9, "QTP 감도", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 9, str.tostring(qtp_sensitivity), text_color=neutral_col, text_size=size.small)
+    table.cell(dash, 0, 10, "QIP 신호", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 10, use_qip ? "ON" : "OFF", text_color=use_qip ? color.green : color.gray, text_size=size.small)
+    table.cell(dash, 0, 11, "QTP 신호", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 11, use_qtp ? "ON" : "OFF", text_color=use_qtp ? color.green : color.gray, text_size=size.small)

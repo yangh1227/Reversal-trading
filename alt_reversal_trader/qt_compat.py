@@ -1,0 +1,142 @@
+from __future__ import annotations
+
+try:
+    from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal as Signal
+    from PyQt5.QtWidgets import (
+        QAbstractItemView,
+        QApplication,
+        QCheckBox,
+        QComboBox as _QComboBox,
+        QDoubleSpinBox as _QDoubleSpinBox,
+        QFormLayout,
+        QGridLayout,
+        QGroupBox,
+        QHBoxLayout,
+        QHeaderView,
+        QLabel,
+        QLineEdit,
+        QMainWindow,
+        QMessageBox,
+        QPlainTextEdit,
+        QPushButton,
+        QScrollArea,
+        QSpinBox as _QSpinBox,
+        QSplitter,
+        QTableWidget,
+        QTableWidgetItem,
+        QTabWidget,
+        QVBoxLayout,
+        QWidget,
+    )
+
+    QT_API = "PyQt5"
+
+    def app_exec(app: QApplication) -> int:
+        return app.exec_()
+
+    HORIZONTAL = Qt.Horizontal
+    VERTICAL = Qt.Vertical
+    ALIGN_LEFT = Qt.AlignLeft
+    USER_ROLE = Qt.UserRole
+    PASSWORD_ECHO = QLineEdit.Password
+    SELECT_ROWS = QAbstractItemView.SelectRows
+    SINGLE_SELECTION = QAbstractItemView.SingleSelection
+    NO_EDIT_TRIGGERS = QAbstractItemView.NoEditTriggers
+
+except ImportError:
+    from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal as Signal
+    from PyQt6.QtWidgets import (
+        QAbstractItemView,
+        QApplication,
+        QCheckBox,
+        QComboBox as _QComboBox,
+        QDoubleSpinBox as _QDoubleSpinBox,
+        QFormLayout,
+        QGridLayout,
+        QGroupBox,
+        QHBoxLayout,
+        QHeaderView,
+        QLabel,
+        QLineEdit,
+        QMainWindow,
+        QMessageBox,
+        QPlainTextEdit,
+        QPushButton,
+        QScrollArea,
+        QSpinBox as _QSpinBox,
+        QSplitter,
+        QTableWidget,
+        QTableWidgetItem,
+        QTabWidget,
+        QVBoxLayout,
+        QWidget,
+    )
+
+    QT_API = "PyQt6"
+
+    def app_exec(app: QApplication) -> int:
+        return app.exec()
+
+    HORIZONTAL = Qt.Orientation.Horizontal
+    VERTICAL = Qt.Orientation.Vertical
+    ALIGN_LEFT = Qt.AlignmentFlag.AlignLeft
+    USER_ROLE = Qt.ItemDataRole.UserRole
+    PASSWORD_ECHO = QLineEdit.EchoMode.Password
+    SELECT_ROWS = QAbstractItemView.SelectionBehavior.SelectRows
+    SINGLE_SELECTION = QAbstractItemView.SelectionMode.SingleSelection
+    NO_EDIT_TRIGGERS = QAbstractItemView.EditTrigger.NoEditTriggers
+
+
+class QSpinBox(_QSpinBox):
+    def wheelEvent(self, event):  # type: ignore[override]
+        event.ignore()
+
+
+class QDoubleSpinBox(_QDoubleSpinBox):
+    def wheelEvent(self, event):  # type: ignore[override]
+        event.ignore()
+
+
+class QComboBox(_QComboBox):
+    def wheelEvent(self, event):  # type: ignore[override]
+        event.ignore()
+
+
+__all__ = [
+    "ALIGN_LEFT",
+    "HORIZONTAL",
+    "PASSWORD_ECHO",
+    "QT_API",
+    "NO_EDIT_TRIGGERS",
+    "SELECT_ROWS",
+    "SINGLE_SELECTION",
+    "Signal",
+    "USER_ROLE",
+    "VERTICAL",
+    "QApplication",
+    "QCheckBox",
+    "QComboBox",
+    "QDoubleSpinBox",
+    "QFormLayout",
+    "QGridLayout",
+    "QGroupBox",
+    "QHBoxLayout",
+    "QHeaderView",
+    "QLabel",
+    "QLineEdit",
+    "QMainWindow",
+    "QMessageBox",
+    "QPlainTextEdit",
+    "QPushButton",
+    "QScrollArea",
+    "QSpinBox",
+    "QSplitter",
+    "QTableWidget",
+    "QTableWidgetItem",
+    "QTabWidget",
+    "QThread",
+    "QTimer",
+    "QVBoxLayout",
+    "QWidget",
+    "app_exec",
+]

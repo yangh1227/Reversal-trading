@@ -1,0 +1,6 @@
+PyQt5
+PyQtWebEngine
+pandas
+pandas_ta
+numpy
+requests
