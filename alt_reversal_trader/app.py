@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections import deque
 import json
+import multiprocessing as mp
 from pathlib import Path
+import time
 from typing import Dict, List, Optional
 import traceback
 
@@ -13,9 +16,10 @@ from plotly.subplots import make_subplots
 from lightweight_charts.widgets import QtChart
 import websocket
 
-from .binance_futures import BinanceFuturesClient, CandidateSymbol
+from .binance_futures import BinanceFuturesClient, CandidateSymbol, PositionSnapshot, resample_ohlcv, resolve_base_interval
 from .config import APP_INTERVAL_OPTIONS, CHART_ENGINE_OPTIONS, PARAMETER_SPECS, AppSettings, StrategySettings
-from .optimizer import OptimizationResult, optimize_symbol
+from .crash_logger import log_runtime_event
+from .optimizer import OptimizationResult, optimize_symbol_intervals
 from .qt_compat import (
     HORIZONTAL,
     NO_EDIT_TRIGGERS,
@@ -52,13 +56,25 @@ from .qt_compat import (
     QWidget,
     Signal,
 )
-from .strategy import BacktestResult, compute_indicators, estimate_warmup_bars, run_backtest
+from .strategy import (
+    CHART_INDICATOR_COLUMNS,
+    BacktestResult,
+    compact_indicator_frame,
+    compute_indicators,
+    estimate_warmup_bars,
+    prepare_ohlcv,
+    run_backtest,
+)
 
 
-CHART_HISTORY_BAR_LIMIT = 20_000
+CHART_HISTORY_BAR_LIMIT = 8_000
+CHART_HISTORY_FETCH_FALLBACK_MIN_BARS = 2_000
 BACKTEST_WARMUP_BAR_FLOOR = 1_500
-DEFAULT_CHART_LOOKBACK_HOURS = 12
+DEFAULT_CHART_LOOKBACK_HOURS = 3
+DEFAULT_CHART_RIGHT_PAD_BARS = 4
 LIVE_RENDER_INTERVAL_MS = 500
+OPTIMIZED_TABLE_REFRESH_MS = 250
+HISTORY_CACHE_SYMBOL_LIMIT = 10
 
 
 def _interval_to_ms(interval: str) -> int:
@@ -78,8 +94,8 @@ def _backtest_start_time_ms(settings: AppSettings) -> int:
     return now_ms - settings.history_days * 86_400_000
 
 
-def _history_fetch_start_time_ms(settings: AppSettings) -> int:
-    interval_ms = _interval_to_ms(settings.kline_interval)
+def _history_fetch_start_time_ms(settings: AppSettings, interval: Optional[str] = None) -> int:
+    interval_ms = _interval_to_ms(interval or settings.kline_interval)
     warmup_bars = max(estimate_warmup_bars(settings.strategy), BACKTEST_WARMUP_BAR_FLOOR)
     return _backtest_start_time_ms(settings) - warmup_bars * interval_ms
 
@@ -121,6 +137,12 @@ def _merge_live_bar(df: pd.DataFrame, bar: Dict[str, object], max_rows: Optional
     return frame
 
 
+def _is_provisional_exit_trade(trade, latest_time: Optional[pd.Timestamp]) -> bool:
+    if latest_time is None:
+        return False
+    return trade.reason == "end_of_test" and pd.Timestamp(trade.exit_time) == latest_time
+
+
 class KlineStreamWorker(QThread):
     kline = Signal(object)
     status = Signal(str)
@@ -129,8 +151,10 @@ class KlineStreamWorker(QThread):
         super().__init__()
         self.symbol = symbol.upper()
         self.interval = interval
+        self.stream_interval = resolve_base_interval(interval)
         self._stopped = False
         self._socket = None
+        self._aggregate_bar: Optional[Dict[str, object]] = None
 
     def stop(self) -> None:
         self._stopped = True
@@ -141,7 +165,7 @@ class KlineStreamWorker(QThread):
                 pass
 
     def run(self) -> None:
-        stream_url = f"wss://fstream.binance.com/ws/{self.symbol.lower()}@kline_{self.interval}"
+        stream_url = f"wss://fstream.binance.com/ws/{self.symbol.lower()}@kline_{self.stream_interval}"
         while not self._stopped:
             try:
                 self.status.emit(f"실시간 스트림 연결: {self.symbol} {self.interval}")
@@ -158,19 +182,19 @@ class KlineStreamWorker(QThread):
                     if payload.get("e") != "kline":
                         continue
                     kline = payload.get("k", {})
-                    self.kline.emit(
-                        {
-                            "symbol": self.symbol,
-                            "interval": self.interval,
-                            "time": _ws_kline_timestamp(int(kline["t"])),
-                            "open": float(kline["o"]),
-                            "high": float(kline["h"]),
-                            "low": float(kline["l"]),
-                            "close": float(kline["c"]),
-                            "volume": float(kline["v"]),
-                            "closed": bool(kline.get("x", False)),
-                        }
-                    )
+                    bar = {
+                        "symbol": self.symbol,
+                        "interval": self.interval,
+                        "time": _ws_kline_timestamp(int(kline["t"])),
+                        "open": float(kline["o"]),
+                        "high": float(kline["h"]),
+                        "low": float(kline["l"]),
+                        "close": float(kline["c"]),
+                        "volume": float(kline["v"]),
+                        "closed": bool(kline.get("x", False)),
+                    }
+                    for event in self._transform_bar(bar):
+                        self.kline.emit(event)
             except Exception as exc:
                 if self._stopped:
                     break
@@ -184,6 +208,35 @@ class KlineStreamWorker(QThread):
                         pass
                     self._socket = None
         self.status.emit(f"실시간 스트림 종료: {self.symbol}")
+
+    def _transform_bar(self, bar: Dict[str, object]) -> List[Dict[str, object]]:
+        if self.interval != "2m":
+            return [bar]
+        if not bool(bar.get("closed")):
+            return []
+        bucket_time = pd.Timestamp(bar["time"]).floor("2min")
+        if self._aggregate_bar is None or pd.Timestamp(self._aggregate_bar["time"]) != bucket_time:
+            self._aggregate_bar = {
+                "symbol": self.symbol,
+                "interval": self.interval,
+                "time": bucket_time,
+                "open": float(bar["open"]),
+                "high": float(bar["high"]),
+                "low": float(bar["low"]),
+                "close": float(bar["close"]),
+                "volume": float(bar["volume"]),
+                "closed": False,
+            }
+            return [dict(self._aggregate_bar)]
+
+        self._aggregate_bar["high"] = max(float(self._aggregate_bar["high"]), float(bar["high"]))
+        self._aggregate_bar["low"] = min(float(self._aggregate_bar["low"]), float(bar["low"]))
+        self._aggregate_bar["close"] = float(bar["close"])
+        self._aggregate_bar["volume"] = float(self._aggregate_bar["volume"]) + float(bar["volume"])
+        self._aggregate_bar["closed"] = True
+        completed = dict(self._aggregate_bar)
+        self._aggregate_bar = None
+        return [completed]
 
 
 class ScanWorker(QThread):
@@ -206,10 +259,14 @@ class ScanWorker(QThread):
                 rsi_upper=self.settings.rsi_upper,
                 workers=self.settings.scan_workers,
                 log_callback=self.progress.emit,
+                should_stop=self.isInterruptionRequested,
             )
+            if self.isInterruptionRequested():
+                return
             self.completed.emit(candidates)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            if not self.isInterruptionRequested():
+                self.failed.emit(str(exc))
 
 
 class OptimizeWorker(QThread):
@@ -223,41 +280,401 @@ class OptimizeWorker(QThread):
         self.settings = settings
         self.candidates = candidates
 
+    def _interval_candidates(self) -> List[str]:
+        if self.settings.optimize_timeframe:
+            return ["1m", "2m"]
+        return [self.settings.kline_interval]
+
+    def _load_histories(
+        self,
+        client: BinanceFuturesClient,
+        symbol: str,
+        history_fetch_start_time_ms: int,
+    ) -> Dict[str, pd.DataFrame]:
+        intervals = self._interval_candidates()
+        primary_interval = self.settings.kline_interval if self.settings.kline_interval in intervals else intervals[0]
+        fetch_interval = resolve_base_interval(primary_interval if len(intervals) == 1 else "1m")
+        base_history = client.historical_ohlcv(symbol, fetch_interval, start_time=history_fetch_start_time_ms)
+        if base_history.empty:
+            return {}
+        histories: Dict[str, pd.DataFrame] = {}
+        for interval in intervals:
+            histories[interval] = base_history if interval == fetch_interval else resample_ohlcv(base_history, interval)
+        return histories
+
+    def run(self) -> None:
+        try:
+            process_count = max(1, min(int(self.settings.optimize_processes), len(self.candidates) or 1))
+            self.progress.emit(f"최적화 워커 시작: 종목 {len(self.candidates)}개, 프로세스 {process_count}개")
+            if process_count <= 1 or len(self.candidates) <= 1:
+                self._run_sequential()
+            else:
+                self._run_parallel(process_count)
+            if not self.isInterruptionRequested():
+                self.completed.emit()
+        except Exception:
+            if not self.isInterruptionRequested():
+                self.failed.emit(traceback.format_exc())
+
+    def _run_sequential(self) -> None:
+        client = BinanceFuturesClient()
+        backtest_start_time = pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms")
+        interval_candidates = self._interval_candidates()
+        history_fetch_start_time_ms = _history_fetch_start_time_ms(
+            self.settings,
+            interval="1m" if "2m" in interval_candidates else self.settings.kline_interval,
+        )
+        for index, candidate in enumerate(self.candidates, start=1):
+            if self.isInterruptionRequested():
+                return
+            self.progress.emit(
+                f"[{index}/{len(self.candidates)}] {candidate.symbol} "
+                f"{self.settings.history_days}일 백테스트 + 웜업 K라인 로드"
+            )
+            histories = self._load_histories(client, candidate.symbol, history_fetch_start_time_ms)
+            if not histories:
+                self.progress.emit(f"{candidate.symbol}: 히스토리 없음")
+                continue
+            optimization, best_history = optimize_symbol_intervals(
+                symbol=candidate.symbol,
+                histories_by_interval=histories,
+                base_settings=self.settings.strategy,
+                optimize_flags=self.settings.optimize_flags,
+                interval_candidates=interval_candidates,
+                span_pct=self.settings.optimization_span_pct,
+                steps=self.settings.optimization_steps,
+                max_combinations=self.settings.max_grid_combinations,
+                fee_rate=self.settings.fee_rate,
+                backtest_start_time=backtest_start_time,
+                should_stop=self.isInterruptionRequested,
+            )
+            if self.isInterruptionRequested():
+                return
+            self.result_ready.emit({"candidate": candidate, "optimization": optimization, "history": best_history})
+            self.progress.emit(
+                f"{candidate.symbol} [{optimization.best_interval}]: {optimization.combinations_tested}개 조합 완료, "
+                f"수익률 {optimization.best_backtest.metrics.total_return_pct:.2f}%"
+            )
+
+    def _run_parallel(self, process_count: int) -> None:
+        client = BinanceFuturesClient()
+        backtest_start_time = pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms")
+        interval_candidates = self._interval_candidates()
+        history_fetch_start_time_ms = _history_fetch_start_time_ms(
+            self.settings,
+            interval="1m" if "2m" in interval_candidates else self.settings.kline_interval,
+        )
+        pending_candidates = deque(self.candidates)
+        active_jobs: List[tuple[CandidateSymbol, pd.DataFrame, object]] = []
+        submitted = 0
+        completed = 0
+        pool = mp.get_context("spawn").Pool(processes=process_count, maxtasksperchild=8)
+        terminated = False
+
+        def terminate_pool() -> None:
+            nonlocal terminated
+            if terminated:
+                return
+            pool.terminate()
+            pool.join()
+            terminated = True
+
+        def close_pool() -> None:
+            nonlocal terminated
+            if terminated:
+                return
+            pool.close()
+            pool.join()
+            terminated = True
+
+        def submit_one(candidate: CandidateSymbol, index: int) -> bool:
+            self.progress.emit(
+                f"[{index}/{len(self.candidates)}] {candidate.symbol} "
+                f"{self.settings.history_days}일 백테스트 + 웜업 K라인 로드"
+            )
+            histories = self._load_histories(client, candidate.symbol, history_fetch_start_time_ms)
+            if not histories:
+                self.progress.emit(f"{candidate.symbol}: 히스토리 없음")
+                return False
+            job = pool.apply_async(
+                optimize_symbol_intervals,
+                kwds={
+                    "symbol": candidate.symbol,
+                    "histories_by_interval": histories,
+                    "base_settings": self.settings.strategy,
+                    "optimize_flags": self.settings.optimize_flags,
+                    "interval_candidates": interval_candidates,
+                    "span_pct": self.settings.optimization_span_pct,
+                    "steps": self.settings.optimization_steps,
+                    "max_combinations": self.settings.max_grid_combinations,
+                    "fee_rate": self.settings.fee_rate,
+                    "backtest_start_time": backtest_start_time,
+                },
+            )
+            default_history = histories.get(interval_candidates[0], next(iter(histories.values())))
+            active_jobs.append((candidate, default_history, job))
+            self.progress.emit(f"{candidate.symbol}: 프로세스 최적화 시작 ({len(active_jobs)}/{process_count})")
+            return True
+
+        try:
+            while len(active_jobs) < process_count and pending_candidates:
+                if self.isInterruptionRequested():
+                    terminate_pool()
+                    return
+                candidate = pending_candidates.popleft()
+                submitted += 1
+                submit_one(candidate, submitted)
+
+            while active_jobs:
+                if self.isInterruptionRequested():
+                    terminate_pool()
+                    return
+                remaining_jobs: List[tuple[CandidateSymbol, pd.DataFrame, object]] = []
+                completed_any = False
+                for candidate, df, job in active_jobs:
+                    if not job.ready():
+                        remaining_jobs.append((candidate, df, job))
+                        continue
+                    optimization, best_history = job.get()
+                    completed_any = True
+                    completed += 1
+                    self.result_ready.emit({"candidate": candidate, "optimization": optimization, "history": best_history})
+                    self.progress.emit(
+                        f"[{completed}/{len(self.candidates)}] {candidate.symbol} [{optimization.best_interval}]: "
+                        f"{optimization.combinations_tested}개 조합 완료, "
+                        f"수익률 {optimization.best_backtest.metrics.total_return_pct:.2f}%"
+                    )
+                active_jobs = remaining_jobs
+
+                while len(active_jobs) < process_count and pending_candidates:
+                    if self.isInterruptionRequested():
+                        terminate_pool()
+                        return
+                    candidate = pending_candidates.popleft()
+                    submitted += 1
+                    submit_one(candidate, submitted)
+
+                if not completed_any:
+                    self.msleep(50)
+            close_pool()
+        except Exception:
+            terminate_pool()
+            raise
+
+
+class SymbolLoadWorker(QThread):
+    loaded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        request_id: int,
+        settings: AppSettings,
+        symbol: str,
+        interval: str,
+        history: Optional[pd.DataFrame],
+        chart_history: Optional[pd.DataFrame],
+        existing_backtest: Optional[BacktestResult],
+    ) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.settings = settings
+        self.symbol = symbol
+        self.interval = interval
+        self.history = history
+        self.chart_history = chart_history
+        self.existing_backtest = existing_backtest
+
     def run(self) -> None:
         try:
             client = BinanceFuturesClient()
-            backtest_start_time_ms = _backtest_start_time_ms(self.settings)
-            history_fetch_start_time_ms = _history_fetch_start_time_ms(self.settings)
-            for index, candidate in enumerate(self.candidates, start=1):
-                self.progress.emit(
-                    f"[{index}/{len(self.candidates)}] {candidate.symbol} "
-                    f"{self.settings.history_days}일 백테스트 + 웜업 K라인 로드"
+            history = self.history
+            if history is None:
+                history = client.historical_ohlcv(
+                    self.symbol,
+                    self.interval,
+                    start_time=_history_fetch_start_time_ms(self.settings, self.interval),
                 )
-                df = client.historical_ohlcv(
-                    candidate.symbol,
-                    self.settings.kline_interval,
-                    start_time=history_fetch_start_time_ms,
+            if history.empty:
+                raise RuntimeError(f"{self.symbol} 히스토리 데이터가 없습니다.")
+            history = prepare_ohlcv(history)
+            if self.isInterruptionRequested():
+                return
+
+            chart_history = self.chart_history
+            if chart_history is None:
+                if len(history) >= CHART_HISTORY_FETCH_FALLBACK_MIN_BARS:
+                    chart_history = history.tail(CHART_HISTORY_BAR_LIMIT).copy().reset_index(drop=True)
+                else:
+                    chart_history = client.historical_ohlcv_recent(
+                        self.symbol,
+                        self.interval,
+                        bars=CHART_HISTORY_BAR_LIMIT,
+                    )
+                    if chart_history.empty:
+                        chart_history = history.tail(CHART_HISTORY_BAR_LIMIT).copy().reset_index(drop=True)
+            chart_history = prepare_ohlcv(chart_history)
+            if self.isInterruptionRequested():
+                return
+
+            backtest_start_time = pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms")
+            backtest = self.existing_backtest or run_backtest(
+                history,
+                settings=self.settings.strategy,
+                fee_rate=self.settings.fee_rate,
+                backtest_start_time=backtest_start_time,
+            )
+            if self.isInterruptionRequested():
+                return
+            chart_indicators = compact_indicator_frame(
+                compute_indicators(chart_history, backtest.settings),
+                CHART_INDICATOR_COLUMNS,
+            )
+            self.loaded.emit(
+                {
+                    "request_id": self.request_id,
+                    "symbol": self.symbol,
+                    "interval": self.interval,
+                    "history": history,
+                    "chart_history": chart_history,
+                    "backtest": backtest,
+                    "chart_indicators": chart_indicators,
+                }
+            )
+        except Exception:
+            if not self.isInterruptionRequested():
+                self.failed.emit(traceback.format_exc())
+
+
+class LiveBacktestWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        settings: AppSettings,
+        symbol: str,
+        history: pd.DataFrame,
+        chart_history: pd.DataFrame,
+        strategy_settings: StrategySettings,
+    ) -> None:
+        super().__init__()
+        self.settings = settings
+        self.symbol = symbol
+        self.history = prepare_ohlcv(history.copy())
+        self.chart_history = prepare_ohlcv(chart_history.copy())
+        self.strategy_settings = strategy_settings
+
+    def run(self) -> None:
+        try:
+            backtest = run_backtest(
+                self.history,
+                settings=self.strategy_settings,
+                fee_rate=self.settings.fee_rate,
+                backtest_start_time=pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms"),
+            )
+            if self.isInterruptionRequested():
+                return
+            chart_indicators = compact_indicator_frame(
+                compute_indicators(self.chart_history, backtest.settings),
+                CHART_INDICATOR_COLUMNS,
+            )
+            self.completed.emit(
+                {
+                    "symbol": self.symbol,
+                    "history": self.history,
+                    "chart_history": self.chart_history,
+                    "backtest": backtest,
+                    "chart_indicators": chart_indicators,
+                }
+            )
+        except Exception:
+            if not self.isInterruptionRequested():
+                self.failed.emit(traceback.format_exc())
+
+
+class AccountInfoWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, request_id: int, api_key: str, api_secret: str, symbol: Optional[str]) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.api_key = api_key.strip()
+        self.api_secret = api_secret.strip()
+        self.symbol = symbol
+
+    def run(self) -> None:
+        try:
+            client = BinanceFuturesClient(self.api_key, self.api_secret)
+            balance = client.get_balance_snapshot()
+            positions = client.get_open_positions()
+            position = next((item for item in positions if item.symbol == self.symbol), None) if self.symbol else None
+            self.completed.emit(
+                {
+                    "request_id": self.request_id,
+                    "symbol": self.symbol,
+                    "balance": balance,
+                    "position": position,
+                    "positions": positions,
+                }
+            )
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+class OrderWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        symbol: str,
+        leverage: int,
+        side: Optional[str] = None,
+        fraction: Optional[float] = None,
+        close_only: bool = False,
+    ) -> None:
+        super().__init__()
+        self.api_key = api_key.strip()
+        self.api_secret = api_secret.strip()
+        self.symbol = symbol
+        self.leverage = int(leverage)
+        self.side = side
+        self.fraction = fraction
+        self.close_only = close_only
+
+    def run(self) -> None:
+        try:
+            client = BinanceFuturesClient(self.api_key, self.api_secret)
+            if self.close_only:
+                result = client.close_position(self.symbol)
+                message = (
+                    "청산할 포지션이 없습니다."
+                    if result is None
+                    else f"포지션 청산 완료: orderId={result.get('orderId')}"
                 )
-                if df.empty:
-                    self.progress.emit(f"{candidate.symbol}: 히스토리 없음")
-                    continue
-                optimization = optimize_symbol(
-                    symbol=candidate.symbol,
-                    df=df,
-                    base_settings=self.settings.strategy,
-                    optimize_flags=self.settings.optimize_flags,
-                    span_pct=self.settings.optimization_span_pct,
-                    steps=self.settings.optimization_steps,
-                    max_combinations=self.settings.max_grid_combinations,
-                    fee_rate=self.settings.fee_rate,
-                    backtest_start_time=pd.to_datetime(backtest_start_time_ms, unit="ms"),
-                )
-                self.result_ready.emit({"candidate": candidate, "optimization": optimization, "history": df})
-                self.progress.emit(
-                    f"{candidate.symbol}: {optimization.combinations_tested}개 조합 완료, "
-                    f"수익률 {optimization.best_backtest.metrics.total_return_pct:.2f}%"
-                )
-            self.completed.emit()
+                self.completed.emit({"symbol": self.symbol, "message": message})
+                return
+
+            if self.side is None or self.fraction is None:
+                raise RuntimeError("order parameters are incomplete")
+            balance = client.get_balance_snapshot()
+            margin = balance.available_balance * float(self.fraction)
+            client.set_leverage(self.symbol, self.leverage)
+            quantity = client.build_order_quantity(self.symbol, margin, self.leverage)
+            result = client.place_market_order(self.symbol, self.side, quantity)
+            self.completed.emit(
+                {
+                    "symbol": self.symbol,
+                    "message": (
+                        f"주문 완료: {self.symbol} {self.side} qty={quantity} "
+                        f"orderId={result.get('orderId')}"
+                    ),
+                }
+            )
         except Exception:
             self.failed.emit(traceback.format_exc())
 
@@ -266,23 +683,39 @@ class AltReversalTraderWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.settings = AppSettings.load()
+        self.public_client = BinanceFuturesClient()
         self.candidates: List[CandidateSymbol] = []
         self.optimized_results: Dict[str, OptimizationResult] = {}
         self.history_cache: Dict[str, pd.DataFrame] = {}
         self.chart_history_cache: Dict[str, pd.DataFrame] = {}
+        self.price_precision_cache: Dict[str, int] = {}
         self.pending_candidates: List[CandidateSymbol] = []
         self.pending_optimized_results: Dict[str, OptimizationResult] = {}
         self.pending_history_cache: Dict[str, pd.DataFrame] = {}
         self.preserve_lists_during_refresh = False
+        self.open_positions: List[PositionSnapshot] = []
+        self.current_position_snapshot: Optional[PositionSnapshot] = None
         self.current_symbol: Optional[str] = None
+        self.current_interval = self.settings.kline_interval
         self.current_backtest: Optional[BacktestResult] = None
+        self.current_chart_indicators: Optional[pd.DataFrame] = None
         self.scan_worker: Optional[ScanWorker] = None
         self.optimize_worker: Optional[OptimizeWorker] = None
+        self.load_worker: Optional[SymbolLoadWorker] = None
+        self.live_backtest_worker: Optional[LiveBacktestWorker] = None
+        self.account_worker: Optional[AccountInfoWorker] = None
+        self.order_worker: Optional[OrderWorker] = None
+        self.load_request_id = 0
+        self.account_request_id = 0
+        self.live_recalc_pending = False
+        self.pending_account_refresh = False
         self.live_stream_worker: Optional[KlineStreamWorker] = None
         self.live_pending_bar: Optional[Dict[str, object]] = None
+        self._tracked_threads: set[QThread] = set()
         self.auto_refresh_minutes = 10
         self.auto_refresh_timer = QTimer(self)
         self.live_update_timer = QTimer(self)
+        self.optimized_table_timer = QTimer(self)
         self.parameter_editors: Dict[str, object] = {}
         self.parameter_opt_boxes: Dict[str, QCheckBox] = {}
         self.plotly_chart_path = Path("alt_reversal_trader_plotly_chart.html").resolve()
@@ -292,11 +725,14 @@ class AltReversalTraderWindow(QMainWindow):
         self.chart_view = None
         self.equity_subchart = None
         self.equity_line = None
+        self.entry_price_line = None
         self.supertrend_line = None
         self.zone2_line = None
         self.zone3_line = None
         self.ema_fast_line = None
         self.ema_slow_line = None
+        self.position_close_buttons: List[QPushButton] = []
+        self.price_label_timer = QTimer(self)
 
         self.setWindowTitle("Binance Alt Mean Reversion Trader")
         self.resize(1680, 960)
@@ -305,6 +741,11 @@ class AltReversalTraderWindow(QMainWindow):
         self._init_chart()
         self.live_update_timer.setSingleShot(True)
         self.live_update_timer.timeout.connect(self._flush_live_update)
+        self.optimized_table_timer.setSingleShot(True)
+        self.optimized_table_timer.timeout.connect(self._flush_optimized_table)
+        self.price_label_timer.setInterval(1000)
+        self.price_label_timer.timeout.connect(self._refresh_live_labels)
+        self.price_label_timer.start()
         self.chart_engine_combo.currentTextChanged.connect(self.on_chart_engine_changed)
         self._init_auto_refresh()
         self.statusBar().showMessage("준비됨")
@@ -358,23 +799,6 @@ class AltReversalTraderWindow(QMainWindow):
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
-        header_group = QGroupBox("Selection")
-        header_layout = QVBoxLayout(header_group)
-        self.symbol_label = QLabel("종목: -")
-        self.signal_label = QLabel("신호: -")
-        self.balance_label = QLabel("잔고: API 미입력")
-        self.position_label = QLabel("포지션: -")
-        header_layout.addWidget(self.symbol_label)
-        header_layout.addWidget(self.signal_label)
-        header_layout.addWidget(self.balance_label)
-        header_layout.addWidget(self.position_label)
-        right_layout.addWidget(header_group)
-
-        self.chart_host = QWidget()
-        self.chart_host_layout = QVBoxLayout(self.chart_host)
-        self.chart_host_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.addWidget(self.chart_host, 7)
-
         summary_group = QGroupBox("Backtest Summary")
         summary_layout = QVBoxLayout(summary_group)
         self.summary_box = QPlainTextEdit()
@@ -382,18 +806,39 @@ class AltReversalTraderWindow(QMainWindow):
         summary_layout.addWidget(self.summary_box)
         right_layout.addWidget(summary_group, 2)
 
+        self.chart_host = QWidget()
+        self.chart_host_layout = QVBoxLayout(self.chart_host)
+        self.chart_host_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(self.chart_host, 7)
+
+        header_group = QGroupBox("Selection")
+        header_layout = QVBoxLayout(header_group)
+        self.symbol_label = QLabel("종목: -")
+        self.signal_label = QLabel("신호: -")
+        self.current_price_label = QLabel("현재가: -")
+        self.balance_label = QLabel("잔고: API 미입력")
+        self.position_label = QLabel("포지션: -")
+        header_layout.addWidget(self.symbol_label)
+        header_layout.addWidget(self.signal_label)
+        header_layout.addWidget(self.current_price_label)
+        header_layout.addWidget(self.balance_label)
+        header_layout.addWidget(self.position_label)
+        right_layout.addWidget(header_group)
+
+        right_layout.addWidget(self._build_positions_group(), 2)
+
         order_group = QGroupBox("Live Order")
         order_layout = QVBoxLayout(order_group)
         long_row = QHBoxLayout()
         short_row = QHBoxLayout()
         self.long_buttons = []
         self.short_buttons = []
-        for fraction, text in ((0.33, "LONG 33%"), (0.50, "LONG 50%"), (0.99, "LONG 99%")):
+        for fraction, text in ((0.33, "LONG 33%"), (0.50, "LONG 50%"), (0.66, "LONG 66%"), (0.99, "LONG 99%")):
             button = QPushButton(text)
             button.clicked.connect(lambda _=False, value=fraction: self.place_fractional_order("BUY", value))
             self.long_buttons.append(button)
             long_row.addWidget(button)
-        for fraction, text in ((0.33, "SHORT 33%"), (0.50, "SHORT 50%"), (0.99, "SHORT 99%")):
+        for fraction, text in ((0.33, "SHORT 33%"), (0.50, "SHORT 50%"), (0.66, "SHORT 66%"), (0.99, "SHORT 99%")):
             button = QPushButton(text)
             button.clicked.connect(lambda _=False, value=fraction: self.place_fractional_order("SELL", value))
             self.short_buttons.append(button)
@@ -471,6 +916,9 @@ class AltReversalTraderWindow(QMainWindow):
         self.opt_steps_spin.setRange(1, 9)
         self.max_combo_spin = QSpinBox()
         self.max_combo_spin.setRange(10, 20_000)
+        self.opt_process_spin = QSpinBox()
+        self.opt_process_spin.setRange(1, 16)
+        self.optimize_timeframe_check = QCheckBox("1m / 2m 최적화")
         self.fee_spin = QDoubleSpinBox()
         self.fee_spin.setRange(0.0, 5.0)
         self.fee_spin.setDecimals(4)
@@ -478,6 +926,8 @@ class AltReversalTraderWindow(QMainWindow):
         layout.addRow("범위 ±%", self.opt_span_spin)
         layout.addRow("격자 단계수", self.opt_steps_spin)
         layout.addRow("최대 조합수", self.max_combo_spin)
+        layout.addRow("최적화 프로세스", self.opt_process_spin)
+        layout.addRow("타임프레임", self.optimize_timeframe_check)
         layout.addRow("수수료 %", self.fee_spin)
         return group
 
@@ -553,8 +1003,8 @@ class AltReversalTraderWindow(QMainWindow):
     def _build_optimized_group(self) -> QGroupBox:
         group = QGroupBox("최적화 종목")
         layout = QVBoxLayout(group)
-        self.optimized_table = QTableWidget(0, 7)
-        self.optimized_table.setHorizontalHeaderLabels(["Symbol", "Return%", "MDD%", "Trades", "Win%", "PF", "Grid"])
+        self.optimized_table = QTableWidget(0, 8)
+        self.optimized_table.setHorizontalHeaderLabels(["Symbol", "TF", "Return%", "MDD%", "Trades", "Win%", "PF", "Grid"])
         self.optimized_table.setSelectionBehavior(SELECT_ROWS)
         self.optimized_table.setSelectionMode(SINGLE_SELECTION)
         self.optimized_table.setEditTriggers(NO_EDIT_TRIGGERS)
@@ -562,6 +1012,18 @@ class AltReversalTraderWindow(QMainWindow):
         self.optimized_table.itemSelectionChanged.connect(self.on_optimized_selection_changed)
         self.optimized_table.cellClicked.connect(self.on_optimized_cell_clicked)
         layout.addWidget(self.optimized_table)
+        return group
+
+    def _build_positions_group(self) -> QGroupBox:
+        group = QGroupBox("Open Positions")
+        layout = QVBoxLayout(group)
+        self.positions_table = QTableWidget(0, 6)
+        self.positions_table.setHorizontalHeaderLabels(["Symbol", "Side", "Amount", "Entry", "UPnL", "Action"])
+        self.positions_table.setSelectionBehavior(SELECT_ROWS)
+        self.positions_table.setSelectionMode(SINGLE_SELECTION)
+        self.positions_table.setEditTriggers(NO_EDIT_TRIGGERS)
+        self.positions_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.positions_table)
         return group
 
     def _build_log_group(self) -> QGroupBox:
@@ -586,6 +1048,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.chart_view = None
         self.equity_subchart = None
         self.equity_line = None
+        self.entry_price_line = None
         self.supertrend_line = None
         self.zone2_line = None
         self.zone3_line = None
@@ -608,22 +1071,28 @@ class AltReversalTraderWindow(QMainWindow):
     def _init_plotly_chart(self) -> None:
         self.chart_view = QWebEngineView(self.chart_host)
         self.chart_view.settings().setAttribute(WEB_ATTR_FILE_URLS, True)
+        self._attach_webview_crash_logger(self.chart_view, "Plotly")
         self.chart_host_layout.addWidget(self.chart_view)
         self.chart_view.setHtml(self._empty_chart_html())
 
     def _init_lightweight_chart(self) -> None:
         self.chart = QtChart(self.chart_host)
-        self.chart_host_layout.addWidget(self.chart.get_webview())
+        chart_webview = self.chart.get_webview()
+        self._attach_webview_crash_logger(chart_webview, "Lightweight")
+        self.chart_host_layout.addWidget(chart_webview)
         self.chart.layout(background_color="#0f1419", text_color="#eceff4", font_size=12, font_family="Consolas")
         self.chart.legend(True)
         self.chart.candle_style(
-            up_color="#d8f3dc",
+            up_color="#8d939a",
             down_color="rgba(0, 0, 0, 0)",
-            border_up_color="#d8f3dc",
-            border_down_color="#ff5d73",
-            wick_up_color="#d8f3dc",
-            wick_down_color="#ff5d73",
+            border_up_color="#8d939a",
+            border_down_color="#8d939a",
+            wick_up_color="#8d939a",
+            wick_down_color="#8d939a",
         )
+        self.chart.run_script(f"""{self.chart.id}.series.applyOptions({{
+            priceLineColor: "#22f202"
+        }})""")
         self.chart.volume_config(up_color="rgba(216, 243, 220, 0.30)", down_color="rgba(255, 93, 115, 0.28)")
         self.chart.watermark("ALT MR", color="rgba(240, 242, 245, 0.16)")
         self.chart.crosshair(mode="normal")
@@ -680,6 +1149,133 @@ class AltReversalTraderWindow(QMainWindow):
             price_line=False,
             price_label=False,
         )
+        self._init_lightweight_bar_close_overlay()
+
+    def _init_lightweight_bar_close_overlay(self) -> None:
+        if self.chart is None:
+            return
+        self.chart.run_script(
+            f"""
+            (() => {{
+                const handler = {self.chart.id};
+                if (!handler || handler.barCloseCountdown) {{
+                    return;
+                }}
+                const label = document.createElement("div");
+                Object.assign(label.style, {{
+                    position: "absolute",
+                    right: "6px",
+                    top: "0px",
+                    display: "none",
+                    padding: "2px 6px",
+                    borderRadius: "3px",
+                    background: "#22f202",
+                    color: "#0f1419",
+                    fontFamily: "Consolas, monospace",
+                    fontSize: "11px",
+                    fontWeight: "700",
+                    lineHeight: "1.25",
+                    letterSpacing: "0.02em",
+                    zIndex: "3200",
+                    pointerEvents: "none",
+                    whiteSpace: "nowrap",
+                    boxShadow: "0 1px 6px rgba(0, 0, 0, 0.35)",
+                }});
+                handler.div.appendChild(label);
+                handler.barCloseCountdown = {{
+                    label,
+                    state: {{ text: "", price: null }},
+                }};
+                handler.updateBarCloseCountdown = (text, price) => {{
+                    const overlay = handler.barCloseCountdown;
+                    if (!overlay) {{
+                        return;
+                    }}
+                    overlay.state = {{ text, price }};
+                    if (!text || !Number.isFinite(price)) {{
+                        overlay.label.style.display = "none";
+                        return;
+                    }}
+                    const y = handler.series.priceToCoordinate(price);
+                    if (y === null || y === undefined || !Number.isFinite(y)) {{
+                        overlay.label.style.display = "none";
+                        return;
+                    }}
+                    overlay.label.textContent = text;
+                    overlay.label.style.display = "block";
+                    const rawTop = Math.round(y) + 18;
+                    const maxTop = Math.max(4, handler.div.clientHeight - overlay.label.offsetHeight - 4);
+                    const top = Math.max(4, Math.min(rawTop, maxTop));
+                    overlay.label.style.top = `${{top}}px`;
+                }};
+                handler.hideBarCloseCountdown = () => {{
+                    const overlay = handler.barCloseCountdown;
+                    if (!overlay) {{
+                        return;
+                    }}
+                    overlay.state = {{ text: "", price: null }};
+                    overlay.label.style.display = "none";
+                }};
+                handler.chart.timeScale().subscribeVisibleLogicalRangeChange(() => {{
+                    const overlay = handler.barCloseCountdown;
+                    if (overlay && overlay.state.text) {{
+                        handler.updateBarCloseCountdown(overlay.state.text, overlay.state.price);
+                    }}
+                }});
+                window.addEventListener("resize", () => {{
+                    const overlay = handler.barCloseCountdown;
+                    if (overlay && overlay.state.text) {{
+                        handler.updateBarCloseCountdown(overlay.state.text, overlay.state.price);
+                    }}
+                }});
+            }})();
+            """
+        )
+
+    def _set_lightweight_bar_close_overlay(self, countdown: Optional[str], price: Optional[float]) -> None:
+        if self.chart_mode != "Lightweight" or self.chart is None:
+            return
+        if not countdown or price is None:
+            self.chart.run_script(
+                f"""
+                if ({self.chart.id}.hideBarCloseCountdown) {{
+                    {self.chart.id}.hideBarCloseCountdown();
+                }}
+                """
+            )
+            return
+        self.chart.run_script(
+            f"""
+            if ({self.chart.id}.updateBarCloseCountdown) {{
+                {self.chart.id}.updateBarCloseCountdown({json.dumps(countdown)}, {float(price)});
+            }}
+            """
+        )
+
+    def _attach_webview_crash_logger(self, webview, engine_label: str) -> None:
+        try:
+            page = webview.page()
+            signal = getattr(page, "renderProcessTerminated", None)
+            if signal is None:
+                return
+            signal.connect(
+                lambda status, exit_code, label=engine_label: self._on_webview_render_crash(label, status, exit_code)
+            )
+        except Exception:
+            pass
+
+    def _on_webview_render_crash(self, engine_label: str, status, exit_code: int) -> None:
+        body = "\n".join(
+            [
+                f"engine: {engine_label}",
+                f"current_symbol: {self.current_symbol}",
+                f"chart_mode: {self.chart_mode}",
+                f"status: {status}",
+                f"exit_code: {exit_code}",
+            ]
+        )
+        path = log_runtime_event("WebEngine Render Crash", body, open_notepad=True)
+        self.log(f"{engine_label} 렌더 프로세스 종료. 로그: {path}")
 
     def on_chart_engine_changed(self, _engine: str) -> None:
         self.settings.chart_engine = self.chart_engine_combo.currentText()
@@ -702,6 +1298,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.opt_span_spin.setValue(settings.optimization_span_pct)
         self.opt_steps_spin.setValue(settings.optimization_steps)
         self.max_combo_spin.setValue(settings.max_grid_combinations)
+        self.opt_process_spin.setValue(settings.optimize_processes)
+        self.optimize_timeframe_check.setChecked(settings.optimize_timeframe)
         self.fee_spin.setValue(settings.fee_rate * 100.0)
 
     def collect_settings(self) -> AppSettings:
@@ -735,22 +1333,35 @@ class AltReversalTraderWindow(QMainWindow):
             optimization_steps=int(self.opt_steps_spin.value()),
             max_grid_combinations=int(self.max_combo_spin.value()),
             scan_workers=int(self.scan_workers_spin.value()),
+            optimize_processes=int(self.opt_process_spin.value()),
+            optimize_timeframe=bool(self.optimize_timeframe_check.isChecked()),
             strategy=StrategySettings(**strategy_payload),
             optimize_flags=optimize_flags,
         )
 
-    def save_settings(self) -> AppSettings:
+    def _sync_settings(self, persist: bool = False) -> AppSettings:
         previous = self.settings
         self.settings = self.collect_settings()
+        if not self.current_symbol:
+            self.current_interval = self.settings.kline_interval
         if (
             previous.kline_interval != self.settings.kline_interval
             or previous.history_days != self.settings.history_days
         ):
+            self._stop_load_worker()
+            self._stop_live_backtest_worker()
             self._stop_live_stream()
             self.history_cache.clear()
             self.chart_history_cache.clear()
-        self.settings.save()
+            self.current_chart_indicators = None
+            self.price_precision_cache.clear()
+        if persist:
+            self.settings.save()
+            self.public_client = BinanceFuturesClient()
         return self.settings
+
+    def save_settings(self) -> AppSettings:
+        return self._sync_settings(persist=True)
 
     def save_settings_with_feedback(self) -> None:
         self.save_settings()
@@ -764,9 +1375,12 @@ class AltReversalTraderWindow(QMainWindow):
         return next((candidate for candidate in self.candidates if candidate.symbol == symbol), None)
 
     def _resolve_price_precision(self, symbol: str, candle_df: pd.DataFrame) -> int:
+        cached = self.price_precision_cache.get(symbol)
+        if cached is not None:
+            return cached
         precision = 2
         try:
-            filters = BinanceFuturesClient().get_symbol_filters(symbol)
+            filters = self.public_client.get_symbol_filters(symbol)
             precision = int(filters.get("pricePrecision", precision))
             tick_size = float(filters.get("tickSize", 0.0) or 0.0)
             if tick_size > 0:
@@ -787,7 +1401,9 @@ class AltReversalTraderWindow(QMainWindow):
                     precision = 5
                 else:
                     precision = 2
-        return max(2, min(precision, 10))
+        precision = max(2, min(precision, 10))
+        self.price_precision_cache[symbol] = precision
+        return precision
 
     def _apply_lightweight_precision(self, symbol: str, candle_df: pd.DataFrame) -> None:
         if self.chart is None:
@@ -808,14 +1424,149 @@ class AltReversalTraderWindow(QMainWindow):
         if candle_df.empty:
             now = pd.Timestamp.utcnow().tz_localize(None)
             return now - pd.Timedelta(hours=DEFAULT_CHART_LOOKBACK_HOURS), now
-        end_time = pd.Timestamp(candle_df["time"].iloc[-1])
+        bar_delta = pd.Timedelta(milliseconds=_interval_to_ms(self.current_interval or self.settings.kline_interval))
+        latest_time = pd.Timestamp(candle_df["time"].iloc[-1])
+        end_time = latest_time + (bar_delta * DEFAULT_CHART_RIGHT_PAD_BARS)
         start_floor = pd.Timestamp(candle_df["time"].iloc[0])
-        start_time = max(start_floor, end_time - pd.Timedelta(hours=DEFAULT_CHART_LOOKBACK_HOURS))
+        start_time = max(start_floor, latest_time - pd.Timedelta(hours=DEFAULT_CHART_LOOKBACK_HOURS))
         return start_time, end_time
+
+    def _stash_lightweight_range(self) -> None:
+        if self.chart is None:
+            return
+        self.chart.run_script(
+            f"""
+            window.__alt_lwc_view_range = {self.chart.id}.chart.timeScale().getVisibleLogicalRange();
+            """
+        )
+
+    def _restore_lightweight_range(self, symbol: str) -> None:
+        if symbol != self.current_symbol or self.chart is None or self.equity_subchart is None:
+            return
+        self.chart.run_script(
+            f"""
+            const range = window.__alt_lwc_view_range;
+            if (range && Number.isFinite(range.from) && Number.isFinite(range.to) && range.to > range.from) {{
+                {self.chart.id}.chart.timeScale().setVisibleLogicalRange(range);
+                {self.equity_subchart.id}.chart.timeScale().setVisibleLogicalRange(range);
+            }}
+            """
+        )
 
     def _active_backtest_settings(self, symbol: str) -> StrategySettings:
         optimization = self.optimized_results.get(symbol)
         return optimization.best_backtest.settings if optimization else self.settings.strategy
+
+    def _track_thread(self, worker: QThread, attr_name: str) -> None:
+        self._tracked_threads.add(worker)
+
+        def _cleanup_thread() -> None:
+            if getattr(self, attr_name, None) is worker:
+                setattr(self, attr_name, None)
+            self._tracked_threads.discard(worker)
+            worker.deleteLater()
+
+        worker.finished.connect(_cleanup_thread)
+
+    def _prune_caches(self) -> None:
+        keep_symbols = set()
+        if self.current_symbol:
+            keep_symbols.add(self.current_symbol)
+        ordered_symbols = [
+            result.symbol
+            for result in sorted(
+                self.optimized_results.values(),
+                key=lambda item: item.best_backtest.metrics.total_return_pct,
+                reverse=True,
+            )[:HISTORY_CACHE_SYMBOL_LIMIT]
+        ]
+        keep_symbols.update(ordered_symbols)
+        self.history_cache = {
+            symbol: frame
+            for symbol, frame in self.history_cache.items()
+            if symbol in keep_symbols
+        }
+        chart_keep = {self.current_symbol} if self.current_symbol else set()
+        self.chart_history_cache = {
+            symbol: frame
+            for symbol, frame in self.chart_history_cache.items()
+            if symbol in chart_keep
+        }
+
+    def _stop_scan_worker(self) -> None:
+        worker = self.scan_worker
+        self.scan_worker = None
+        if worker is not None and worker.isRunning():
+            worker.requestInterruption()
+            worker.wait(10000)
+
+    def _stop_optimize_worker(self) -> None:
+        worker = self.optimize_worker
+        self.optimize_worker = None
+        if worker is not None and worker.isRunning():
+            worker.requestInterruption()
+            worker.wait(5000)
+
+    def _stop_load_worker(self) -> None:
+        worker = self.load_worker
+        self.load_worker = None
+        if worker is not None and worker.isRunning():
+            worker.requestInterruption()
+            worker.wait(1500)
+
+    def _stop_live_backtest_worker(self) -> None:
+        worker = self.live_backtest_worker
+        self.live_backtest_worker = None
+        self.live_recalc_pending = False
+        if worker is not None and worker.isRunning():
+            worker.requestInterruption()
+            worker.wait(1500)
+
+    def _stop_account_worker(self) -> None:
+        worker = self.account_worker
+        self.account_worker = None
+        self.pending_account_refresh = False
+        if worker is not None and worker.isRunning():
+            worker.requestInterruption()
+            worker.wait(1500)
+
+    def _stop_order_worker(self) -> None:
+        worker = self.order_worker
+        self.order_worker = None
+        if worker is not None and worker.isRunning():
+            worker.requestInterruption()
+            worker.wait(1500)
+
+    def _drain_tracked_threads(self, timeout_ms: int = 15000) -> None:
+        deadline = time.monotonic() + max(timeout_ms, 0) / 1000.0
+        while True:
+            running_threads = [thread for thread in list(self._tracked_threads) if thread.isRunning()]
+            if not running_threads:
+                return
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                break
+            wait_ms = max(1, min(500, remaining_ms))
+            for thread in running_threads:
+                thread.wait(wait_ms)
+            QApplication.processEvents()
+
+        running_threads = [thread for thread in list(self._tracked_threads) if thread.isRunning()]
+        if not running_threads:
+            return
+
+        thread_names = ", ".join(type(thread).__name__ for thread in running_threads)
+        log_runtime_event(
+            "Forced Thread Shutdown",
+            f"Threads still running during close: {thread_names}",
+            open_notepad=False,
+        )
+        for thread in running_threads:
+            try:
+                thread.terminate()
+                thread.wait(1000)
+            except Exception:
+                pass
 
     def _stop_live_stream(self) -> None:
         worker = self.live_stream_worker
@@ -829,10 +1580,11 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _start_live_stream(self, symbol: str) -> None:
         self._stop_live_stream()
-        worker = KlineStreamWorker(symbol, self.settings.kline_interval)
+        worker = KlineStreamWorker(symbol, self.current_interval or self.settings.kline_interval)
         worker.kline.connect(self._queue_live_update)
         worker.status.connect(self._on_live_stream_status)
         self.live_stream_worker = worker
+        self._track_thread(worker, "live_stream_worker")
         worker.start()
 
     def _on_live_stream_status(self, message: str) -> None:
@@ -860,18 +1612,199 @@ class AltReversalTraderWindow(QMainWindow):
 
         self.history_cache[symbol] = _merge_live_bar(history, bar)
         self.chart_history_cache[symbol] = _merge_live_bar(chart_history, bar, max_rows=CHART_HISTORY_BAR_LIMIT)
+        if not bool(bar.get("closed")):
+            if self.chart_mode == "Lightweight":
+                self._apply_live_lightweight_bar(symbol, bar)
+            return
+        self._schedule_live_backtest(symbol)
 
-        backtest = run_backtest(
-            self.history_cache[symbol],
-            settings=self._active_backtest_settings(symbol),
-            fee_rate=self.settings.fee_rate,
-            backtest_start_time=pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms"),
+    def _apply_live_lightweight_bar(self, symbol: str, bar: Dict[str, object]) -> None:
+        if symbol != self.current_symbol or self.chart_mode != "Lightweight" or self.chart is None:
+            return
+        series = pd.Series(
+            {
+                "time": pd.Timestamp(bar["time"]),
+                "open": float(bar["open"]),
+                "high": float(bar["high"]),
+                "low": float(bar["low"]),
+                "close": float(bar["close"]),
+                "volume": float(bar["volume"]),
+            }
         )
-        self.current_backtest = backtest
-        self.render_chart(symbol, backtest, reset_view=False)
-        self.update_summary(symbol, backtest, self.optimized_results.get(symbol))
+        try:
+            self.chart.update(series)
+        except Exception:
+            pass
+        self._refresh_live_labels()
+
+    def _schedule_live_backtest(self, symbol: str) -> None:
+        if symbol != self.current_symbol:
+            return
+        if self.live_backtest_worker and self.live_backtest_worker.isRunning():
+            self.live_recalc_pending = True
+            return
+        history = self.history_cache.get(symbol)
+        chart_history = self.chart_history_cache.get(symbol)
+        if history is None or chart_history is None:
+            return
+        worker = LiveBacktestWorker(
+            self.settings,
+            symbol,
+            history,
+            chart_history,
+            self._active_backtest_settings(symbol),
+        )
+        worker.completed.connect(self._on_live_backtest_completed)
+        worker.failed.connect(self._on_live_backtest_failed)
+        self.live_backtest_worker = worker
+        self._track_thread(worker, "live_backtest_worker")
+        worker.start()
+
+    def _on_live_backtest_completed(self, payload: object) -> None:
+        result = dict(payload)
+        symbol = str(result["symbol"])
+        if symbol != self.current_symbol:
+            return
+        self.history_cache[symbol] = result["history"]
+        self.chart_history_cache[symbol] = result["chart_history"]
+        self.current_backtest = result["backtest"]
+        self.current_chart_indicators = result["chart_indicators"]
+        self._prune_caches()
+        self.render_chart(symbol, self.current_backtest, reset_view=False)
+        self.update_summary(symbol, self.current_backtest, self.optimized_results.get(symbol))
+        if self.live_recalc_pending:
+            self.live_recalc_pending = False
+            self._schedule_live_backtest(symbol)
+
+    def _on_live_backtest_failed(self, message: str) -> None:
+        self.live_recalc_pending = False
+        self.log(message)
+
+    def _set_order_buttons_enabled(self, enabled: bool) -> None:
+        for button in self.long_buttons + self.short_buttons:
+            button.setEnabled(enabled)
+        self.close_position_button.setEnabled(enabled)
+        self._set_position_close_buttons_enabled(enabled)
+
+    def _set_position_close_buttons_enabled(self, enabled: bool) -> None:
+        for button in self.position_close_buttons:
+            button.setEnabled(enabled)
+
+    def _clear_entry_price_overlay(self) -> None:
+        if self.entry_price_line is None:
+            return
+        try:
+            self.entry_price_line.delete()
+        except Exception:
+            pass
+        self.entry_price_line = None
+
+    def _update_entry_price_overlay(self) -> None:
+        position = self.current_position_snapshot
+        if (
+            self.chart_mode != "Lightweight"
+            or self.chart is None
+            or position is None
+            or position.symbol != self.current_symbol
+        ):
+            self._clear_entry_price_overlay()
+            return
+        frame = self.chart_history_cache.get(position.symbol)
+        if frame is None or frame.empty:
+            frame = self.history_cache.get(position.symbol)
+        if frame is None or frame.empty:
+            self._clear_entry_price_overlay()
+            return
+        precision = self._resolve_price_precision(position.symbol, frame)
+        text = f"ENTRY {position.entry_price:.{precision}f}"
+        if self.entry_price_line is None:
+            self.entry_price_line = self.chart.horizontal_line(
+                position.entry_price,
+                color="#22f202",
+                width=1,
+                style="solid",
+                text=text,
+                axis_label_visible=True,
+            )
+        else:
+            self.entry_price_line.update(position.entry_price)
+            self.entry_price_line.options(color="#22f202", style="solid", width=1, text=text)
+
+    def _refresh_live_labels(self) -> None:
+        if not hasattr(self, "current_price_label"):
+            return
+        symbol = self.current_symbol
+        if not symbol:
+            self.current_price_label.setText("현재가: -")
+            self._set_lightweight_bar_close_overlay(None, None)
+            return
+
+        frame = self.chart_history_cache.get(symbol)
+        if frame is None or frame.empty:
+            frame = self.history_cache.get(symbol)
+        if frame is None or frame.empty:
+            self.current_price_label.setText("현재가: -")
+            self._set_lightweight_bar_close_overlay(None, None)
+            return
+
+        latest_price = float(frame["close"].iloc[-1])
+        precision = self._resolve_price_precision(symbol, frame)
+        self.current_price_label.setText(f"현재가: {latest_price:.{precision}f}")
+
+        now = pd.Timestamp.now(tz="UTC").tz_convert(None)
+        interval = self.current_interval or self.settings.kline_interval
+        value = int(interval[:-1])
+        unit = interval[-1]
+        if unit == "m":
+            floor_freq = f"{value}min"
+        elif unit == "h":
+            floor_freq = f"{value}h"
+        elif unit == "d":
+            floor_freq = f"{value}d"
+        else:
+            self._set_lightweight_bar_close_overlay(None, None)
+            return
+
+        bar_start = now.floor(floor_freq)
+        bar_end = bar_start + pd.Timedelta(milliseconds=_interval_to_ms(interval))
+        remaining_seconds = max(0, int((bar_end - now).total_seconds()))
+        minutes, seconds = divmod(remaining_seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            countdown = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        else:
+            countdown = f"{minutes:02d}:{seconds:02d}"
+        self._set_lightweight_bar_close_overlay(countdown, latest_price)
+
+    def update_positions_table(self) -> None:
+        if not hasattr(self, "positions_table"):
+            return
+        for button in self.position_close_buttons:
+            button.deleteLater()
+        self.position_close_buttons.clear()
+        self.positions_table.setRowCount(len(self.open_positions))
+        for row, position in enumerate(self.open_positions):
+            side = "LONG" if position.amount > 0 else "SHORT"
+            entry_text = f"{position.entry_price:.8f}".rstrip("0").rstrip(".")
+            values = [
+                position.symbol,
+                side,
+                f"{abs(position.amount):.6f}",
+                entry_text,
+                f"{position.unrealized_pnl:.2f}",
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(USER_ROLE, position.symbol)
+                self.positions_table.setItem(row, col, item)
+            button = QPushButton("청산")
+            button.clicked.connect(lambda _=False, symbol=position.symbol: self.close_position_for_symbol(symbol))
+            self.positions_table.setCellWidget(row, 5, button)
+            self.position_close_buttons.append(button)
+        self._set_position_close_buttons_enabled(self.order_worker is None or not self.order_worker.isRunning())
 
     def update_candidate_table(self) -> None:
+        self.candidate_table.setUpdatesEnabled(False)
         self.candidate_table.setRowCount(len(self.candidates))
         for row, candidate in enumerate(self.candidates):
             values = [
@@ -886,8 +1819,10 @@ class AltReversalTraderWindow(QMainWindow):
                 item = QTableWidgetItem(value)
                 item.setData(USER_ROLE, candidate.symbol)
                 self.candidate_table.setItem(row, col, item)
+        self.candidate_table.setUpdatesEnabled(True)
 
     def update_optimized_table(self) -> None:
+        self.optimized_table.setUpdatesEnabled(False)
         ordered = sorted(
             self.optimized_results.values(),
             key=lambda result: result.best_backtest.metrics.total_return_pct,
@@ -898,6 +1833,7 @@ class AltReversalTraderWindow(QMainWindow):
             metrics = result.best_backtest.metrics
             values = [
                 result.symbol,
+                result.best_interval or self.settings.kline_interval,
                 f"{metrics.total_return_pct:.2f}",
                 f"{metrics.max_drawdown_pct:.2f}",
                 str(metrics.trade_count),
@@ -909,6 +1845,14 @@ class AltReversalTraderWindow(QMainWindow):
                 item = QTableWidgetItem(value)
                 item.setData(USER_ROLE, result.symbol)
                 self.optimized_table.setItem(row, col, item)
+        self.optimized_table.setUpdatesEnabled(True)
+
+    def _schedule_optimized_table_refresh(self) -> None:
+        if not self.optimized_table_timer.isActive():
+            self.optimized_table_timer.start(OPTIMIZED_TABLE_REFRESH_MS)
+
+    def _flush_optimized_table(self) -> None:
+        self.update_optimized_table()
 
     def _init_auto_refresh(self) -> None:
         self.auto_refresh_timer.setInterval(self.auto_refresh_minutes * 60 * 1000)
@@ -930,6 +1874,10 @@ class AltReversalTraderWindow(QMainWindow):
         if self._is_refresh_running():
             return
         self.save_settings()
+        self._stop_scan_worker()
+        self._stop_optimize_worker()
+        self._stop_load_worker()
+        self._stop_live_backtest_worker()
         self.preserve_lists_during_refresh = preserve_existing
         self.pending_candidates = []
         self.pending_optimized_results = {}
@@ -942,12 +1890,14 @@ class AltReversalTraderWindow(QMainWindow):
             self.chart_history_cache.clear()
             self.current_symbol = None
             self.current_backtest = None
+            self.current_chart_indicators = None
             self.update_candidate_table()
             self.update_optimized_table()
             self.summary_box.clear()
         self.log("후보 스캔 + 최적화 시작" + (" (기존 목록 유지)" if preserve_existing else ""))
         self._set_refresh_running(True)
         self.scan_worker = ScanWorker(self.settings)
+        self._track_thread(self.scan_worker, "scan_worker")
         self.scan_worker.progress.connect(self.log)
         self.scan_worker.completed.connect(self.on_scan_completed)
         self.scan_worker.failed.connect(self.on_worker_failed)
@@ -982,6 +1932,7 @@ class AltReversalTraderWindow(QMainWindow):
             return
         self.log(f"최적화 시작: {len(targets)}개 종목")
         self.optimize_worker = OptimizeWorker(self.settings, targets)
+        self._track_thread(self.optimize_worker, "optimize_worker")
         self.optimize_worker.progress.connect(self.log)
         self.optimize_worker.result_ready.connect(self.on_optimization_result)
         self.optimize_worker.completed.connect(self.on_optimization_completed)
@@ -999,7 +1950,8 @@ class AltReversalTraderWindow(QMainWindow):
             return
         self.optimized_results[candidate.symbol] = optimization
         self.history_cache[candidate.symbol] = history
-        self.update_optimized_table()
+        self._prune_caches()
+        self._schedule_optimized_table_refresh()
 
     def on_optimization_completed(self) -> None:
         preserved_refresh = self.preserve_lists_during_refresh
@@ -1009,13 +1961,16 @@ class AltReversalTraderWindow(QMainWindow):
                 self.update_candidate_table()
             if self.pending_optimized_results:
                 self.optimized_results = dict(self.pending_optimized_results)
-                self.update_optimized_table()
+                self._flush_optimized_table()
             self.history_cache.update(self.pending_history_cache)
             self.pending_candidates = []
             self.pending_optimized_results = {}
             self.pending_history_cache = {}
             self.preserve_lists_during_refresh = False
+        self._prune_caches()
         self.log(f"최적화 완료: {len(self.optimized_results)}개")
+        if not preserved_refresh:
+            self._flush_optimized_table()
         if not preserved_refresh and self.optimized_table.rowCount() > 0:
             self.optimized_table.selectRow(0)
         self._set_refresh_running(False)
@@ -1025,6 +1980,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.pending_optimized_results = {}
         self.pending_history_cache = {}
         self.preserve_lists_during_refresh = False
+        log_runtime_event("Worker Failure", message, open_notepad=False)
         self.log(message)
         self._set_refresh_running(False)
         self.show_error(message)
@@ -1047,7 +2003,21 @@ class AltReversalTraderWindow(QMainWindow):
     def _request_symbol_load(self, symbol: str) -> None:
         if not symbol:
             return
-        if symbol == self.current_symbol and self.current_backtest is not None:
+        optimization = self.optimized_results.get(symbol)
+        target_interval = (optimization.best_interval or self.settings.kline_interval) if optimization else self.settings.kline_interval
+        if self.load_worker is not None and self.load_worker.isRunning():
+            return
+        if (
+            symbol == self.current_symbol
+            and target_interval == self.current_interval
+            and self.current_backtest is not None
+        ):
+            self.render_chart(
+                symbol,
+                self.current_backtest,
+                reset_view=True,
+                chart_indicators=self.current_chart_indicators,
+            )
             return
         self.load_symbol(symbol)
 
@@ -1072,68 +2042,74 @@ class AltReversalTraderWindow(QMainWindow):
             self._request_symbol_load(item.data(USER_ROLE) or item.text())
 
     def load_symbol(self, symbol: str) -> None:
-        try:
-            self._stop_live_stream()
-            self.current_symbol = symbol
-            self.save_settings()
-            backtest_start_time = pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms")
-            history = self.history_cache.get(symbol)
-            if history is None:
-                client = BinanceFuturesClient()
-                history = client.historical_ohlcv(
-                    symbol,
-                    self.settings.kline_interval,
-                    start_time=_history_fetch_start_time_ms(self.settings),
-                )
-                self.history_cache[symbol] = history
-            if history.empty:
-                self.show_warning(f"{symbol} 히스토리 데이터가 없습니다.")
-                return
+        self._sync_settings()
+        self._stop_live_stream()
+        self._stop_live_backtest_worker()
+        self._stop_load_worker()
+        self.current_symbol = symbol
+        optimization = self.optimized_results.get(symbol)
+        target_interval = (optimization.best_interval or self.settings.kline_interval) if optimization else self.settings.kline_interval
+        self.current_interval = target_interval
+        self.current_backtest = None
+        self.current_chart_indicators = None
+        self.load_request_id += 1
+        cached_history = self.history_cache.get(symbol) if target_interval == self.settings.kline_interval else None
+        cached_chart_history = self.chart_history_cache.get(symbol) if target_interval == self.settings.kline_interval else None
+        worker = SymbolLoadWorker(
+            self.load_request_id,
+            self.settings,
+            symbol,
+            target_interval,
+            cached_history,
+            cached_chart_history,
+            optimization.best_backtest if optimization else None,
+        )
+        worker.loaded.connect(self._on_symbol_loaded)
+        worker.failed.connect(self._on_symbol_load_failed)
+        self.load_worker = worker
+        self._track_thread(worker, "load_worker")
+        self.statusBar().showMessage(f"{symbol} 로드 중...", 3000)
+        worker.start()
 
+    def _on_symbol_loaded(self, payload: object) -> None:
+        result = dict(payload)
+        request_id = int(result["request_id"])
+        symbol = str(result["symbol"])
+        if request_id != self.load_request_id or symbol != self.current_symbol:
+            return
+        self.current_interval = str(result.get("interval", self.current_interval))
+        self.history_cache[symbol] = result["history"]
+        self.chart_history_cache[symbol] = result["chart_history"]
+        self.current_backtest = result["backtest"]
+        self.current_chart_indicators = result["chart_indicators"]
+        self._prune_caches()
+        optimization = self.optimized_results.get(symbol)
+        self.render_chart(symbol, self.current_backtest, reset_view=True, chart_indicators=self.current_chart_indicators)
+        self.update_summary(symbol, self.current_backtest, optimization)
+        self.refresh_account_info()
+        self._start_live_stream(symbol)
+
+    def _on_symbol_load_failed(self, message: str) -> None:
+        self.show_error(message)
+
+    def render_chart(
+        self,
+        symbol: str,
+        result: BacktestResult,
+        reset_view: bool = True,
+        chart_indicators: Optional[pd.DataFrame] = None,
+    ) -> None:
+        if chart_indicators is None and symbol == self.current_symbol and self.current_chart_indicators is not None:
+            chart_indicators = self.current_chart_indicators
+        if chart_indicators is None:
             chart_history = self.chart_history_cache.get(symbol)
-            if chart_history is None:
-                client = BinanceFuturesClient()
-                chart_history = client.historical_ohlcv_recent(
-                    symbol,
-                    self.settings.kline_interval,
-                    bars=CHART_HISTORY_BAR_LIMIT,
+            if chart_history is not None and not chart_history.empty:
+                chart_indicators = compact_indicator_frame(
+                    compute_indicators(prepare_ohlcv(chart_history), result.settings),
+                    CHART_INDICATOR_COLUMNS,
                 )
-                if chart_history.empty:
-                    chart_history = history.copy()
-                else:
-                    chart_history = (
-                        pd.concat([chart_history, history], ignore_index=True)
-                        .drop_duplicates(subset=["time"])
-                        .sort_values("time")
-                        .reset_index(drop=True)
-                    )
-                self.chart_history_cache[symbol] = chart_history
-
-            optimization = self.optimized_results.get(symbol)
-            backtest = (
-                optimization.best_backtest
-                if optimization
-                else run_backtest(
-                    history,
-                    settings=self.settings.strategy,
-                    fee_rate=self.settings.fee_rate,
-                    backtest_start_time=backtest_start_time,
-                )
-            )
-            self.current_backtest = backtest
-            self.render_chart(symbol, backtest)
-            self.update_summary(symbol, backtest, optimization)
-            self.refresh_account_info()
-            self._start_live_stream(symbol)
-        except Exception as exc:
-            self.show_error(str(exc))
-
-    def render_chart(self, symbol: str, result: BacktestResult, reset_view: bool = True) -> None:
-        chart_history = self.chart_history_cache.get(symbol)
-        if chart_history is not None and not chart_history.empty:
-            chart_indicators = compute_indicators(chart_history, result.settings)
-        else:
-            chart_indicators = result.indicators
+            else:
+                chart_indicators = result.indicators
         indicators = chart_indicators.sort_values("time").drop_duplicates(subset=["time"]).reset_index(drop=True)
         candle_df = indicators[["time", "open", "high", "low", "close", "volume"]].copy()
         equity_df = (
@@ -1150,13 +2126,15 @@ class AltReversalTraderWindow(QMainWindow):
         candidate = self._candidate_by_symbol(symbol)
         latest = result.latest_state
         self.symbol_label.setText(
-            f"종목: {symbol}"
+            f"종목: {symbol} | TF {self.current_interval}"
             + (f" | DayVol {candidate.daily_volatility_pct:.2f}% | RSI1m {candidate.rsi_1m:.2f}" if candidate else "")
         )
         self.signal_label.setText(
             f"신호: Trend {latest['trend']} | Zone {latest['zone']} | "
             f"Bull {latest['final_bull']} | Bear {latest['final_bear']} | RSI {latest['rsi']:.2f}"
         )
+        self._update_entry_price_overlay()
+        self._refresh_live_labels()
 
     def _render_plotly_chart(
         self,
@@ -1172,7 +2150,16 @@ class AltReversalTraderWindow(QMainWindow):
         if not self.plotly_js_path.exists() or self.plotly_js_path.stat().st_size == 0:
             self.plotly_js_path.write_text(get_plotlyjs(), encoding="utf-8")
         range_start, range_end = self._default_chart_time_range(candle_df) if reset_view else (None, None)
-        html = self._plotly_chart_html(symbol, candle_df, indicators, equity_df, trades, range_start, range_end)
+        html = self._plotly_chart_html(
+            symbol,
+            candle_df,
+            indicators,
+            equity_df,
+            trades,
+            range_start,
+            range_end,
+            reset_view=reset_view,
+        )
         self.plotly_chart_path.write_text(html, encoding="utf-8")
         chart_url = QUrl.fromLocalFile(str(self.plotly_chart_path))
         chart_url.setQuery(f"ts={self.plotly_chart_path.stat().st_mtime_ns}")
@@ -1189,6 +2176,8 @@ class AltReversalTraderWindow(QMainWindow):
     ) -> None:
         if self.chart is None:
             self._rebuild_chart_engine(force=True)
+        if not reset_view:
+            self._stash_lightweight_range()
         self.chart.set(candle_df)
         self._apply_lightweight_precision(symbol, candle_df)
         self.chart.clear_markers()
@@ -1199,6 +2188,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.ema_slow_line.set(indicators[["time", "ema_slow"]].rename(columns={"ema_slow": "EMA Slow"}))
         self.equity_line.set(equity_df)
         range_start, range_end = self._default_chart_time_range(candle_df)
+        latest_time = pd.Timestamp(candle_df["time"].iloc[-1]) if not candle_df.empty else None
 
         markers = []
         for trade in trades:
@@ -1211,15 +2201,16 @@ class AltReversalTraderWindow(QMainWindow):
                     "text": trade.zones,
                 }
             )
-            markers.append(
-                {
-                    "time": trade.exit_time,
-                    "position": "above" if trade.side == "long" else "below",
-                    "shape": "circle",
-                    "color": "#94a3b8",
-                    "text": f"{trade.return_pct:+.1f}%",
-                }
-            )
+            if not _is_provisional_exit_trade(trade, latest_time):
+                markers.append(
+                    {
+                        "time": trade.exit_time,
+                        "position": "above" if trade.side == "long" else "below",
+                        "shape": "circle",
+                        "color": "#f801e8",
+                        "text": f"{trade.return_pct:+.1f}%",
+                    }
+                )
         if markers:
             self.chart.marker_list(markers)
         if reset_view:
@@ -1227,6 +2218,8 @@ class AltReversalTraderWindow(QMainWindow):
                 140,
                 lambda s=symbol, st=range_start, et=range_end: self._sync_lightweight_range(s, st, et),
             )
+        else:
+            QTimer.singleShot(140, lambda s=symbol: self._restore_lightweight_range(s))
 
     def _sync_lightweight_range(self, symbol: str, start_time: pd.Timestamp, end_time: pd.Timestamp) -> None:
         if symbol != self.current_symbol or self.chart is None or self.equity_subchart is None:
@@ -1275,6 +2268,7 @@ class AltReversalTraderWindow(QMainWindow):
         trades,
         range_start: Optional[pd.Timestamp],
         range_end: Optional[pd.Timestamp],
+        reset_view: bool = True,
     ) -> str:
         fig = make_subplots(
             rows=2,
@@ -1339,6 +2333,8 @@ class AltReversalTraderWindow(QMainWindow):
                 secondary_y=False,
             )
 
+        latest_time = pd.Timestamp(candle_df["time"].iloc[-1]) if not candle_df.empty else None
+        plotted_trades = [trade for trade in trades if not _is_provisional_exit_trade(trade, latest_time)]
         long_entries = [trade for trade in trades if trade.side == "long"]
         short_entries = [trade for trade in trades if trade.side == "short"]
         if long_entries:
@@ -1371,20 +2367,32 @@ class AltReversalTraderWindow(QMainWindow):
                 col=1,
                 secondary_y=False,
             )
-        if trades:
+        if plotted_trades:
             fig.add_trace(
                 go.Scatter(
-                    x=[trade.exit_time for trade in trades],
-                    y=[trade.exit_price for trade in trades],
+                    x=[trade.exit_time for trade in plotted_trades],
+                    y=[trade.exit_price for trade in plotted_trades],
                     mode="markers+text",
                     name="Exit",
-                    text=[f"{trade.return_pct:+.1f}%" for trade in trades],
+                    text=[f"{trade.return_pct:+.1f}%" for trade in plotted_trades],
                     textposition="middle right",
-                    marker={"symbol": "x", "size": 9, "color": "#94a3b8"},
+                    marker={"symbol": "x", "size": 9, "color": "#f801e8"},
                 ),
                 row=1,
                 col=1,
                 secondary_y=False,
+            )
+
+        position = self.current_position_snapshot
+        if position is not None and position.symbol == self.current_symbol:
+            fig.add_hline(
+                y=position.entry_price,
+                line_color="#22f202",
+                line_width=1,
+                annotation_text="ENTRY",
+                annotation_position="top right",
+                row=1,
+                col=1,
             )
 
         fig.add_trace(
@@ -1455,6 +2463,46 @@ class AltReversalTraderWindow(QMainWindow):
             "scrollZoom": True,
             "modeBarButtonsToRemove": ["lasso2d", "select2d", "autoScale2d"],
         }
+        view_key = json.dumps(f"plotly_view::{symbol}::{self.current_interval or self.settings.kline_interval}")
+        default_from = json.dumps(range_start.isoformat() if range_start is not None else None)
+        default_to = json.dumps(range_end.isoformat() if range_end is not None else None)
+        reset_literal = "true" if reset_view else "false"
+        post_script = f"""
+        const gd = document.getElementById('{{plot_id}}');
+        const storageKey = {view_key};
+        const defaultFrom = {default_from};
+        const defaultTo = {default_to};
+        const shouldReset = {reset_literal};
+        const applyRange = (fromValue, toValue) => {{
+            if (!fromValue || !toValue) return;
+            Plotly.relayout(gd, {{
+                'xaxis.range': [fromValue, toValue],
+                'xaxis2.range': [fromValue, toValue]
+            }});
+        }};
+        const saveRange = (fromValue, toValue) => {{
+            if (!fromValue || !toValue) return;
+            localStorage.setItem(storageKey, JSON.stringify({{from: fromValue, to: toValue}}));
+        }};
+        gd.on('plotly_relayout', (eventData) => {{
+            const fromValue = eventData['xaxis.range[0]'] ?? eventData['xaxis2.range[0]'] ?? null;
+            const toValue = eventData['xaxis.range[1]'] ?? eventData['xaxis2.range[1]'] ?? null;
+            if (fromValue && toValue) {{
+                saveRange(fromValue, toValue);
+            }}
+        }});
+        if (shouldReset) {{
+            applyRange(defaultFrom, defaultTo);
+            saveRange(defaultFrom, defaultTo);
+        }} else {{
+            try {{
+                const saved = JSON.parse(localStorage.getItem(storageKey) || 'null');
+                if (saved && saved.from && saved.to) {{
+                    applyRange(saved.from, saved.to);
+                }}
+            }} catch (error) {{}}
+        }}
+        """
         return pio.to_html(
             fig,
             full_html=True,
@@ -1462,6 +2510,7 @@ class AltReversalTraderWindow(QMainWindow):
             config=config,
             default_width="100%",
             default_height=f"{max(self.chart_host.height(), 760)}px",
+            post_script=post_script,
         )
 
     def update_summary(self, symbol: str, backtest: BacktestResult, optimization: Optional[OptimizationResult]) -> None:
@@ -1486,6 +2535,9 @@ class AltReversalTraderWindow(QMainWindow):
         if optimization:
             lines.append("")
             lines.append(
+                f"Best Interval: {optimization.best_interval or self.current_interval}"
+            )
+            lines.append(
                 f"Optimization: {optimization.combinations_tested} combos"
                 + (" (trimmed)" if optimization.trimmed_grid else "")
                 + f", {optimization.duration_seconds:.2f}s"
@@ -1493,68 +2545,150 @@ class AltReversalTraderWindow(QMainWindow):
         self.summary_box.setPlainText("\n".join(lines))
 
     def refresh_account_info(self) -> None:
-        self.save_settings()
+        self._sync_settings()
         if not self.settings.api_key or not self.settings.api_secret:
+            self._stop_account_worker()
+            self.open_positions = []
+            self.current_position_snapshot = None
             self.balance_label.setText("잔고: API 미입력")
             self.position_label.setText("포지션: API 미입력")
+            self.update_positions_table()
+            self._clear_entry_price_overlay()
             return
-        try:
-            client = BinanceFuturesClient(self.settings.api_key, self.settings.api_secret)
-            balance = client.get_balance_snapshot()
-            self.balance_label.setText(
-                f"잔고: Equity {balance.equity:.2f} USDT | Available {balance.available_balance:.2f} USDT"
-            )
-            if self.current_symbol:
-                position = client.get_position(self.current_symbol)
-                if position is None:
-                    self.position_label.setText("포지션: 없음")
-                else:
-                    side = "LONG" if position.amount > 0 else "SHORT"
-                    self.position_label.setText(
-                        f"포지션: {side} {position.amount:.6f} @ {position.entry_price:.6f} | "
-                        f"UPnL {position.unrealized_pnl:.2f}"
-                    )
+        if self.account_worker is not None and self.account_worker.isRunning():
+            self.pending_account_refresh = True
+            return
+        self.account_request_id += 1
+        worker = AccountInfoWorker(
+            self.account_request_id,
+            self.settings.api_key,
+            self.settings.api_secret,
+            self.current_symbol,
+        )
+        worker.completed.connect(self._on_account_info_completed)
+        worker.failed.connect(self._on_account_info_failed)
+        self.account_worker = worker
+        self._track_thread(worker, "account_worker")
+        self.pending_account_refresh = False
+        self.refresh_balance_button.setEnabled(False)
+        self.statusBar().showMessage("잔고 조회 중...", 3000)
+        worker.start()
+
+    def _on_account_info_completed(self, payload: object) -> None:
+        result = dict(payload)
+        if int(result["request_id"]) != self.account_request_id:
+            return
+        requested_symbol = result.get("symbol")
+        balance = result["balance"]
+        position = result["position"]
+        self.open_positions = list(result.get("positions", []))
+        self.current_position_snapshot = position if (self.current_symbol and requested_symbol == self.current_symbol) else None
+        self.balance_label.setText(
+            f"잔고: Equity {balance.equity:.2f} USDT | Available {balance.available_balance:.2f} USDT"
+        )
+        if self.current_symbol and requested_symbol == self.current_symbol:
+            if position is None:
+                self.position_label.setText("포지션: 없음")
             else:
-                self.position_label.setText("포지션: 종목 미선택")
-        except Exception as exc:
-            self.balance_label.setText(f"잔고 조회 실패: {exc}")
-            self.position_label.setText("포지션: 조회 실패")
+                side = "LONG" if position.amount > 0 else "SHORT"
+                self.position_label.setText(
+                    f"포지션: {side} {position.amount:.6f} @ {position.entry_price:.6f} | "
+                    f"UPnL {position.unrealized_pnl:.2f}"
+                )
+        else:
+            self.position_label.setText("포지션: 종목 미선택")
+        self.update_positions_table()
+        if self.current_backtest and self.current_symbol:
+            if self.chart_mode == "Lightweight":
+                self._update_entry_price_overlay()
+            else:
+                self.render_chart(self.current_symbol, self.current_backtest, reset_view=False)
+        if not self._is_refresh_running():
+            self.refresh_balance_button.setEnabled(True)
+        if self.pending_account_refresh:
+            self.pending_account_refresh = False
+            self.refresh_account_info()
+
+    def _on_account_info_failed(self, message: str) -> None:
+        self.open_positions = []
+        self.current_position_snapshot = None
+        self.balance_label.setText("잔고 조회 실패")
+        self.position_label.setText("포지션: 조회 실패")
+        self.update_positions_table()
+        self._clear_entry_price_overlay()
+        self.log(message)
+        if not self._is_refresh_running():
+            self.refresh_balance_button.setEnabled(True)
+        if self.pending_account_refresh:
+            self.pending_account_refresh = False
+            self.refresh_account_info()
 
     def place_fractional_order(self, side: str, fraction: float) -> None:
-        self.save_settings()
+        self._sync_settings()
         if not self.current_symbol:
             self.show_warning("주문할 종목을 먼저 선택하세요.")
             return
         if not self.settings.api_key or not self.settings.api_secret:
             self.show_warning("API Key / Secret을 입력해야 실제 주문할 수 있습니다.")
             return
-        try:
-            client = BinanceFuturesClient(self.settings.api_key, self.settings.api_secret)
-            balance = client.get_balance_snapshot()
-            margin = balance.available_balance * fraction
-            client.set_leverage(self.current_symbol, self.settings.leverage)
-            quantity = client.build_order_quantity(self.current_symbol, margin, self.settings.leverage)
-            result = client.place_market_order(self.current_symbol, side, quantity)
-            self.log(f"주문 완료: {self.current_symbol} {side} qty={quantity} orderId={result.get('orderId')}")
-            self.refresh_account_info()
-        except Exception as exc:
-            self.show_error(str(exc))
+        if self.order_worker is not None and self.order_worker.isRunning():
+            self.show_warning("이미 주문 처리 중입니다.")
+            return
+        worker = OrderWorker(
+            self.settings.api_key,
+            self.settings.api_secret,
+            self.current_symbol,
+            self.settings.leverage,
+            side=side,
+            fraction=fraction,
+        )
+        worker.completed.connect(self._on_order_completed)
+        worker.failed.connect(self._on_order_failed)
+        self.order_worker = worker
+        self._track_thread(worker, "order_worker")
+        self._set_order_buttons_enabled(False)
+        self.statusBar().showMessage(f"{self.current_symbol} 주문 처리 중...", 3000)
+        worker.start()
 
     def close_selected_position(self) -> None:
-        self.save_settings()
         if not self.current_symbol:
             self.show_warning("종목을 먼저 선택하세요.")
             return
+        self.close_position_for_symbol(self.current_symbol)
+
+    def close_position_for_symbol(self, symbol: str) -> None:
+        self._sync_settings()
         if not self.settings.api_key or not self.settings.api_secret:
             self.show_warning("API Key / Secret을 입력해야 실제 주문할 수 있습니다.")
             return
-        try:
-            client = BinanceFuturesClient(self.settings.api_key, self.settings.api_secret)
-            result = client.close_position(self.current_symbol)
-            self.log("청산할 포지션이 없습니다." if result is None else f"포지션 청산 완료: orderId={result.get('orderId')}")
-            self.refresh_account_info()
-        except Exception as exc:
-            self.show_error(str(exc))
+        if self.order_worker is not None and self.order_worker.isRunning():
+            self.show_warning("이미 주문 처리 중입니다.")
+            return
+        worker = OrderWorker(
+            self.settings.api_key,
+            self.settings.api_secret,
+            symbol,
+            self.settings.leverage,
+            close_only=True,
+        )
+        worker.completed.connect(self._on_order_completed)
+        worker.failed.connect(self._on_order_failed)
+        self.order_worker = worker
+        self._track_thread(worker, "order_worker")
+        self._set_order_buttons_enabled(False)
+        self.statusBar().showMessage(f"{symbol} 청산 처리 중...", 3000)
+        worker.start()
+
+    def _on_order_completed(self, payload: object) -> None:
+        self._set_order_buttons_enabled(True)
+        result = dict(payload)
+        self.log(str(result.get("message", "주문 완료")))
+        self.refresh_account_info()
+
+    def _on_order_failed(self, message: str) -> None:
+        self._set_order_buttons_enabled(True)
+        self.log(message)
+        self.show_error("주문 처리 중 오류가 발생했습니다. 로그를 확인하세요.")
 
     def show_warning(self, message: str) -> None:
         QMessageBox.warning(self, "Warning", message)
@@ -1564,7 +2698,17 @@ class AltReversalTraderWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         try:
+            self.auto_refresh_timer.stop()
+            self.live_update_timer.stop()
+            self.optimized_table_timer.stop()
+            self._stop_scan_worker()
+            self._stop_optimize_worker()
+            self._stop_load_worker()
+            self._stop_live_backtest_worker()
+            self._stop_account_worker()
+            self._stop_order_worker()
             self._stop_live_stream()
+            self._drain_tracked_threads()
             self.save_settings()
         finally:
             super().closeEvent(event)
