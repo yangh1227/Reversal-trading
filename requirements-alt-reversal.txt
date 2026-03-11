@@ -5,3 +5,4 @@ pandas_ta
 numpy
 plotly
 requests
+websocket-client

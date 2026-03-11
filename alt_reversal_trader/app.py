@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Dict, List, Optional
 import traceback
@@ -10,6 +11,7 @@ import plotly.io as pio
 from plotly.offline import get_plotlyjs
 from plotly.subplots import make_subplots
 from lightweight_charts.widgets import QtChart
+import websocket
 
 from .binance_futures import BinanceFuturesClient, CandidateSymbol
 from .config import APP_INTERVAL_OPTIONS, CHART_ENGINE_OPTIONS, PARAMETER_SPECS, AppSettings, StrategySettings
@@ -55,6 +57,8 @@ from .strategy import BacktestResult, compute_indicators, estimate_warmup_bars, 
 
 CHART_HISTORY_BAR_LIMIT = 20_000
 BACKTEST_WARMUP_BAR_FLOOR = 1_500
+DEFAULT_CHART_LOOKBACK_HOURS = 12
+LIVE_RENDER_INTERVAL_MS = 500
 
 
 def _interval_to_ms(interval: str) -> int:
@@ -78,6 +82,108 @@ def _history_fetch_start_time_ms(settings: AppSettings) -> int:
     interval_ms = _interval_to_ms(settings.kline_interval)
     warmup_bars = max(estimate_warmup_bars(settings.strategy), BACKTEST_WARMUP_BAR_FLOOR)
     return _backtest_start_time_ms(settings) - warmup_bars * interval_ms
+
+
+def _ws_kline_timestamp(time_ms: int) -> pd.Timestamp:
+    return pd.to_datetime(int(time_ms), unit="ms", utc=True).tz_convert(None)
+
+
+def _merge_live_bar(df: pd.DataFrame, bar: Dict[str, object], max_rows: Optional[int] = None) -> pd.DataFrame:
+    columns = ["time", "open", "high", "low", "close", "volume"]
+    frame = df.copy() if df is not None and not df.empty else pd.DataFrame(columns=columns)
+    row = {key: bar[key] for key in columns}
+    if frame.empty:
+        frame = pd.DataFrame([row], columns=columns)
+    else:
+        frame["time"] = pd.to_datetime(frame["time"])
+        row_time = pd.Timestamp(row["time"])
+        last_time = pd.Timestamp(frame["time"].iloc[-1])
+        if last_time == row_time:
+            for key in columns[1:]:
+                frame.at[frame.index[-1], key] = row[key]
+        elif last_time < row_time:
+            frame = pd.concat([frame, pd.DataFrame([row], columns=columns)], ignore_index=True)
+        else:
+            matches = frame["time"] == row_time
+            if matches.any():
+                idx = frame.index[matches][-1]
+                for key in columns[1:]:
+                    frame.at[idx, key] = row[key]
+            else:
+                frame = (
+                    pd.concat([frame, pd.DataFrame([row], columns=columns)], ignore_index=True)
+                    .drop_duplicates(subset=["time"], keep="last")
+                    .sort_values("time")
+                    .reset_index(drop=True)
+                )
+    if max_rows is not None and len(frame) > max_rows:
+        frame = frame.iloc[-max_rows:].reset_index(drop=True)
+    return frame
+
+
+class KlineStreamWorker(QThread):
+    kline = Signal(object)
+    status = Signal(str)
+
+    def __init__(self, symbol: str, interval: str) -> None:
+        super().__init__()
+        self.symbol = symbol.upper()
+        self.interval = interval
+        self._stopped = False
+        self._socket = None
+
+    def stop(self) -> None:
+        self._stopped = True
+        if self._socket is not None:
+            try:
+                self._socket.close()
+            except Exception:
+                pass
+
+    def run(self) -> None:
+        stream_url = f"wss://fstream.binance.com/ws/{self.symbol.lower()}@kline_{self.interval}"
+        while not self._stopped:
+            try:
+                self.status.emit(f"실시간 스트림 연결: {self.symbol} {self.interval}")
+                self._socket = websocket.create_connection(stream_url, timeout=10)
+                self._socket.settimeout(1.0)
+                while not self._stopped:
+                    try:
+                        raw = self._socket.recv()
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    if not raw:
+                        continue
+                    payload = json.loads(raw)
+                    if payload.get("e") != "kline":
+                        continue
+                    kline = payload.get("k", {})
+                    self.kline.emit(
+                        {
+                            "symbol": self.symbol,
+                            "interval": self.interval,
+                            "time": _ws_kline_timestamp(int(kline["t"])),
+                            "open": float(kline["o"]),
+                            "high": float(kline["h"]),
+                            "low": float(kline["l"]),
+                            "close": float(kline["c"]),
+                            "volume": float(kline["v"]),
+                            "closed": bool(kline.get("x", False)),
+                        }
+                    )
+            except Exception as exc:
+                if self._stopped:
+                    break
+                self.status.emit(f"실시간 스트림 재연결 대기: {self.symbol} ({exc})")
+                self.msleep(2000)
+            finally:
+                if self._socket is not None:
+                    try:
+                        self._socket.close()
+                    except Exception:
+                        pass
+                    self._socket = None
+        self.status.emit(f"실시간 스트림 종료: {self.symbol}")
 
 
 class ScanWorker(QThread):
@@ -164,12 +270,19 @@ class AltReversalTraderWindow(QMainWindow):
         self.optimized_results: Dict[str, OptimizationResult] = {}
         self.history_cache: Dict[str, pd.DataFrame] = {}
         self.chart_history_cache: Dict[str, pd.DataFrame] = {}
+        self.pending_candidates: List[CandidateSymbol] = []
+        self.pending_optimized_results: Dict[str, OptimizationResult] = {}
+        self.pending_history_cache: Dict[str, pd.DataFrame] = {}
+        self.preserve_lists_during_refresh = False
         self.current_symbol: Optional[str] = None
         self.current_backtest: Optional[BacktestResult] = None
         self.scan_worker: Optional[ScanWorker] = None
         self.optimize_worker: Optional[OptimizeWorker] = None
+        self.live_stream_worker: Optional[KlineStreamWorker] = None
+        self.live_pending_bar: Optional[Dict[str, object]] = None
         self.auto_refresh_minutes = 10
         self.auto_refresh_timer = QTimer(self)
+        self.live_update_timer = QTimer(self)
         self.parameter_editors: Dict[str, object] = {}
         self.parameter_opt_boxes: Dict[str, QCheckBox] = {}
         self.plotly_chart_path = Path("alt_reversal_trader_plotly_chart.html").resolve()
@@ -190,6 +303,8 @@ class AltReversalTraderWindow(QMainWindow):
         self._build_ui()
         self._apply_loaded_settings()
         self._init_chart()
+        self.live_update_timer.setSingleShot(True)
+        self.live_update_timer.timeout.connect(self._flush_live_update)
         self.chart_engine_combo.currentTextChanged.connect(self.on_chart_engine_changed)
         self._init_auto_refresh()
         self.statusBar().showMessage("준비됨")
@@ -431,6 +546,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.candidate_table.setEditTriggers(NO_EDIT_TRIGGERS)
         self.candidate_table.horizontalHeader().setStretchLastSection(True)
         self.candidate_table.itemSelectionChanged.connect(self.on_candidate_selection_changed)
+        self.candidate_table.cellClicked.connect(self.on_candidate_cell_clicked)
         layout.addWidget(self.candidate_table)
         return group
 
@@ -444,6 +560,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.optimized_table.setEditTriggers(NO_EDIT_TRIGGERS)
         self.optimized_table.horizontalHeader().setStretchLastSection(True)
         self.optimized_table.itemSelectionChanged.connect(self.on_optimized_selection_changed)
+        self.optimized_table.cellClicked.connect(self.on_optimized_cell_clicked)
         layout.addWidget(self.optimized_table)
         return group
 
@@ -497,18 +614,18 @@ class AltReversalTraderWindow(QMainWindow):
     def _init_lightweight_chart(self) -> None:
         self.chart = QtChart(self.chart_host)
         self.chart_host_layout.addWidget(self.chart.get_webview())
-        self.chart.layout(background_color="#0f1419", text_color="#dfe6eb", font_size=12, font_family="Consolas")
+        self.chart.layout(background_color="#0f1419", text_color="#eceff4", font_size=12, font_family="Consolas")
         self.chart.legend(True)
         self.chart.candle_style(
-            up_color="#17c964",
-            down_color="#f31260",
-            border_up_color="#17c964",
-            border_down_color="#f31260",
-            wick_up_color="#17c964",
-            wick_down_color="#f31260",
+            up_color="#d8f3dc",
+            down_color="rgba(0, 0, 0, 0)",
+            border_up_color="#d8f3dc",
+            border_down_color="#ff5d73",
+            wick_up_color="#d8f3dc",
+            wick_down_color="#ff5d73",
         )
-        self.chart.volume_config(up_color="rgba(23, 201, 100, 0.45)", down_color="rgba(243, 18, 96, 0.45)")
-        self.chart.watermark("ALT MR", color="rgba(180, 190, 210, 0.22)")
+        self.chart.volume_config(up_color="rgba(216, 243, 220, 0.30)", down_color="rgba(255, 93, 115, 0.28)")
+        self.chart.watermark("ALT MR", color="rgba(240, 242, 245, 0.16)")
         self.chart.crosshair(mode="normal")
         self.chart.time_scale(time_visible=True, seconds_visible=False, min_bar_spacing=0.01, right_offset=0)
         self.equity_subchart = self.chart.create_subchart(
@@ -518,7 +635,7 @@ class AltReversalTraderWindow(QMainWindow):
             sync=True,
             scale_candles_only=True,
         )
-        self.equity_subchart.layout(background_color="#121922", text_color="#dfe6eb", font_size=11, font_family="Consolas")
+        self.equity_subchart.layout(background_color="#121922", text_color="#eceff4", font_size=11, font_family="Consolas")
         self.equity_subchart.legend(True)
         self.equity_subchart.time_scale(time_visible=True, seconds_visible=False, min_bar_spacing=0.01, right_offset=0)
         self.equity_line = self.equity_subchart.create_line(
@@ -528,11 +645,41 @@ class AltReversalTraderWindow(QMainWindow):
             price_line=False,
             price_label=False,
         )
-        self.supertrend_line = self.chart.create_line("Supertrend", color="rgba(255, 204, 0, 0.85)", width=2)
-        self.zone2_line = self.chart.create_line("Zone 2", color="rgba(255, 145, 0, 0.65)", width=1)
-        self.zone3_line = self.chart.create_line("Zone 3", color="rgba(255, 23, 68, 0.65)", width=1)
-        self.ema_fast_line = self.chart.create_line("EMA Fast", color="rgba(0, 229, 255, 0.7)", width=1)
-        self.ema_slow_line = self.chart.create_line("EMA Slow", color="rgba(255, 214, 0, 0.7)", width=1)
+        self.supertrend_line = self.chart.create_line(
+            "Supertrend",
+            color="rgba(255, 225, 120, 0.95)",
+            width=2,
+            price_line=False,
+            price_label=False,
+        )
+        self.zone2_line = self.chart.create_line(
+            "Zone 2",
+            color="rgba(255, 186, 73, 0.72)",
+            width=1,
+            price_line=False,
+            price_label=False,
+        )
+        self.zone3_line = self.chart.create_line(
+            "Zone 3",
+            color="rgba(255, 123, 123, 0.72)",
+            width=1,
+            price_line=False,
+            price_label=False,
+        )
+        self.ema_fast_line = self.chart.create_line(
+            "EMA Fast",
+            color="rgba(153, 229, 255, 0.82)",
+            width=1,
+            price_line=False,
+            price_label=False,
+        )
+        self.ema_slow_line = self.chart.create_line(
+            "EMA Slow",
+            color="rgba(255, 243, 176, 0.82)",
+            width=1,
+            price_line=False,
+            price_label=False,
+        )
 
     def on_chart_engine_changed(self, _engine: str) -> None:
         self.settings.chart_engine = self.chart_engine_combo.currentText()
@@ -599,6 +746,7 @@ class AltReversalTraderWindow(QMainWindow):
             previous.kline_interval != self.settings.kline_interval
             or previous.history_days != self.settings.history_days
         ):
+            self._stop_live_stream()
             self.history_cache.clear()
             self.chart_history_cache.clear()
         self.settings.save()
@@ -656,6 +804,73 @@ class AltReversalTraderWindow(QMainWindow):
             if line is not None:
                 line.precision(precision)
 
+    def _default_chart_time_range(self, candle_df: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp]:
+        if candle_df.empty:
+            now = pd.Timestamp.utcnow().tz_localize(None)
+            return now - pd.Timedelta(hours=DEFAULT_CHART_LOOKBACK_HOURS), now
+        end_time = pd.Timestamp(candle_df["time"].iloc[-1])
+        start_floor = pd.Timestamp(candle_df["time"].iloc[0])
+        start_time = max(start_floor, end_time - pd.Timedelta(hours=DEFAULT_CHART_LOOKBACK_HOURS))
+        return start_time, end_time
+
+    def _active_backtest_settings(self, symbol: str) -> StrategySettings:
+        optimization = self.optimized_results.get(symbol)
+        return optimization.best_backtest.settings if optimization else self.settings.strategy
+
+    def _stop_live_stream(self) -> None:
+        worker = self.live_stream_worker
+        self.live_stream_worker = None
+        self.live_pending_bar = None
+        if self.live_update_timer.isActive():
+            self.live_update_timer.stop()
+        if worker is not None:
+            worker.stop()
+            worker.wait(1500)
+
+    def _start_live_stream(self, symbol: str) -> None:
+        self._stop_live_stream()
+        worker = KlineStreamWorker(symbol, self.settings.kline_interval)
+        worker.kline.connect(self._queue_live_update)
+        worker.status.connect(self._on_live_stream_status)
+        self.live_stream_worker = worker
+        worker.start()
+
+    def _on_live_stream_status(self, message: str) -> None:
+        self.statusBar().showMessage(message, 3000)
+
+    def _queue_live_update(self, payload: object) -> None:
+        bar = dict(payload)
+        if bar.get("symbol") != self.current_symbol:
+            return
+        self.live_pending_bar = bar
+        self.live_update_timer.setInterval(LIVE_RENDER_INTERVAL_MS if self.chart_mode == "Lightweight" else 1000)
+        if not self.live_update_timer.isActive():
+            self.live_update_timer.start()
+
+    def _flush_live_update(self) -> None:
+        bar = self.live_pending_bar
+        self.live_pending_bar = None
+        if not bar or not self.current_symbol:
+            return
+        symbol = str(bar["symbol"])
+        history = self.history_cache.get(symbol)
+        chart_history = self.chart_history_cache.get(symbol)
+        if history is None or chart_history is None:
+            return
+
+        self.history_cache[symbol] = _merge_live_bar(history, bar)
+        self.chart_history_cache[symbol] = _merge_live_bar(chart_history, bar, max_rows=CHART_HISTORY_BAR_LIMIT)
+
+        backtest = run_backtest(
+            self.history_cache[symbol],
+            settings=self._active_backtest_settings(symbol),
+            fee_rate=self.settings.fee_rate,
+            backtest_start_time=pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms"),
+        )
+        self.current_backtest = backtest
+        self.render_chart(symbol, backtest, reset_view=False)
+        self.update_summary(symbol, backtest, self.optimized_results.get(symbol))
+
     def update_candidate_table(self) -> None:
         self.candidate_table.setRowCount(len(self.candidates))
         for row, candidate in enumerate(self.candidates):
@@ -711,18 +926,26 @@ class AltReversalTraderWindow(QMainWindow):
             or (self.optimize_worker and self.optimize_worker.isRunning())
         )
 
-    def run_scan_and_optimize(self) -> None:
+    def run_scan_and_optimize(self, preserve_existing: bool = False) -> None:
         if self._is_refresh_running():
             return
         self.save_settings()
-        self.candidates = []
-        self.optimized_results.clear()
-        self.history_cache.clear()
-        self.chart_history_cache.clear()
-        self.update_candidate_table()
-        self.update_optimized_table()
-        self.summary_box.clear()
-        self.log("후보 스캔 + 최적화 시작")
+        self.preserve_lists_during_refresh = preserve_existing
+        self.pending_candidates = []
+        self.pending_optimized_results = {}
+        self.pending_history_cache = {}
+        if not preserve_existing:
+            self._stop_live_stream()
+            self.candidates = []
+            self.optimized_results.clear()
+            self.history_cache.clear()
+            self.chart_history_cache.clear()
+            self.current_symbol = None
+            self.current_backtest = None
+            self.update_candidate_table()
+            self.update_optimized_table()
+            self.summary_box.clear()
+        self.log("후보 스캔 + 최적화 시작" + (" (기존 목록 유지)" if preserve_existing else ""))
         self._set_refresh_running(True)
         self.scan_worker = ScanWorker(self.settings)
         self.scan_worker.progress.connect(self.log)
@@ -731,14 +954,24 @@ class AltReversalTraderWindow(QMainWindow):
         self.scan_worker.start()
 
     def on_scan_completed(self, candidates: object) -> None:
-        self.candidates = list(candidates)
-        self.update_candidate_table()
-        self.log(f"후보 스캔 완료: {len(self.candidates)}개")
-        if self.candidates:
-            self.candidate_table.selectRow(0)
-            self.start_optimization(self.candidates)
+        self.pending_candidates = list(candidates)
+        if not self.preserve_lists_during_refresh:
+            self.candidates = list(self.pending_candidates)
+            self.update_candidate_table()
+        self.log(f"후보 스캔 완료: {len(self.pending_candidates)}개")
+        if self.pending_candidates:
+            if not self.preserve_lists_during_refresh:
+                self.candidate_table.selectRow(0)
+            self.start_optimization(self.pending_candidates)
             return
-        self.log("후보가 없어 최적화를 건너뜁니다.")
+        if self.preserve_lists_during_refresh:
+            self.log("새 후보가 없어 기존 목록을 유지합니다.")
+        else:
+            self.log("후보가 없어 최적화를 건너뜁니다.")
+        self.pending_candidates = []
+        self.pending_optimized_results = {}
+        self.pending_history_cache = {}
+        self.preserve_lists_during_refresh = False
         self._set_refresh_running(False)
 
     def start_optimization(self, targets: List[CandidateSymbol]) -> None:
@@ -760,17 +993,38 @@ class AltReversalTraderWindow(QMainWindow):
         candidate: CandidateSymbol = result["candidate"]
         optimization: OptimizationResult = result["optimization"]
         history: pd.DataFrame = result["history"]
+        if self.preserve_lists_during_refresh:
+            self.pending_optimized_results[candidate.symbol] = optimization
+            self.pending_history_cache[candidate.symbol] = history
+            return
         self.optimized_results[candidate.symbol] = optimization
         self.history_cache[candidate.symbol] = history
         self.update_optimized_table()
 
     def on_optimization_completed(self) -> None:
+        preserved_refresh = self.preserve_lists_during_refresh
+        if preserved_refresh:
+            if self.pending_candidates:
+                self.candidates = list(self.pending_candidates)
+                self.update_candidate_table()
+            if self.pending_optimized_results:
+                self.optimized_results = dict(self.pending_optimized_results)
+                self.update_optimized_table()
+            self.history_cache.update(self.pending_history_cache)
+            self.pending_candidates = []
+            self.pending_optimized_results = {}
+            self.pending_history_cache = {}
+            self.preserve_lists_during_refresh = False
         self.log(f"최적화 완료: {len(self.optimized_results)}개")
-        if self.optimized_table.rowCount() > 0:
+        if not preserved_refresh and self.optimized_table.rowCount() > 0:
             self.optimized_table.selectRow(0)
         self._set_refresh_running(False)
 
     def on_worker_failed(self, message: str) -> None:
+        self.pending_candidates = []
+        self.pending_optimized_results = {}
+        self.pending_history_cache = {}
+        self.preserve_lists_during_refresh = False
         self.log(message)
         self._set_refresh_running(False)
         self.show_error(message)
@@ -780,7 +1034,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.log("자동 10분 갱신 시점이지만 이전 작업이 아직 실행 중이라 건너뜁니다.")
             return
         self.log("자동 10분 갱신 시작")
-        self.run_scan_and_optimize()
+        self.run_scan_and_optimize(preserve_existing=True)
 
     def selected_candidate_symbols(self) -> List[str]:
         selected = self.candidate_table.selectedItems()
@@ -790,18 +1044,36 @@ class AltReversalTraderWindow(QMainWindow):
         symbol_item = self.candidate_table.item(row, 0)
         return [symbol_item.text()] if symbol_item else []
 
+    def _request_symbol_load(self, symbol: str) -> None:
+        if not symbol:
+            return
+        if symbol == self.current_symbol and self.current_backtest is not None:
+            return
+        self.load_symbol(symbol)
+
     def on_candidate_selection_changed(self) -> None:
         selected = self.candidate_table.selectedItems()
         if selected:
-            self.load_symbol(selected[0].data(USER_ROLE) or selected[0].text())
+            self._request_symbol_load(selected[0].data(USER_ROLE) or selected[0].text())
+
+    def on_candidate_cell_clicked(self, row: int, _column: int) -> None:
+        item = self.candidate_table.item(row, 0)
+        if item:
+            self._request_symbol_load(item.data(USER_ROLE) or item.text())
 
     def on_optimized_selection_changed(self) -> None:
         selected = self.optimized_table.selectedItems()
         if selected:
-            self.load_symbol(selected[0].data(USER_ROLE) or selected[0].text())
+            self._request_symbol_load(selected[0].data(USER_ROLE) or selected[0].text())
+
+    def on_optimized_cell_clicked(self, row: int, _column: int) -> None:
+        item = self.optimized_table.item(row, 0)
+        if item:
+            self._request_symbol_load(item.data(USER_ROLE) or item.text())
 
     def load_symbol(self, symbol: str) -> None:
         try:
+            self._stop_live_stream()
             self.current_symbol = symbol
             self.save_settings()
             backtest_start_time = pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms")
@@ -852,10 +1124,11 @@ class AltReversalTraderWindow(QMainWindow):
             self.render_chart(symbol, backtest)
             self.update_summary(symbol, backtest, optimization)
             self.refresh_account_info()
+            self._start_live_stream(symbol)
         except Exception as exc:
             self.show_error(str(exc))
 
-    def render_chart(self, symbol: str, result: BacktestResult) -> None:
+    def render_chart(self, symbol: str, result: BacktestResult, reset_view: bool = True) -> None:
         chart_history = self.chart_history_cache.get(symbol)
         if chart_history is not None and not chart_history.empty:
             chart_indicators = compute_indicators(chart_history, result.settings)
@@ -870,9 +1143,9 @@ class AltReversalTraderWindow(QMainWindow):
             .reset_index(drop=True)
         )
         if self.chart_mode == "Lightweight":
-            self._render_lightweight_chart(symbol, candle_df, indicators, equity_df, result.trades)
+            self._render_lightweight_chart(symbol, candle_df, indicators, equity_df, result.trades, reset_view=reset_view)
         else:
-            self._render_plotly_chart(symbol, candle_df, indicators, equity_df, result.trades)
+            self._render_plotly_chart(symbol, candle_df, indicators, equity_df, result.trades, reset_view=reset_view)
 
         candidate = self._candidate_by_symbol(symbol)
         latest = result.latest_state
@@ -892,12 +1165,14 @@ class AltReversalTraderWindow(QMainWindow):
         indicators: pd.DataFrame,
         equity_df: pd.DataFrame,
         trades,
+        reset_view: bool = True,
     ) -> None:
         if self.chart_view is None:
             self._rebuild_chart_engine(force=True)
         if not self.plotly_js_path.exists() or self.plotly_js_path.stat().st_size == 0:
             self.plotly_js_path.write_text(get_plotlyjs(), encoding="utf-8")
-        html = self._plotly_chart_html(symbol, candle_df, indicators, equity_df, trades)
+        range_start, range_end = self._default_chart_time_range(candle_df) if reset_view else (None, None)
+        html = self._plotly_chart_html(symbol, candle_df, indicators, equity_df, trades, range_start, range_end)
         self.plotly_chart_path.write_text(html, encoding="utf-8")
         chart_url = QUrl.fromLocalFile(str(self.plotly_chart_path))
         chart_url.setQuery(f"ts={self.plotly_chart_path.stat().st_mtime_ns}")
@@ -910,6 +1185,7 @@ class AltReversalTraderWindow(QMainWindow):
         indicators: pd.DataFrame,
         equity_df: pd.DataFrame,
         trades,
+        reset_view: bool = True,
     ) -> None:
         if self.chart is None:
             self._rebuild_chart_engine(force=True)
@@ -922,6 +1198,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.ema_fast_line.set(indicators[["time", "ema_fast"]].rename(columns={"ema_fast": "EMA Fast"}))
         self.ema_slow_line.set(indicators[["time", "ema_slow"]].rename(columns={"ema_slow": "EMA Slow"}))
         self.equity_line.set(equity_df)
+        range_start, range_end = self._default_chart_time_range(candle_df)
 
         markers = []
         for trade in trades:
@@ -945,25 +1222,18 @@ class AltReversalTraderWindow(QMainWindow):
             )
         if markers:
             self.chart.marker_list(markers)
-        QTimer.singleShot(
-            140,
-            lambda s=symbol, bars=len(candle_df), equity_bars=len(equity_df): self._sync_lightweight_range(s, bars, equity_bars),
-        )
+        if reset_view:
+            QTimer.singleShot(
+                140,
+                lambda s=symbol, st=range_start, et=range_end: self._sync_lightweight_range(s, st, et),
+            )
 
-    def _sync_lightweight_range(self, symbol: str, candle_bars: int, equity_bars: int) -> None:
+    def _sync_lightweight_range(self, symbol: str, start_time: pd.Timestamp, end_time: pd.Timestamp) -> None:
         if symbol != self.current_symbol or self.chart is None or self.equity_subchart is None:
             return
         try:
-            candle_to = max(candle_bars - 1, 1)
-            equity_to = max(equity_bars - 1, 1)
-            self.chart.run_script(
-                f"{self.chart.id}.chart.timeScale().setVisibleLogicalRange({{from: 0, to: {candle_to}}})"
-            )
-            self.equity_subchart.run_script(
-                f"{self.equity_subchart.id}.chart.timeScale().setVisibleLogicalRange({{from: 0, to: {equity_to}}})"
-            )
-            self.chart.fit()
-            self.equity_subchart.fit()
+            self.chart.set_visible_range(start_time, end_time)
+            self.equity_subchart.set_visible_range(start_time, end_time)
         except Exception:
             self.chart.fit()
             self.equity_subchart.fit()
@@ -1003,6 +1273,8 @@ class AltReversalTraderWindow(QMainWindow):
         indicators: pd.DataFrame,
         equity_df: pd.DataFrame,
         trades,
+        range_start: Optional[pd.Timestamp],
+        range_end: Optional[pd.Timestamp],
     ) -> str:
         fig = make_subplots(
             rows=2,
@@ -1145,11 +1417,14 @@ class AltReversalTraderWindow(QMainWindow):
             xaxis_rangeslider_visible=False,
             hovermode="x unified",
         )
-        fig.update_xaxes(
-            showgrid=True,
-            gridcolor="rgba(120, 130, 150, 0.14)",
-            zeroline=False,
-        )
+        xaxis_options = {
+            "showgrid": True,
+            "gridcolor": "rgba(120, 130, 150, 0.14)",
+            "zeroline": False,
+        }
+        if range_start is not None and range_end is not None:
+            xaxis_options["range"] = [range_start, range_end]
+        fig.update_xaxes(**xaxis_options)
         fig.update_yaxes(
             showgrid=True,
             gridcolor="rgba(120, 130, 150, 0.14)",
@@ -1289,6 +1564,7 @@ class AltReversalTraderWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         try:
+            self._stop_live_stream()
             self.save_settings()
         finally:
             super().closeEvent(event)
