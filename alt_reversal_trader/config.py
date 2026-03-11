@@ -8,6 +8,7 @@ import json
 
 APP_CONFIG_PATH = Path("alt_reversal_trader_config.json")
 APP_INTERVAL_OPTIONS = ("1m", "3m", "5m", "15m")
+CHART_ENGINE_OPTIONS = ("Plotly", "Lightweight")
 QIP_SENSITIVITY_OPTIONS = (
     "1-Ultra Fine Max",
     "2-Ultra Fine",
@@ -69,6 +70,7 @@ class StrategySettings:
 class AppSettings:
     api_key: str = ""
     api_secret: str = ""
+    chart_engine: str = "Plotly"
     leverage: int = 3
     fee_rate: float = 0.0005
     history_days: int = 5
@@ -86,6 +88,8 @@ class AppSettings:
     optimize_flags: Dict[str, bool] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if self.chart_engine not in CHART_ENGINE_OPTIONS:
+            self.chart_engine = CHART_ENGINE_OPTIONS[0]
         if not self.optimize_flags:
             self.optimize_flags = DEFAULT_OPTIMIZE_FLAGS.copy()
 
@@ -93,6 +97,7 @@ class AppSettings:
         return {
             "api_key": self.api_key,
             "api_secret": self.api_secret,
+            "chart_engine": self.chart_engine,
             "leverage": self.leverage,
             "fee_rate": self.fee_rate,
             "history_days": self.history_days,

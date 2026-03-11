@@ -304,6 +304,31 @@ class BinanceFuturesClient:
                 break
         return _rows_to_ohlcv_frame(rows)
 
+    def historical_ohlcv_recent(
+        self,
+        symbol: str,
+        interval: str,
+        bars: int,
+        end_time: Optional[int] = None,
+    ) -> pd.DataFrame:
+        target_bars = max(int(bars), 1)
+        cursor_end = int(end_time or time.time() * 1000)
+        rows: List[List[Any]] = []
+
+        while target_bars > 0:
+            batch_limit = min(target_bars, 1500)
+            batch = self.klines(symbol, interval, limit=batch_limit, end_time=cursor_end, ttl_seconds=0.0)
+            if not batch:
+                break
+            rows.extend(batch)
+            target_bars -= len(batch)
+            earliest_open_time = int(batch[0][0])
+            if len(batch) < batch_limit or earliest_open_time <= 0:
+                break
+            cursor_end = earliest_open_time - 1
+
+        return _rows_to_ohlcv_frame(rows)
+
     def usdt_perpetual_symbols(self) -> List[str]:
         symbols = []
         for entry in self.exchange_info().get("symbols", []):

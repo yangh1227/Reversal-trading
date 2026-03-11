@@ -36,6 +36,17 @@ def test_backtest_smoke() -> None:
     assert result.metrics.trade_count >= 0
     assert not result.indicators.empty
     assert {"supertrend", "final_bull", "final_bear"}.issubset(result.indicators.columns)
+    assert result.indicators["supertrend"].notna().any()
+    assert result.indicators["ema_fast"].notna().any()
+
+
+def test_backtest_respects_start_time_window() -> None:
+    df = make_sample_ohlcv(800)
+    start_time = df["time"].iloc[500]
+    result = run_backtest(df, settings=StrategySettings(), backtest_start_time=start_time)
+    assert not result.indicators.empty
+    assert result.indicators["time"].iloc[0] >= start_time
+    assert result.equity_curve.index[0] >= start_time
 
 
 def test_parameter_grid_respects_limits() -> None:

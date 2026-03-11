@@ -115,23 +115,32 @@ def _supertrend(df: pd.DataFrame, length: int, factor: float) -> tuple[pd.Series
     supertrend = pd.Series(index=df.index, dtype=float)
     direction = pd.Series(index=df.index, dtype=float)
 
-    for i in range(len(df)):
-        if i == 0:
-            supertrend.iat[i] = upperband.iat[i]
-            direction.iat[i] = 1.0
-            continue
+    valid_start = next((i for i, value in enumerate(atr) if np.isfinite(value)), None)
+    if valid_start is None:
+        return supertrend, direction, atr
 
-        if upperband.iat[i] < final_upper.iat[i - 1] or close.iat[i - 1] > final_upper.iat[i - 1]:
+    supertrend.iat[valid_start] = upperband.iat[valid_start]
+    direction.iat[valid_start] = 1.0
+
+    for i in range(valid_start + 1, len(df)):
+        prev_final_upper = final_upper.iat[i - 1]
+        prev_final_lower = final_lower.iat[i - 1]
+        if not np.isfinite(prev_final_upper):
+            prev_final_upper = upperband.iat[i - 1]
+        if not np.isfinite(prev_final_lower):
+            prev_final_lower = lowerband.iat[i - 1]
+
+        if upperband.iat[i] < prev_final_upper or close.iat[i - 1] > prev_final_upper:
             final_upper.iat[i] = upperband.iat[i]
         else:
-            final_upper.iat[i] = final_upper.iat[i - 1]
+            final_upper.iat[i] = prev_final_upper
 
-        if lowerband.iat[i] > final_lower.iat[i - 1] or close.iat[i - 1] < final_lower.iat[i - 1]:
+        if lowerband.iat[i] > prev_final_lower or close.iat[i - 1] < prev_final_lower:
             final_lower.iat[i] = lowerband.iat[i]
         else:
-            final_lower.iat[i] = final_lower.iat[i - 1]
+            final_lower.iat[i] = prev_final_lower
 
-        if supertrend.iat[i - 1] == final_upper.iat[i - 1]:
+        if supertrend.iat[i - 1] == prev_final_upper:
             if close.iat[i] <= final_upper.iat[i]:
                 supertrend.iat[i] = final_upper.iat[i]
                 direction.iat[i] = 1.0
@@ -178,6 +187,26 @@ def _previous_occurrence(condition: np.ndarray, values: np.ndarray) -> np.ndarra
         if flag and np.isfinite(values[idx]):
             last_value = values[idx]
     return result
+
+
+def estimate_warmup_bars(settings: StrategySettings) -> int:
+    sensitivity_mult = SENSITIVITY_MULTIPLIERS.get(settings.sensitivity_mode, 1.0)
+    zz_left = max(2, int(round(settings.zz_len_raw * sensitivity_mult)))
+    lookbacks = [
+        settings.atr_period + 2,
+        settings.qip_rsi_len + 2,
+        settings.vol_ma_len + 2,
+        settings.qip_ema_slow + 2,
+        zz_left * 2 + settings.atr_period + 5,
+        settings.qtp_ema_slow_len + 2,
+        settings.qtp_rsi_len + 2,
+        settings.qtp_stoch_len + 2,
+        settings.qtp_atr_len + 2,
+        settings.qtp_dev_lookback * 2 + settings.qtp_atr_len + 5,
+        settings.qtp_vol_len + 2,
+        settings.qtp_max_pvt_left + 2,
+    ]
+    return max(max(lookbacks) * 3, 300)
 
 
 def compute_indicators(df: pd.DataFrame, settings: StrategySettings) -> pd.DataFrame:
@@ -356,8 +385,16 @@ def run_backtest(
     settings: StrategySettings,
     fee_rate: float = 0.0004,
     starting_equity: float = 1_000.0,
+    backtest_start_time: Optional[pd.Timestamp | str] = None,
 ) -> BacktestResult:
     indicators = compute_indicators(df, settings)
+    latest = indicators.iloc[-1]
+    if backtest_start_time is not None:
+        test_start = pd.Timestamp(backtest_start_time)
+        active_indicators = indicators[indicators["time"] >= test_start].reset_index(drop=True)
+    else:
+        active_indicators = indicators
+    result_indicators = active_indicators if not active_indicators.empty else indicators.tail(1).reset_index(drop=True)
     equity = float(starting_equity)
     position_qty = 0.0
     avg_entry_price = 0.0
@@ -443,7 +480,7 @@ def run_backtest(
         open_trade = None
         reset_zones()
 
-    for row in indicators.itertuples(index=False):
+    for row in active_indicators.itertuples(index=False):
         current_price = float(row.close)
         current_time = pd.Timestamp(row.time)
 
@@ -486,7 +523,7 @@ def run_backtest(
         equity_curve.append(equity + unrealized)
 
     if abs(position_qty) > 1e-12:
-        final_row = indicators.iloc[-1]
+        final_row = active_indicators.iloc[-1]
         close_position(float(final_row["close"]), pd.Timestamp(final_row["time"]), "end_of_test")
         equity_curve[-1] = equity
 
@@ -497,15 +534,14 @@ def run_backtest(
     profit_factor = (gross_profit / gross_loss) if gross_loss else float("inf" if gross_profit > 0 else 0.0)
 
     if equity_curve:
-        curve_index = indicators["time"].iloc[: len(equity_curve)]
+        curve_index = active_indicators["time"].iloc[: len(equity_curve)]
         curve = pd.Series(equity_curve, index=curve_index, dtype=float)
     else:
-        curve = pd.Series([starting_equity], index=[indicators["time"].iloc[0]], dtype=float)
+        curve = pd.Series([starting_equity], index=[result_indicators["time"].iloc[0]], dtype=float)
     peaks = curve.cummax()
     drawdown_pct = ((curve - peaks) / peaks.replace(0.0, np.nan)).fillna(0.0) * 100.0
     max_drawdown_pct = abs(float(drawdown_pct.min())) if not drawdown_pct.empty else 0.0
 
-    latest = indicators.iloc[-1]
     latest_state = {
         "trend": "LONG" if bool(latest["is_long_trend"]) else "SHORT",
         "zone": int(latest["lev_zone"]),
@@ -531,7 +567,7 @@ def run_backtest(
         settings=settings,
         metrics=metrics,
         trades=trades,
-        indicators=indicators,
+        indicators=result_indicators,
         latest_state=latest_state,
         equity_curve=curve,
     )

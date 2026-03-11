@@ -113,13 +113,19 @@ def optimize_symbol(
     steps: int,
     max_combinations: int,
     fee_rate: float,
+    backtest_start_time: pd.Timestamp | str | None = None,
 ) -> OptimizationResult:
     started = time.perf_counter()
     grid, trimmed = generate_parameter_grid(base_settings, optimize_flags, span_pct, steps, max_combinations)
     best_result: BacktestResult | None = None
 
     for settings in grid:
-        result = run_backtest(df, settings=settings, fee_rate=fee_rate)
+        result = run_backtest(
+            df,
+            settings=settings,
+            fee_rate=fee_rate,
+            backtest_start_time=backtest_start_time,
+        )
         if best_result is None:
             best_result = result
             continue

@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict, List, Optional
 import traceback
 
 import pandas as pd
-
+import plotly.graph_objects as go
+import plotly.io as pio
+from plotly.offline import get_plotlyjs
+from plotly.subplots import make_subplots
 from lightweight_charts.widgets import QtChart
 
 from .binance_futures import BinanceFuturesClient, CandidateSymbol
-from .config import APP_INTERVAL_OPTIONS, PARAMETER_SPECS, AppSettings, StrategySettings
+from .config import APP_INTERVAL_OPTIONS, CHART_ENGINE_OPTIONS, PARAMETER_SPECS, AppSettings, StrategySettings
 from .optimizer import OptimizationResult, optimize_symbol
 from .qt_compat import (
     HORIZONTAL,
@@ -18,6 +22,7 @@ from .qt_compat import (
     SINGLE_SELECTION,
     USER_ROLE,
     VERTICAL,
+    WEB_ATTR_FILE_URLS,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -39,11 +44,40 @@ from .qt_compat import (
     QTabWidget,
     QThread,
     QTimer,
+    QUrl,
     QVBoxLayout,
+    QWebEngineView,
     QWidget,
     Signal,
 )
-from .strategy import BacktestResult, run_backtest
+from .strategy import BacktestResult, compute_indicators, estimate_warmup_bars, run_backtest
+
+
+CHART_HISTORY_BAR_LIMIT = 20_000
+BACKTEST_WARMUP_BAR_FLOOR = 1_500
+
+
+def _interval_to_ms(interval: str) -> int:
+    unit = interval[-1]
+    value = int(interval[:-1])
+    if unit == "m":
+        return value * 60_000
+    if unit == "h":
+        return value * 3_600_000
+    if unit == "d":
+        return value * 86_400_000
+    raise ValueError(f"unsupported interval: {interval}")
+
+
+def _backtest_start_time_ms(settings: AppSettings) -> int:
+    now_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
+    return now_ms - settings.history_days * 86_400_000
+
+
+def _history_fetch_start_time_ms(settings: AppSettings) -> int:
+    interval_ms = _interval_to_ms(settings.kline_interval)
+    warmup_bars = max(estimate_warmup_bars(settings.strategy), BACKTEST_WARMUP_BAR_FLOOR)
+    return _backtest_start_time_ms(settings) - warmup_bars * interval_ms
 
 
 class ScanWorker(QThread):
@@ -86,12 +120,17 @@ class OptimizeWorker(QThread):
     def run(self) -> None:
         try:
             client = BinanceFuturesClient()
+            backtest_start_time_ms = _backtest_start_time_ms(self.settings)
+            history_fetch_start_time_ms = _history_fetch_start_time_ms(self.settings)
             for index, candidate in enumerate(self.candidates, start=1):
-                self.progress.emit(f"[{index}/{len(self.candidates)}] {candidate.symbol} 5일 K라인 로드")
+                self.progress.emit(
+                    f"[{index}/{len(self.candidates)}] {candidate.symbol} "
+                    f"{self.settings.history_days}일 백테스트 + 웜업 K라인 로드"
+                )
                 df = client.historical_ohlcv(
                     candidate.symbol,
                     self.settings.kline_interval,
-                    start_time=int(pd.Timestamp.utcnow().timestamp() * 1000) - self.settings.history_days * 86_400_000,
+                    start_time=history_fetch_start_time_ms,
                 )
                 if df.empty:
                     self.progress.emit(f"{candidate.symbol}: 히스토리 없음")
@@ -105,6 +144,7 @@ class OptimizeWorker(QThread):
                     steps=self.settings.optimization_steps,
                     max_combinations=self.settings.max_grid_combinations,
                     fee_rate=self.settings.fee_rate,
+                    backtest_start_time=pd.to_datetime(backtest_start_time_ms, unit="ms"),
                 )
                 self.result_ready.emit({"candidate": candidate, "optimization": optimization, "history": df})
                 self.progress.emit(
@@ -123,6 +163,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.candidates: List[CandidateSymbol] = []
         self.optimized_results: Dict[str, OptimizationResult] = {}
         self.history_cache: Dict[str, pd.DataFrame] = {}
+        self.chart_history_cache: Dict[str, pd.DataFrame] = {}
         self.current_symbol: Optional[str] = None
         self.current_backtest: Optional[BacktestResult] = None
         self.scan_worker: Optional[ScanWorker] = None
@@ -131,12 +172,25 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_refresh_timer = QTimer(self)
         self.parameter_editors: Dict[str, object] = {}
         self.parameter_opt_boxes: Dict[str, QCheckBox] = {}
+        self.plotly_chart_path = Path("alt_reversal_trader_plotly_chart.html").resolve()
+        self.plotly_js_path = self.plotly_chart_path.with_name("plotly.min.js")
+        self.chart_mode = ""
+        self.chart = None
+        self.chart_view = None
+        self.equity_subchart = None
+        self.equity_line = None
+        self.supertrend_line = None
+        self.zone2_line = None
+        self.zone3_line = None
+        self.ema_fast_line = None
+        self.ema_slow_line = None
 
         self.setWindowTitle("Binance Alt Mean Reversion Trader")
         self.resize(1680, 960)
         self._build_ui()
         self._apply_loaded_settings()
         self._init_chart()
+        self.chart_engine_combo.currentTextChanged.connect(self.on_chart_engine_changed)
         self._init_auto_refresh()
         self.statusBar().showMessage("준비됨")
 
@@ -274,6 +328,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.rsi_upper_spin.setDecimals(1)
         self.interval_combo = QComboBox()
         self.interval_combo.addItems(APP_INTERVAL_OPTIONS)
+        self.chart_engine_combo = QComboBox()
+        self.chart_engine_combo.addItems(CHART_ENGINE_OPTIONS)
         self.history_days_spin = QSpinBox()
         self.history_days_spin.setRange(1, 30)
         self.scan_workers_spin = QSpinBox()
@@ -284,6 +340,7 @@ class AltReversalTraderWindow(QMainWindow):
         layout.addRow("1m RSI Lower <=", self.rsi_lower_spin)
         layout.addRow("1m RSI Upper >=", self.rsi_upper_spin)
         layout.addRow("백테스트 봉", self.interval_combo)
+        layout.addRow("차트 엔진", self.chart_engine_combo)
         layout.addRow("히스토리 일수", self.history_days_spin)
         layout.addRow("스캔 워커", self.scan_workers_spin)
         return group
@@ -296,17 +353,17 @@ class AltReversalTraderWindow(QMainWindow):
         self.opt_span_spin.setDecimals(1)
         self.opt_span_spin.setSingleStep(1.0)
         self.opt_steps_spin = QSpinBox()
-        self.opt_steps_spin.setRange(3, 9)
+        self.opt_steps_spin.setRange(1, 9)
         self.max_combo_spin = QSpinBox()
         self.max_combo_spin.setRange(10, 20_000)
         self.fee_spin = QDoubleSpinBox()
-        self.fee_spin.setRange(0.0, 0.01)
-        self.fee_spin.setDecimals(5)
-        self.fee_spin.setSingleStep(0.0001)
+        self.fee_spin.setRange(0.0, 5.0)
+        self.fee_spin.setDecimals(4)
+        self.fee_spin.setSingleStep(0.01)
         layout.addRow("범위 ±%", self.opt_span_spin)
         layout.addRow("격자 단계수", self.opt_steps_spin)
         layout.addRow("최대 조합수", self.max_combo_spin)
-        layout.addRow("수수료", self.fee_spin)
+        layout.addRow("수수료 %", self.fee_spin)
         return group
 
     def _build_parameter_tabs(self) -> QGroupBox:
@@ -399,6 +456,45 @@ class AltReversalTraderWindow(QMainWindow):
         return group
 
     def _init_chart(self) -> None:
+        self._rebuild_chart_engine(force=True)
+
+    def _clear_chart_host(self) -> None:
+        while self.chart_host_layout.count():
+            item = self.chart_host_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        self.chart = None
+        self.chart_view = None
+        self.equity_subchart = None
+        self.equity_line = None
+        self.supertrend_line = None
+        self.zone2_line = None
+        self.zone3_line = None
+        self.ema_fast_line = None
+        self.ema_slow_line = None
+
+    def _rebuild_chart_engine(self, force: bool = False) -> None:
+        engine = self.chart_engine_combo.currentText() if hasattr(self, "chart_engine_combo") else self.settings.chart_engine
+        if not force and engine == self.chart_mode:
+            return
+        self._clear_chart_host()
+        if engine == "Lightweight":
+            self._init_lightweight_chart()
+        else:
+            self._init_plotly_chart()
+        self.chart_mode = engine
+        if self.current_symbol and self.current_backtest:
+            self.render_chart(self.current_symbol, self.current_backtest)
+
+    def _init_plotly_chart(self) -> None:
+        self.chart_view = QWebEngineView(self.chart_host)
+        self.chart_view.settings().setAttribute(WEB_ATTR_FILE_URLS, True)
+        self.chart_host_layout.addWidget(self.chart_view)
+        self.chart_view.setHtml(self._empty_chart_html())
+
+    def _init_lightweight_chart(self) -> None:
         self.chart = QtChart(self.chart_host)
         self.chart_host_layout.addWidget(self.chart.get_webview())
         self.chart.layout(background_color="#0f1419", text_color="#dfe6eb", font_size=12, font_family="Consolas")
@@ -414,8 +510,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.chart.volume_config(up_color="rgba(23, 201, 100, 0.45)", down_color="rgba(243, 18, 96, 0.45)")
         self.chart.watermark("ALT MR", color="rgba(180, 190, 210, 0.22)")
         self.chart.crosshair(mode="normal")
-        self.chart.time_scale(time_visible=True, seconds_visible=False)
-
+        self.chart.time_scale(time_visible=True, seconds_visible=False, min_bar_spacing=0.01, right_offset=0)
         self.equity_subchart = self.chart.create_subchart(
             position="bottom",
             width=1.0,
@@ -425,13 +520,23 @@ class AltReversalTraderWindow(QMainWindow):
         )
         self.equity_subchart.layout(background_color="#121922", text_color="#dfe6eb", font_size=11, font_family="Consolas")
         self.equity_subchart.legend(True)
-        self.equity_line = self.equity_subchart.create_line("Equity", color="rgba(108, 245, 160, 0.9)", width=2, price_line=False, price_label=False)
-
+        self.equity_subchart.time_scale(time_visible=True, seconds_visible=False, min_bar_spacing=0.01, right_offset=0)
+        self.equity_line = self.equity_subchart.create_line(
+            "Equity",
+            color="rgba(108, 245, 160, 0.9)",
+            width=2,
+            price_line=False,
+            price_label=False,
+        )
         self.supertrend_line = self.chart.create_line("Supertrend", color="rgba(255, 204, 0, 0.85)", width=2)
         self.zone2_line = self.chart.create_line("Zone 2", color="rgba(255, 145, 0, 0.65)", width=1)
         self.zone3_line = self.chart.create_line("Zone 3", color="rgba(255, 23, 68, 0.65)", width=1)
         self.ema_fast_line = self.chart.create_line("EMA Fast", color="rgba(0, 229, 255, 0.7)", width=1)
         self.ema_slow_line = self.chart.create_line("EMA Slow", color="rgba(255, 214, 0, 0.7)", width=1)
+
+    def on_chart_engine_changed(self, _engine: str) -> None:
+        self.settings.chart_engine = self.chart_engine_combo.currentText()
+        self._rebuild_chart_engine()
 
     def _apply_loaded_settings(self) -> None:
         settings = self.settings
@@ -444,12 +549,13 @@ class AltReversalTraderWindow(QMainWindow):
         self.rsi_lower_spin.setValue(settings.rsi_lower)
         self.rsi_upper_spin.setValue(settings.rsi_upper)
         self.interval_combo.setCurrentText(settings.kline_interval)
+        self.chart_engine_combo.setCurrentText(settings.chart_engine)
         self.history_days_spin.setValue(settings.history_days)
         self.scan_workers_spin.setValue(settings.scan_workers)
         self.opt_span_spin.setValue(settings.optimization_span_pct)
         self.opt_steps_spin.setValue(settings.optimization_steps)
         self.max_combo_spin.setValue(settings.max_grid_combinations)
-        self.fee_spin.setValue(settings.fee_rate)
+        self.fee_spin.setValue(settings.fee_rate * 100.0)
 
     def collect_settings(self) -> AppSettings:
         strategy_payload: Dict[str, object] = {}
@@ -468,8 +574,9 @@ class AltReversalTraderWindow(QMainWindow):
         return AppSettings(
             api_key=self.api_key_edit.text().strip(),
             api_secret=self.api_secret_edit.text().strip(),
+            chart_engine=self.chart_engine_combo.currentText(),
             leverage=int(self.leverage_spin.value()),
-            fee_rate=float(self.fee_spin.value()),
+            fee_rate=float(self.fee_spin.value()) / 100.0,
             history_days=int(self.history_days_spin.value()),
             kline_interval=self.interval_combo.currentText(),
             daily_volatility_min=float(self.daily_vol_spin.value()),
@@ -486,7 +593,14 @@ class AltReversalTraderWindow(QMainWindow):
         )
 
     def save_settings(self) -> AppSettings:
+        previous = self.settings
         self.settings = self.collect_settings()
+        if (
+            previous.kline_interval != self.settings.kline_interval
+            or previous.history_days != self.settings.history_days
+        ):
+            self.history_cache.clear()
+            self.chart_history_cache.clear()
         self.settings.save()
         return self.settings
 
@@ -500,6 +614,47 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _candidate_by_symbol(self, symbol: str) -> Optional[CandidateSymbol]:
         return next((candidate for candidate in self.candidates if candidate.symbol == symbol), None)
+
+    def _resolve_price_precision(self, symbol: str, candle_df: pd.DataFrame) -> int:
+        precision = 2
+        try:
+            filters = BinanceFuturesClient().get_symbol_filters(symbol)
+            precision = int(filters.get("pricePrecision", precision))
+            tick_size = float(filters.get("tickSize", 0.0) or 0.0)
+            if tick_size > 0:
+                tick_text = f"{tick_size:.16f}".rstrip("0").rstrip(".")
+                if "." in tick_text:
+                    precision = max(precision, len(tick_text.split(".", 1)[1]))
+        except Exception:
+            close_series = candle_df["close"].dropna()
+            if not close_series.empty:
+                price = abs(float(close_series.iloc[-1]))
+                if price < 0.001:
+                    precision = 8
+                elif price < 0.01:
+                    precision = 7
+                elif price < 0.1:
+                    precision = 6
+                elif price < 1:
+                    precision = 5
+                else:
+                    precision = 2
+        return max(2, min(precision, 10))
+
+    def _apply_lightweight_precision(self, symbol: str, candle_df: pd.DataFrame) -> None:
+        if self.chart is None:
+            return
+        precision = self._resolve_price_precision(symbol, candle_df)
+        self.chart.precision(precision)
+        for line in (
+            self.supertrend_line,
+            self.zone2_line,
+            self.zone3_line,
+            self.ema_fast_line,
+            self.ema_slow_line,
+        ):
+            if line is not None:
+                line.precision(precision)
 
     def update_candidate_table(self) -> None:
         self.candidate_table.setRowCount(len(self.candidates))
@@ -563,6 +718,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.candidates = []
         self.optimized_results.clear()
         self.history_cache.clear()
+        self.chart_history_cache.clear()
         self.update_candidate_table()
         self.update_optimized_table()
         self.summary_box.clear()
@@ -648,21 +804,50 @@ class AltReversalTraderWindow(QMainWindow):
         try:
             self.current_symbol = symbol
             self.save_settings()
+            backtest_start_time = pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms")
             history = self.history_cache.get(symbol)
             if history is None:
                 client = BinanceFuturesClient()
                 history = client.historical_ohlcv(
                     symbol,
                     self.settings.kline_interval,
-                    start_time=int(pd.Timestamp.utcnow().timestamp() * 1000) - self.settings.history_days * 86_400_000,
+                    start_time=_history_fetch_start_time_ms(self.settings),
                 )
                 self.history_cache[symbol] = history
             if history.empty:
                 self.show_warning(f"{symbol} 히스토리 데이터가 없습니다.")
                 return
 
+            chart_history = self.chart_history_cache.get(symbol)
+            if chart_history is None:
+                client = BinanceFuturesClient()
+                chart_history = client.historical_ohlcv_recent(
+                    symbol,
+                    self.settings.kline_interval,
+                    bars=CHART_HISTORY_BAR_LIMIT,
+                )
+                if chart_history.empty:
+                    chart_history = history.copy()
+                else:
+                    chart_history = (
+                        pd.concat([chart_history, history], ignore_index=True)
+                        .drop_duplicates(subset=["time"])
+                        .sort_values("time")
+                        .reset_index(drop=True)
+                    )
+                self.chart_history_cache[symbol] = chart_history
+
             optimization = self.optimized_results.get(symbol)
-            backtest = optimization.best_backtest if optimization else run_backtest(history, settings=self.settings.strategy, fee_rate=self.settings.fee_rate)
+            backtest = (
+                optimization.best_backtest
+                if optimization
+                else run_backtest(
+                    history,
+                    settings=self.settings.strategy,
+                    fee_rate=self.settings.fee_rate,
+                    backtest_start_time=backtest_start_time,
+                )
+            )
             self.current_backtest = backtest
             self.render_chart(symbol, backtest)
             self.update_summary(symbol, backtest, optimization)
@@ -671,7 +856,12 @@ class AltReversalTraderWindow(QMainWindow):
             self.show_error(str(exc))
 
     def render_chart(self, symbol: str, result: BacktestResult) -> None:
-        indicators = result.indicators.sort_values("time").drop_duplicates(subset=["time"]).reset_index(drop=True)
+        chart_history = self.chart_history_cache.get(symbol)
+        if chart_history is not None and not chart_history.empty:
+            chart_indicators = compute_indicators(chart_history, result.settings)
+        else:
+            chart_indicators = result.indicators
+        indicators = chart_indicators.sort_values("time").drop_duplicates(subset=["time"]).reset_index(drop=True)
         candle_df = indicators[["time", "open", "high", "low", "close", "volume"]].copy()
         equity_df = (
             pd.DataFrame({"time": list(result.equity_curve.index), "Equity": list(result.equity_curve.values)})
@@ -679,7 +869,52 @@ class AltReversalTraderWindow(QMainWindow):
             .drop_duplicates(subset=["time"])
             .reset_index(drop=True)
         )
+        if self.chart_mode == "Lightweight":
+            self._render_lightweight_chart(symbol, candle_df, indicators, equity_df, result.trades)
+        else:
+            self._render_plotly_chart(symbol, candle_df, indicators, equity_df, result.trades)
+
+        candidate = self._candidate_by_symbol(symbol)
+        latest = result.latest_state
+        self.symbol_label.setText(
+            f"종목: {symbol}"
+            + (f" | DayVol {candidate.daily_volatility_pct:.2f}% | RSI1m {candidate.rsi_1m:.2f}" if candidate else "")
+        )
+        self.signal_label.setText(
+            f"신호: Trend {latest['trend']} | Zone {latest['zone']} | "
+            f"Bull {latest['final_bull']} | Bear {latest['final_bear']} | RSI {latest['rsi']:.2f}"
+        )
+
+    def _render_plotly_chart(
+        self,
+        symbol: str,
+        candle_df: pd.DataFrame,
+        indicators: pd.DataFrame,
+        equity_df: pd.DataFrame,
+        trades,
+    ) -> None:
+        if self.chart_view is None:
+            self._rebuild_chart_engine(force=True)
+        if not self.plotly_js_path.exists() or self.plotly_js_path.stat().st_size == 0:
+            self.plotly_js_path.write_text(get_plotlyjs(), encoding="utf-8")
+        html = self._plotly_chart_html(symbol, candle_df, indicators, equity_df, trades)
+        self.plotly_chart_path.write_text(html, encoding="utf-8")
+        chart_url = QUrl.fromLocalFile(str(self.plotly_chart_path))
+        chart_url.setQuery(f"ts={self.plotly_chart_path.stat().st_mtime_ns}")
+        self.chart_view.load(chart_url)
+
+    def _render_lightweight_chart(
+        self,
+        symbol: str,
+        candle_df: pd.DataFrame,
+        indicators: pd.DataFrame,
+        equity_df: pd.DataFrame,
+        trades,
+    ) -> None:
+        if self.chart is None:
+            self._rebuild_chart_engine(force=True)
         self.chart.set(candle_df)
+        self._apply_lightweight_precision(symbol, candle_df)
         self.chart.clear_markers()
         self.supertrend_line.set(indicators[["time", "supertrend"]].rename(columns={"supertrend": "Supertrend"}))
         self.zone2_line.set(indicators[["time", "zone2_line"]].rename(columns={"zone2_line": "Zone 2"}))
@@ -689,7 +924,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.equity_line.set(equity_df)
 
         markers = []
-        for trade in result.trades:
+        for trade in trades:
             markers.append(
                 {
                     "time": trade.entry_time,
@@ -710,31 +945,249 @@ class AltReversalTraderWindow(QMainWindow):
             )
         if markers:
             self.chart.marker_list(markers)
-        if not candle_df.empty:
-            start_time = candle_df.iloc[0]["time"]
-            end_time = candle_df.iloc[-1]["time"]
-            QTimer.singleShot(50, lambda s=symbol, st=start_time, et=end_time: self._sync_chart_range(s, st, et))
-
-        candidate = self._candidate_by_symbol(symbol)
-        latest = result.latest_state
-        self.symbol_label.setText(
-            f"종목: {symbol}"
-            + (f" | DayVol {candidate.daily_volatility_pct:.2f}% | RSI1m {candidate.rsi_1m:.2f}" if candidate else "")
-        )
-        self.signal_label.setText(
-            f"신호: Trend {latest['trend']} | Zone {latest['zone']} | "
-            f"Bull {latest['final_bull']} | Bear {latest['final_bear']} | RSI {latest['rsi']:.2f}"
+        QTimer.singleShot(
+            140,
+            lambda s=symbol, bars=len(candle_df), equity_bars=len(equity_df): self._sync_lightweight_range(s, bars, equity_bars),
         )
 
-    def _sync_chart_range(self, symbol: str, start_time, end_time) -> None:
-        if symbol != self.current_symbol:
+    def _sync_lightweight_range(self, symbol: str, candle_bars: int, equity_bars: int) -> None:
+        if symbol != self.current_symbol or self.chart is None or self.equity_subchart is None:
             return
         try:
-            self.chart.set_visible_range(start_time, end_time)
-            self.equity_subchart.set_visible_range(start_time, end_time)
+            candle_to = max(candle_bars - 1, 1)
+            equity_to = max(equity_bars - 1, 1)
+            self.chart.run_script(
+                f"{self.chart.id}.chart.timeScale().setVisibleLogicalRange({{from: 0, to: {candle_to}}})"
+            )
+            self.equity_subchart.run_script(
+                f"{self.equity_subchart.id}.chart.timeScale().setVisibleLogicalRange({{from: 0, to: {equity_to}}})"
+            )
+            self.chart.fit()
+            self.equity_subchart.fit()
         except Exception:
             self.chart.fit()
             self.equity_subchart.fit()
+
+    def _empty_chart_html(self) -> str:
+        return """
+        <html>
+          <head>
+            <style>
+              html, body {
+                margin: 0;
+                height: 100%;
+                background: #0f1419;
+                color: #dfe6eb;
+                font-family: Consolas, monospace;
+              }
+              .wrap {
+                height: 100%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                opacity: 0.7;
+                font-size: 15px;
+              }
+            </style>
+          </head>
+          <body>
+            <div class="wrap">차트 대기 중</div>
+          </body>
+        </html>
+        """
+
+    def _plotly_chart_html(
+        self,
+        symbol: str,
+        candle_df: pd.DataFrame,
+        indicators: pd.DataFrame,
+        equity_df: pd.DataFrame,
+        trades,
+    ) -> str:
+        fig = make_subplots(
+            rows=2,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.04,
+            row_heights=[0.74, 0.26],
+            specs=[[{"secondary_y": True}], [{}]],
+        )
+
+        volume_colors = [
+            "rgba(23, 201, 100, 0.35)" if close_ >= open_ else "rgba(243, 18, 96, 0.35)"
+            for open_, close_ in zip(candle_df["open"], candle_df["close"])
+        ]
+
+        fig.add_trace(
+            go.Candlestick(
+                x=candle_df["time"],
+                open=candle_df["open"],
+                high=candle_df["high"],
+                low=candle_df["low"],
+                close=candle_df["close"],
+                name=symbol,
+                increasing_line_color="#17c964",
+                increasing_fillcolor="#17c964",
+                decreasing_line_color="#f31260",
+                decreasing_fillcolor="#f31260",
+            ),
+            row=1,
+            col=1,
+            secondary_y=False,
+        )
+        fig.add_trace(
+            go.Bar(
+                x=candle_df["time"],
+                y=candle_df["volume"],
+                name="Volume",
+                marker_color=volume_colors,
+                opacity=0.35,
+            ),
+            row=1,
+            col=1,
+            secondary_y=True,
+        )
+        for column, name, color, width in (
+            ("supertrend", "Supertrend", "#ffcc00", 2),
+            ("zone2_line", "Zone 2", "#ff9100", 1),
+            ("zone3_line", "Zone 3", "#ff1744", 1),
+            ("ema_fast", "EMA Fast", "#00e5ff", 1),
+            ("ema_slow", "EMA Slow", "#ffd600", 1),
+        ):
+            fig.add_trace(
+                go.Scatter(
+                    x=indicators["time"],
+                    y=indicators[column],
+                    mode="lines",
+                    name=name,
+                    line={"color": color, "width": width},
+                ),
+                row=1,
+                col=1,
+                secondary_y=False,
+            )
+
+        long_entries = [trade for trade in trades if trade.side == "long"]
+        short_entries = [trade for trade in trades if trade.side == "short"]
+        if long_entries:
+            fig.add_trace(
+                go.Scatter(
+                    x=[trade.entry_time for trade in long_entries],
+                    y=[trade.entry_price for trade in long_entries],
+                    mode="markers+text",
+                    name="Long Entry",
+                    text=[trade.zones for trade in long_entries],
+                    textposition="bottom center",
+                    marker={"symbol": "triangle-up", "size": 11, "color": "#17c964"},
+                ),
+                row=1,
+                col=1,
+                secondary_y=False,
+            )
+        if short_entries:
+            fig.add_trace(
+                go.Scatter(
+                    x=[trade.entry_time for trade in short_entries],
+                    y=[trade.entry_price for trade in short_entries],
+                    mode="markers+text",
+                    name="Short Entry",
+                    text=[trade.zones for trade in short_entries],
+                    textposition="top center",
+                    marker={"symbol": "triangle-down", "size": 11, "color": "#f31260"},
+                ),
+                row=1,
+                col=1,
+                secondary_y=False,
+            )
+        if trades:
+            fig.add_trace(
+                go.Scatter(
+                    x=[trade.exit_time for trade in trades],
+                    y=[trade.exit_price for trade in trades],
+                    mode="markers+text",
+                    name="Exit",
+                    text=[f"{trade.return_pct:+.1f}%" for trade in trades],
+                    textposition="middle right",
+                    marker={"symbol": "x", "size": 9, "color": "#94a3b8"},
+                ),
+                row=1,
+                col=1,
+                secondary_y=False,
+            )
+
+        fig.add_trace(
+            go.Scatter(
+                x=equity_df["time"],
+                y=equity_df["Equity"],
+                mode="lines",
+                name="Equity",
+                line={"color": "#6cf5a0", "width": 2},
+            ),
+            row=2,
+            col=1,
+        )
+
+        fig.update_layout(
+            paper_bgcolor="#0f1419",
+            plot_bgcolor="#0f1419",
+            font={"family": "Consolas, monospace", "color": "#dfe6eb", "size": 12},
+            height=max(self.chart_host.height(), 760),
+            autosize=True,
+            margin={"l": 48, "r": 36, "t": 36, "b": 36},
+            legend={
+                "orientation": "h",
+                "yanchor": "bottom",
+                "y": 1.01,
+                "xanchor": "left",
+                "x": 0.0,
+                "bgcolor": "rgba(0,0,0,0)",
+            },
+            xaxis_rangeslider_visible=False,
+            hovermode="x unified",
+        )
+        fig.update_xaxes(
+            showgrid=True,
+            gridcolor="rgba(120, 130, 150, 0.14)",
+            zeroline=False,
+        )
+        fig.update_yaxes(
+            showgrid=True,
+            gridcolor="rgba(120, 130, 150, 0.14)",
+            zeroline=False,
+            row=1,
+            col=1,
+            secondary_y=False,
+        )
+        fig.update_yaxes(
+            showgrid=False,
+            zeroline=False,
+            showticklabels=False,
+            row=1,
+            col=1,
+            secondary_y=True,
+        )
+        fig.update_yaxes(
+            showgrid=True,
+            gridcolor="rgba(120, 130, 150, 0.14)",
+            zeroline=False,
+            row=2,
+            col=1,
+        )
+
+        config = {
+            "displaylogo": False,
+            "responsive": True,
+            "scrollZoom": True,
+            "modeBarButtonsToRemove": ["lasso2d", "select2d", "autoScale2d"],
+        }
+        return pio.to_html(
+            fig,
+            full_html=True,
+            include_plotlyjs="directory",
+            config=config,
+            default_width="100%",
+            default_height=f"{max(self.chart_host.height(), 760)}px",
+        )
 
     def update_summary(self, symbol: str, backtest: BacktestResult, optimization: Optional[OptimizationResult]) -> None:
         metrics = backtest.metrics

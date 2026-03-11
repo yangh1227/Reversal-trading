@@ -200,7 +200,8 @@ class SeriesCommon(Pane):
         self._set_interval(df)
         if not pd.api.types.is_datetime64_any_dtype(df['time']):
             df['time'] = pd.to_datetime(df['time'])
-        df['time'] = df['time'].astype('int64') // 10 ** 9
+        epoch = pd.Timestamp('1970-01-01')
+        df['time'] = ((df['time'] - epoch) / pd.Timedelta(seconds=1)).astype(float)
         return df
 
     def _series_datetime_format(self, series: pd.Series, exclude_lowercase=None):
@@ -215,7 +216,8 @@ class SeriesCommon(Pane):
                 arg = pd.to_datetime(arg, unit='ms')
             except ValueError:
                 arg = pd.to_datetime(arg)
-        arg = self._interval * (arg.timestamp() // self._interval)+self.offset
+        seconds = float((pd.Timestamp(arg) - pd.Timestamp('1970-01-01')) / pd.Timedelta(seconds=1))
+        arg = self._interval * (seconds // self._interval) + self.offset
         return arg
 
     def set(self, df: Optional[pd.DataFrame] = None, format_cols: bool = True):
@@ -749,10 +751,12 @@ class AbstractChart(Candlestick, Pane):
         return self._lines.copy()
 
     def set_visible_range(self, start_time: TIME, end_time: TIME):
+        start_seconds = float((pd.Timestamp(start_time) - pd.Timestamp('1970-01-01')) / pd.Timedelta(seconds=1))
+        end_seconds = float((pd.Timestamp(end_time) - pd.Timestamp('1970-01-01')) / pd.Timedelta(seconds=1))
         self.run_script(f'''
         {self.id}.chart.timeScale().setVisibleRange({{
-            from: {pd.to_datetime(start_time).timestamp()},
-            to: {pd.to_datetime(end_time).timestamp()}
+            from: {start_seconds},
+            to: {end_seconds}
         }})
         ''')
 

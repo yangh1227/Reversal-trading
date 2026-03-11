@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 try:
-    from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal as Signal
+    from PyQt5.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal as Signal
+    from PyQt5.QtWebEngineWidgets import QWebEngineSettings, QWebEngineView
     from PyQt5.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -42,9 +43,12 @@ try:
     SELECT_ROWS = QAbstractItemView.SelectRows
     SINGLE_SELECTION = QAbstractItemView.SingleSelection
     NO_EDIT_TRIGGERS = QAbstractItemView.NoEditTriggers
+    WEB_ATTR_FILE_URLS = QWebEngineSettings.LocalContentCanAccessFileUrls
 
 except ImportError:
-    from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal as Signal
+    from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal as Signal
+    from PyQt6.QtWebEngineCore import QWebEngineSettings
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
     from PyQt6.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -85,6 +89,7 @@ except ImportError:
     SELECT_ROWS = QAbstractItemView.SelectionBehavior.SelectRows
     SINGLE_SELECTION = QAbstractItemView.SelectionMode.SingleSelection
     NO_EDIT_TRIGGERS = QAbstractItemView.EditTrigger.NoEditTriggers
+    WEB_ATTR_FILE_URLS = QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls
 
 
 class QSpinBox(_QSpinBox):
@@ -113,6 +118,7 @@ __all__ = [
     "Signal",
     "USER_ROLE",
     "VERTICAL",
+    "WEB_ATTR_FILE_URLS",
     "QApplication",
     "QCheckBox",
     "QComboBox",
@@ -136,6 +142,8 @@ __all__ = [
     "QTabWidget",
     "QThread",
     "QTimer",
+    "QUrl",
+    "QWebEngineView",
     "QVBoxLayout",
     "QWidget",
     "app_exec",

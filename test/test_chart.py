@@ -25,6 +25,11 @@ class TestChart(Tester):
         self.assertIn('priceScaleId: undefined,', script)
         self.assertIn('autoscaleInfoProvider', script)
 
+    def test_datetime_format_uses_epoch_seconds(self):
+        result = self.chart._df_datetime_format(BARS.copy())
+        self.assertGreater(result["time"].iloc[0], 1_000_000_000)
+        self.assertTrue(result["time"].is_monotonic_increasing)
+
 
 if __name__ == '__main__':
     unittest.main()
