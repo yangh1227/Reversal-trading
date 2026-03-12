@@ -1165,6 +1165,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_close_last_trigger_time: Dict[str, pd.Timestamp] = {}
         self.order_worker_symbol: Optional[str] = None
         self.order_worker_is_auto_close = False
+        self.pending_open_order_interval: Optional[str] = None
         self.auto_refresh_minutes = 10
         self.auto_refresh_timer = QTimer(self)
         self.live_update_timer = QTimer(self)
@@ -1903,6 +1904,7 @@ class AltReversalTraderWindow(QMainWindow):
             optimize_timeframe=bool(self.optimize_timeframe_check.isChecked()),
             strategy=StrategySettings(**strategy_payload),
             optimize_flags=optimize_flags,
+            position_intervals=dict(self.settings.position_intervals),
         )
 
     def _sync_settings(self, persist: bool = False) -> AppSettings:
@@ -1985,9 +1987,55 @@ class AltReversalTraderWindow(QMainWindow):
         if elapsed_ms >= PERFORMANCE_LOG_THRESHOLD_MS:
             self.log(f"[perf] {label}: {elapsed_ms:.1f}ms")
 
-    def _active_interval_for_symbol(self, symbol: str) -> str:
+    def _persist_position_intervals(self) -> None:
+        self.settings.save()
+
+    def _remember_position_interval(self, symbol: str, interval: Optional[str], persist: bool = True) -> None:
+        normalized = str(interval or "").strip()
+        if not symbol or normalized not in APP_INTERVAL_OPTIONS:
+            return
+        if self.settings.position_intervals.get(symbol) == normalized:
+            return
+        self.settings.position_intervals[symbol] = normalized
+        if persist:
+            self._persist_position_intervals()
+
+    def _forget_closed_position_intervals(self, open_symbols: set[str], persist: bool = True) -> None:
+        removed = False
+        for symbol in list(self.settings.position_intervals):
+            if symbol in open_symbols:
+                continue
+            self.settings.position_intervals.pop(symbol, None)
+            removed = True
+        if removed and persist:
+            self._persist_position_intervals()
+
+    def _remember_missing_open_position_intervals(self, open_symbols: set[str]) -> None:
+        changed = False
+        for symbol in sorted(open_symbols):
+            if self.settings.position_intervals.get(symbol) in APP_INTERVAL_OPTIONS:
+                continue
+            optimization = self.optimized_results.get(symbol)
+            interval = (optimization.best_interval or self.settings.kline_interval) if optimization else self.settings.kline_interval
+            if interval not in APP_INTERVAL_OPTIONS:
+                continue
+            self.settings.position_intervals[symbol] = interval
+            changed = True
+        if changed:
+            self._persist_position_intervals()
+
+    def _position_interval_for_symbol(self, symbol: str) -> str:
+        remembered = self.settings.position_intervals.get(symbol)
+        if remembered in APP_INTERVAL_OPTIONS and self._find_open_position(symbol) is not None:
+            return remembered
         optimization = self.optimized_results.get(symbol)
         return (optimization.best_interval or self.settings.kline_interval) if optimization else self.settings.kline_interval
+
+    def _position_symbol_text(self, symbol: str) -> str:
+        return f"{symbol} [{self._position_interval_for_symbol(symbol)}]"
+
+    def _active_interval_for_symbol(self, symbol: str) -> str:
+        return self._position_interval_for_symbol(symbol)
 
     def _find_open_position(self, symbol: str) -> Optional[PositionSnapshot]:
         return next((position for position in self.open_positions if position.symbol == symbol), None)
@@ -2960,7 +3008,7 @@ class AltReversalTraderWindow(QMainWindow):
         return_pct = _position_return_pct(position)
         return (
             [
-                position.symbol,
+                self._position_symbol_text(position.symbol),
                 side,
                 f"{abs(position.amount):.6f}",
                 entry_text,
@@ -2992,7 +3040,7 @@ class AltReversalTraderWindow(QMainWindow):
         upnl_color = self._pnl_color(upnl_value)
         return_color = self._pnl_color(return_pct)
         return (
-            f"<span style='color:#111827;'>포지션: {side} {abs(position.amount):.6f} @ {position.entry_price:.6f} | </span>"
+            f"<span style='color:#111827;'>포지션: {self._position_symbol_text(position.symbol)} {side} {abs(position.amount):.6f} @ {position.entry_price:.6f} | </span>"
             f"<span style='font-weight:700; color:{upnl_color};'>UPnL {upnl_value:.2f}</span> | "
             f"<span style='font-weight:700; color:{return_color};'>수익률 {return_pct:+.2f}%</span>"
         )
@@ -3331,8 +3379,7 @@ class AltReversalTraderWindow(QMainWindow):
     def _request_symbol_load(self, symbol: str) -> None:
         if not symbol:
             return
-        optimization = self.optimized_results.get(symbol)
-        target_interval = (optimization.best_interval or self.settings.kline_interval) if optimization else self.settings.kline_interval
+        target_interval = self._active_interval_for_symbol(symbol)
         if (
             symbol == self.current_symbol
             and target_interval == self.current_interval
@@ -4000,6 +4047,9 @@ class AltReversalTraderWindow(QMainWindow):
         balance = result["balance"]
         position = result["position"]
         self.open_positions = list(result.get("positions", []))
+        open_symbols = {entry.symbol for entry in self.open_positions}
+        self._forget_closed_position_intervals(open_symbols, persist=False)
+        self._remember_missing_open_position_intervals(open_symbols)
         if self.current_symbol and requested_symbol == self.current_symbol:
             self.current_position_snapshot = position
         elif self.current_symbol:
@@ -4090,6 +4140,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.order_worker = worker
         self.order_worker_symbol = self.current_symbol
         self.order_worker_is_auto_close = False
+        self.pending_open_order_interval = self.current_interval
         self._track_thread(worker, "order_worker")
         self._set_order_buttons_enabled(False)
         self.statusBar().showMessage(f"{self.current_symbol} 주문 처리 중...", 3000)
@@ -4125,6 +4176,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.order_worker = worker
         self.order_worker_symbol = symbol
         self.order_worker_is_auto_close = auto_close_reason is not None
+        self.pending_open_order_interval = None
         self._track_thread(worker, "order_worker")
         self._set_order_buttons_enabled(False)
         if auto_close_reason is None:
@@ -4144,8 +4196,11 @@ class AltReversalTraderWindow(QMainWindow):
         order_symbol = self.order_worker_symbol or str(result.get("symbol", ""))
         if self.order_worker_is_auto_close and order_symbol:
             self.auto_close_order_pending.discard(order_symbol)
+        if not self.order_worker_is_auto_close and order_symbol:
+            self._remember_position_interval(order_symbol, self.pending_open_order_interval)
         self.order_worker_symbol = None
         self.order_worker_is_auto_close = False
+        self.pending_open_order_interval = None
         self.log(str(result.get("message", "주문 완료")))
         self.refresh_account_info()
         QTimer.singleShot(0, self._flush_queued_auto_close_orders)
@@ -4158,6 +4213,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.auto_close_last_trigger_time.pop(order_symbol, None)
         self.order_worker_symbol = None
         self.order_worker_is_auto_close = False
+        self.pending_open_order_interval = None
         self._set_order_buttons_enabled(True)
         self.log(message)
         if not was_auto_close:

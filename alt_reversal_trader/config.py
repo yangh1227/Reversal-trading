@@ -97,6 +97,7 @@ class AppSettings:
     optimize_timeframe: bool = True
     strategy: StrategySettings = field(default_factory=StrategySettings)
     optimize_flags: Dict[str, bool] = field(default_factory=dict)
+    position_intervals: Dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.chart_engine not in CHART_ENGINE_OPTIONS:
@@ -108,6 +109,11 @@ class AppSettings:
         self.optimize_processes = max(1, int(self.optimize_processes))
         if not self.optimize_flags:
             self.optimize_flags = DEFAULT_OPTIMIZE_FLAGS.copy()
+        self.position_intervals = {
+            str(symbol): str(interval)
+            for symbol, interval in dict(self.position_intervals).items()
+            if str(interval) in APP_INTERVAL_OPTIONS
+        }
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -133,6 +139,7 @@ class AppSettings:
             "optimize_timeframe": self.optimize_timeframe,
             "strategy": self.strategy.to_dict(),
             "optimize_flags": dict(self.optimize_flags),
+            "position_intervals": dict(self.position_intervals),
         }
 
     @classmethod
@@ -140,6 +147,7 @@ class AppSettings:
         payload = dict(data or {})
         strategy_payload = payload.pop("strategy", {}) or {}
         optimize_flags = payload.pop("optimize_flags", {}) or {}
+        position_intervals = payload.pop("position_intervals", {}) or {}
         simple_order_amount = payload.pop("simple_order_amount", None)
         legacy_simple_long = payload.pop("simple_long_order_amount", None)
         legacy_simple_short = payload.pop("simple_short_order_amount", None)
@@ -155,6 +163,11 @@ class AppSettings:
         merged_flags = DEFAULT_OPTIMIZE_FLAGS.copy()
         merged_flags.update({k: bool(v) for k, v in optimize_flags.items() if k in merged_flags})
         settings.optimize_flags = merged_flags
+        settings.position_intervals = {
+            str(symbol): str(interval)
+            for symbol, interval in dict(position_intervals).items()
+            if str(interval) in APP_INTERVAL_OPTIONS
+        }
         return settings
 
     @classmethod
