@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import math
 
 import numpy as np
@@ -9,6 +9,43 @@ import pandas as pd
 import pandas_ta as pta
 
 from .config import StrategySettings
+
+RESULT_INDICATOR_COLUMNS = [
+    "time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "supertrend",
+    "zone2_line",
+    "zone3_line",
+    "ema_fast",
+    "ema_slow",
+    "rsi",
+    "trend_to_long",
+    "trend_to_short",
+    "final_bull",
+    "final_bear",
+]
+
+CHART_INDICATOR_COLUMNS = [
+    "time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "supertrend",
+    "zone2_line",
+    "zone3_line",
+    "ema_fast",
+    "ema_slow",
+    "trend_to_long",
+    "trend_to_short",
+    "final_bull",
+    "final_bear",
+]
 
 
 SENSITIVITY_MULTIPLIERS = {
@@ -23,6 +60,8 @@ SENSITIVITY_MULTIPLIERS = {
     "9-Ultra Broad": 2.0,
     "10-Ultra Broad Max": 2.5,
 }
+
+PREPARED_OHLCV_ATTR = "_alt_prepared_ohlcv"
 
 
 @dataclass(frozen=True)
@@ -59,15 +98,30 @@ class BacktestResult:
     equity_curve: pd.Series
 
 
+def compact_indicator_frame(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    selected = [column for column in columns if column in df.columns]
+    if not selected:
+        return df.tail(1).copy()
+    return df.loc[:, selected].copy()
+
+
 def _ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     required = {"time", "open", "high", "low", "close", "volume"}
     missing = required.difference(df.columns)
     if missing:
         raise ValueError(f"missing columns: {sorted(missing)}")
+    if df.attrs.get(PREPARED_OHLCV_ATTR):
+        return df
     frame = df.copy()
     frame["time"] = pd.to_datetime(frame["time"])
     frame[["open", "high", "low", "close", "volume"]] = frame[["open", "high", "low", "close", "volume"]].astype(float)
-    return frame.sort_values("time").reset_index(drop=True)
+    frame = frame.sort_values("time").reset_index(drop=True)
+    frame.attrs[PREPARED_OHLCV_ATTR] = True
+    return frame
+
+
+def prepare_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    return _ensure_ohlcv(df)
 
 
 def _rma(series: pd.Series, length: int) -> pd.Series:
@@ -209,7 +263,19 @@ def estimate_warmup_bars(settings: StrategySettings) -> int:
     return max(max(lookbacks) * 3, 300)
 
 
-def compute_indicators(df: pd.DataFrame, settings: StrategySettings) -> pd.DataFrame:
+def _cached(cache: Optional[Dict[Tuple[object, ...], object]], key: Tuple[object, ...], builder):
+    if cache is None:
+        return builder()
+    if key not in cache:
+        cache[key] = builder()
+    return cache[key]
+
+
+def compute_indicators(
+    df: pd.DataFrame,
+    settings: StrategySettings,
+    cache: Optional[Dict[Tuple[object, ...], object]] = None,
+) -> pd.DataFrame:
     frame = _ensure_ohlcv(df)
     close = frame["close"]
     high = frame["high"]
@@ -217,7 +283,11 @@ def compute_indicators(df: pd.DataFrame, settings: StrategySettings) -> pd.DataF
     open_ = frame["open"]
     volume = frame["volume"]
 
-    supertrend, direction, atr_st = _supertrend(frame, settings.atr_period, settings.factor)
+    supertrend, direction, atr_st = _cached(
+        cache,
+        ("supertrend", settings.atr_period, settings.factor),
+        lambda: _supertrend(frame, settings.atr_period, settings.factor),
+    )
     dist_atr = (close - supertrend).abs() / atr_st.replace(0.0, np.nan)
     zone3_thresh = 0.5 * settings.zone_sensitivity
     zone2_thresh = 1.0 * settings.zone_sensitivity
@@ -231,38 +301,82 @@ def compute_indicators(df: pd.DataFrame, settings: StrategySettings) -> pd.DataF
     sens_mult = SENSITIVITY_MULTIPLIERS.get(settings.sensitivity_mode, 1.0)
     zz_left = max(2, int(round(settings.zz_len_raw * sens_mult)))
     atr_mult = settings.atr_mult_raw / sens_mult
-    atr_val = _atr(high, low, close, 14)
-    macd_raw = _macd_line(close)
+    atr_val = _cached(cache, ("atr", 14), lambda: _atr(high, low, close, 14))
+    macd_raw = _cached(cache, ("macd_line",), lambda: _macd_line(close))
 
-    pivot_h = _pivot_high(high.to_numpy(dtype=float), zz_left, 1)
-    pivot_l = _pivot_low(low.to_numpy(dtype=float), zz_left, 1)
-    pivot_h_series = pd.Series(pivot_h, index=frame.index)
-    pivot_l_series = pd.Series(pivot_l, index=frame.index)
+    pivot_h_series = _cached(
+        cache,
+        ("pivot_high_series", zz_left, 1),
+        lambda: pd.Series(_pivot_high(high.to_numpy(dtype=float), zz_left, 1), index=frame.index),
+    )
+    pivot_l_series = _cached(
+        cache,
+        ("pivot_low_series", zz_left, 1),
+        lambda: pd.Series(_pivot_low(low.to_numpy(dtype=float), zz_left, 1), index=frame.index),
+    )
     ph_confirmed = pivot_h_series.notna()
     pl_confirmed = pivot_l_series.notna()
 
-    lowest_low_prev = low.rolling(zz_left * 2, min_periods=1).min().shift(1)
-    highest_high_prev = high.rolling(zz_left * 2, min_periods=1).max().shift(1)
+    lowest_low_prev = _cached(
+        cache,
+        ("rolling_low_shift", zz_left * 2),
+        lambda: low.rolling(zz_left * 2, min_periods=1).min().shift(1),
+    )
+    highest_high_prev = _cached(
+        cache,
+        ("rolling_high_shift", zz_left * 2),
+        lambda: high.rolling(zz_left * 2, min_periods=1).max().shift(1),
+    )
     ph_valid = ph_confirmed & ((pivot_h_series - lowest_low_prev) > (atr_val.shift(1) * atr_mult))
     pl_valid = pl_confirmed & ((highest_high_prev - pivot_l_series) > (atr_val.shift(1) * atr_mult))
 
-    qip_rsi_full = _rsi(close, settings.qip_rsi_len)
+    qip_rsi_full = _cached(cache, ("rsi", settings.qip_rsi_len), lambda: _rsi(close, settings.qip_rsi_len))
     qip_rsi_val = qip_rsi_full.shift(1)
-    vol_ma = volume.rolling(settings.vol_ma_len, min_periods=settings.vol_ma_len).mean().shift(1)
+    vol_ma = _cached(
+        cache,
+        ("volume_mean_shift", settings.vol_ma_len),
+        lambda: volume.rolling(settings.vol_ma_len, min_periods=settings.vol_ma_len).mean().shift(1),
+    )
     vol_curr = volume.shift(1)
-    qip_ema_f = _ema(close, settings.qip_ema_fast).shift(1)
-    qip_ema_s = _ema(close, settings.qip_ema_slow).shift(1)
+    qip_ema_fast_full = _cached(cache, ("ema", settings.qip_ema_fast), lambda: _ema(close, settings.qip_ema_fast))
+    qip_ema_slow_full = _cached(cache, ("ema", settings.qip_ema_slow), lambda: _ema(close, settings.qip_ema_slow))
+    qip_ema_f = qip_ema_fast_full.shift(1)
+    qip_ema_s = qip_ema_slow_full.shift(1)
     macd_line = macd_raw.shift(1)
 
     qip_rsi_bull_ok = pd.Series(True, index=frame.index) if not settings.qip_use_rsi_zone else (qip_rsi_val <= settings.qip_rsi_bull_max)
     qip_rsi_bear_ok = pd.Series(True, index=frame.index) if not settings.qip_use_rsi_zone else (qip_rsi_val >= settings.qip_rsi_bear_min)
 
-    prev_pl_rsi = _previous_occurrence(pl_confirmed.to_numpy(dtype=bool), qip_rsi_val.to_numpy(dtype=float))
-    prev_ph_rsi = _previous_occurrence(ph_confirmed.to_numpy(dtype=bool), qip_rsi_val.to_numpy(dtype=float))
-    prev_pl_val = _previous_occurrence(pl_confirmed.to_numpy(dtype=bool), pivot_l_series.to_numpy(dtype=float))
-    prev_ph_val = _previous_occurrence(ph_confirmed.to_numpy(dtype=bool), pivot_h_series.to_numpy(dtype=float))
-    prev_pl_macd = _previous_occurrence(pl_confirmed.to_numpy(dtype=bool), macd_line.to_numpy(dtype=float))
-    prev_ph_macd = _previous_occurrence(ph_confirmed.to_numpy(dtype=bool), macd_line.to_numpy(dtype=float))
+    prev_pl_rsi = _cached(
+        cache,
+        ("previous_occurrence", "pl_rsi", zz_left, settings.qip_rsi_len),
+        lambda: _previous_occurrence(pl_confirmed.to_numpy(dtype=bool), qip_rsi_val.to_numpy(dtype=float)),
+    )
+    prev_ph_rsi = _cached(
+        cache,
+        ("previous_occurrence", "ph_rsi", zz_left, settings.qip_rsi_len),
+        lambda: _previous_occurrence(ph_confirmed.to_numpy(dtype=bool), qip_rsi_val.to_numpy(dtype=float)),
+    )
+    prev_pl_val = _cached(
+        cache,
+        ("previous_occurrence", "pl_val", zz_left),
+        lambda: _previous_occurrence(pl_confirmed.to_numpy(dtype=bool), pivot_l_series.to_numpy(dtype=float)),
+    )
+    prev_ph_val = _cached(
+        cache,
+        ("previous_occurrence", "ph_val", zz_left),
+        lambda: _previous_occurrence(ph_confirmed.to_numpy(dtype=bool), pivot_h_series.to_numpy(dtype=float)),
+    )
+    prev_pl_macd = _cached(
+        cache,
+        ("previous_occurrence", "pl_macd", zz_left),
+        lambda: _previous_occurrence(pl_confirmed.to_numpy(dtype=bool), macd_line.to_numpy(dtype=float)),
+    )
+    prev_ph_macd = _cached(
+        cache,
+        ("previous_occurrence", "ph_macd", zz_left),
+        lambda: _previous_occurrence(ph_confirmed.to_numpy(dtype=bool), macd_line.to_numpy(dtype=float)),
+    )
 
     bull_div = pl_valid & (qip_rsi_val > prev_pl_rsi) & (pivot_l_series < prev_pl_val)
     bear_div = ph_valid & (qip_rsi_val < prev_ph_rsi) & (pivot_h_series > prev_ph_val)
@@ -294,23 +408,37 @@ def compute_indicators(df: pd.DataFrame, settings: StrategySettings) -> pd.DataF
     qtp_stoch_lower = 20 + round(10 * qtp_sens)
     qtp_score_thr = 55 - round(15 * qtp_sens)
 
-    qtp_ema_fast_val = _ema(close, settings.qtp_ema_fast_len)
-    qtp_ema_slow_val = _ema(close, settings.qtp_ema_slow_len)
-    qtp_atr = _atr(high, low, close, settings.qtp_atr_len)
-    qtp_rsi = _rsi(close, settings.qtp_rsi_len)
-    qtp_stoch = _stoch(close, high, low, settings.qtp_stoch_len)
-    qtp_vol_sma = volume.rolling(settings.qtp_vol_len, min_periods=settings.qtp_vol_len).mean()
+    qtp_ema_fast_val = _cached(cache, ("ema", settings.qtp_ema_fast_len), lambda: _ema(close, settings.qtp_ema_fast_len))
+    qtp_ema_slow_val = _cached(cache, ("ema", settings.qtp_ema_slow_len), lambda: _ema(close, settings.qtp_ema_slow_len))
+    qtp_atr = _cached(cache, ("atr", settings.qtp_atr_len), lambda: _atr(high, low, close, settings.qtp_atr_len))
+    qtp_rsi = _cached(cache, ("rsi", settings.qtp_rsi_len), lambda: _rsi(close, settings.qtp_rsi_len))
+    qtp_stoch = _cached(cache, ("stoch", settings.qtp_stoch_len), lambda: _stoch(close, high, low, settings.qtp_stoch_len))
+    qtp_vol_sma = _cached(
+        cache,
+        ("volume_mean", settings.qtp_vol_len),
+        lambda: volume.rolling(settings.qtp_vol_len, min_periods=settings.qtp_vol_len).mean(),
+    )
 
-    qtp_basis = _ema(close, settings.qtp_dev_lookback)
+    qtp_basis = _cached(cache, ("ema", settings.qtp_dev_lookback), lambda: _ema(close, settings.qtp_dev_lookback))
     qtp_dev = (close - qtp_basis) / qtp_atr.replace(0.0, np.nan)
-    qtp_d_mean = qtp_dev.rolling(settings.qtp_dev_lookback, min_periods=settings.qtp_dev_lookback).mean()
-    qtp_d_std = qtp_dev.rolling(settings.qtp_dev_lookback, min_periods=settings.qtp_dev_lookback).std()
+    qtp_d_mean = _cached(
+        cache,
+        ("qtp_dev_mean", settings.qtp_dev_lookback, settings.qtp_atr_len),
+        lambda: qtp_dev.rolling(settings.qtp_dev_lookback, min_periods=settings.qtp_dev_lookback).mean(),
+    )
+    qtp_d_std = _cached(
+        cache,
+        ("qtp_dev_std", settings.qtp_dev_lookback, settings.qtp_atr_len),
+        lambda: qtp_dev.rolling(settings.qtp_dev_lookback, min_periods=settings.qtp_dev_lookback).std(),
+    )
     qtp_zdev = (qtp_dev - qtp_d_mean) / qtp_d_std.replace(0.0, np.nan)
 
     qtp_body = (close - open_).abs()
     qtp_range = high - low
-    qtp_upper_wick = high - pd.concat([open_, close], axis=1).max(axis=1)
-    qtp_lower_wick = pd.concat([open_, close], axis=1).min(axis=1) - low
+    open_close_max = np.maximum(open_.to_numpy(dtype=float), close.to_numpy(dtype=float))
+    open_close_min = np.minimum(open_.to_numpy(dtype=float), close.to_numpy(dtype=float))
+    qtp_upper_wick = high - pd.Series(open_close_max, index=frame.index)
+    qtp_lower_wick = pd.Series(open_close_min, index=frame.index) - low
 
     qtp_bull_rev = (qtp_range > 0) & (qtp_lower_wick > qtp_body * 1.2) & (close > open_)
     qtp_bear_rev = (qtp_range > 0) & (qtp_upper_wick > qtp_body * 1.2) & (close < open_)
@@ -342,8 +470,16 @@ def compute_indicators(df: pd.DataFrame, settings: StrategySettings) -> pd.DataF
 
     qtp_rsi_bull_ok = pd.Series(True, index=frame.index) if not settings.qtp_use_rsi_zone else (qtp_rsi.shift(1) <= settings.qtp_rsi_bull_max)
     qtp_rsi_bear_ok = pd.Series(True, index=frame.index) if not settings.qtp_use_rsi_zone else (qtp_rsi.shift(1) >= settings.qtp_rsi_bear_min)
-    qtp_p_low = _pivot_low(low.to_numpy(dtype=float), qtp_pivot_left, 1)
-    qtp_p_high = _pivot_high(high.to_numpy(dtype=float), qtp_pivot_left, 1)
+    qtp_p_low = _cached(
+        cache,
+        ("pivot_low", qtp_pivot_left, 1),
+        lambda: _pivot_low(low.to_numpy(dtype=float), qtp_pivot_left, 1),
+    )
+    qtp_p_high = _cached(
+        cache,
+        ("pivot_high", qtp_pivot_left, 1),
+        lambda: _pivot_high(high.to_numpy(dtype=float), qtp_pivot_left, 1),
+    )
     qtp_p_low_series = pd.Series(np.isfinite(qtp_p_low), index=frame.index)
     qtp_p_high_series = pd.Series(np.isfinite(qtp_p_high), index=frame.index)
     qtp_final_bull = (qtp_p_low_series & (qtp_bot_score >= qtp_score_thr) & qtp_rsi_bull_ok) if settings.use_qtp else pd.Series(False, index=frame.index)
@@ -374,39 +510,94 @@ def compute_indicators(df: pd.DataFrame, settings: StrategySettings) -> pd.DataF
     indicators["bear_score"] = bear_score
     indicators["qtp_bot_score"] = qtp_bot_score
     indicators["qtp_top_score"] = qtp_top_score
-    indicators["ema_fast"] = _ema(close, settings.qip_ema_fast)
-    indicators["ema_slow"] = _ema(close, settings.qip_ema_slow)
-    indicators["rsi"] = _rsi(close, settings.qip_rsi_len)
+    indicators["ema_fast"] = qip_ema_fast_full
+    indicators["ema_slow"] = qip_ema_slow_full
+    indicators["rsi"] = qip_rsi_full
     return indicators
 
 
-def run_backtest(
-    df: pd.DataFrame,
+def _normalize_backtest_start_time(backtest_start_time: Optional[pd.Timestamp | str]) -> Optional[pd.Timestamp]:
+    if backtest_start_time is None:
+        return None
+    timestamp = pd.Timestamp(backtest_start_time)
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.tz_convert(None)
+    return timestamp
+
+
+def _select_active_indicators(
+    indicators: pd.DataFrame,
+    backtest_start_time: Optional[pd.Timestamp | str],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    test_start = _normalize_backtest_start_time(backtest_start_time)
+    if test_start is None:
+        return indicators, indicators
+    times = indicators["time"].to_numpy(dtype="datetime64[ns]", copy=False)
+    start_index = int(times.searchsorted(test_start.to_datetime64(), side="left"))
+    active_indicators = indicators.iloc[start_index:].reset_index(drop=True)
+    if active_indicators.empty:
+        return active_indicators, indicators.tail(1).reset_index(drop=True)
+    return active_indicators, active_indicators
+
+
+def _build_latest_state(latest: pd.Series) -> Dict[str, object]:
+    return {
+        "trend": "LONG" if bool(latest["is_long_trend"]) else "SHORT",
+        "zone": int(latest["lev_zone"]),
+        "trend_to_long": bool(latest["trend_to_long"]),
+        "trend_to_short": bool(latest["trend_to_short"]),
+        "final_bull": bool(latest["final_bull"]),
+        "final_bear": bool(latest["final_bear"]),
+        "qip_bull": bool(latest["qip_final_bull"]),
+        "qip_bear": bool(latest["qip_final_bear"]),
+        "qtp_bull": bool(latest["qtp_final_bull"]),
+        "qtp_bear": bool(latest["qtp_final_bear"]),
+        "rsi": float(latest["rsi"]) if np.isfinite(latest["rsi"]) else float("nan"),
+        "dist_atr": float(latest["dist_atr"]) if np.isfinite(latest["dist_atr"]) else float("nan"),
+    }
+
+
+def _run_backtest_core(
+    indicators: pd.DataFrame,
     settings: StrategySettings,
-    fee_rate: float = 0.0004,
-    starting_equity: float = 1_000.0,
-    backtest_start_time: Optional[pd.Timestamp | str] = None,
-) -> BacktestResult:
-    indicators = compute_indicators(df, settings)
+    fee_rate: float,
+    starting_equity: float,
+    backtest_start_time: Optional[pd.Timestamp | str],
+    include_details: bool,
+) -> Tuple[StrategyMetrics, List[TradeRecord], pd.Series, pd.DataFrame, Dict[str, object]]:
     latest = indicators.iloc[-1]
-    if backtest_start_time is not None:
-        test_start = pd.Timestamp(backtest_start_time)
-        active_indicators = indicators[indicators["time"] >= test_start].reset_index(drop=True)
-    else:
-        active_indicators = indicators
-    result_indicators = active_indicators if not active_indicators.empty else indicators.tail(1).reset_index(drop=True)
+    active_indicators, result_indicators = _select_active_indicators(indicators, backtest_start_time)
+
+    active_count = len(active_indicators)
+    close_values = active_indicators["close"].to_numpy(dtype=float, copy=False)
+    time_values = active_indicators["time"].to_numpy(copy=False)
+    lev_zone_values = active_indicators["lev_zone"].to_numpy(dtype=int, copy=False)
+    is_long_trend_values = active_indicators["is_long_trend"].to_numpy(dtype=bool, copy=False)
+    is_short_trend_values = active_indicators["is_short_trend"].to_numpy(dtype=bool, copy=False)
+    trend_to_long_values = active_indicators["trend_to_long"].to_numpy(dtype=bool, copy=False)
+    trend_to_short_values = active_indicators["trend_to_short"].to_numpy(dtype=bool, copy=False)
+    final_bull_values = active_indicators["final_bull"].to_numpy(dtype=bool, copy=False)
+    final_bear_values = active_indicators["final_bear"].to_numpy(dtype=bool, copy=False)
+
     equity = float(starting_equity)
     position_qty = 0.0
     avg_entry_price = 0.0
-    open_trade: Optional[dict] = None
+    entry_side = ""
+    entry_time = pd.Timestamp(result_indicators["time"].iloc[0])
+    entry_price = 0.0
+    zone_events: List[str] = []
     trades: List[TradeRecord] = []
-    equity_curve: List[float] = []
+    equity_curve_values = np.empty(active_count, dtype=float) if active_count else np.empty(0, dtype=float)
+
+    gross_profit = 0.0
+    gross_loss = 0.0
+    trade_count = 0
+    win_count = 0
 
     long_zone_used = [False, False, False]
     short_zone_used = [False, False, False]
     last_long_zone = 0
     last_short_zone = 0
-
     def reset_zones() -> None:
         nonlocal last_long_zone, last_short_zone
         long_zone_used[:] = [False, False, False]
@@ -415,7 +606,7 @@ def run_backtest(
         last_short_zone = 0
 
     def add_position(side: str, price: float, time_value: pd.Timestamp, zone: int) -> None:
-        nonlocal equity, position_qty, avg_entry_price, open_trade, last_long_zone, last_short_zone
+        nonlocal equity, position_qty, avg_entry_price, entry_side, entry_time, entry_price, last_long_zone, last_short_zone
         allocation_pct = settings.entry_size_pct / 100.0
         if settings.beast_mode and zone in (2, 3):
             if zone == 2:
@@ -432,18 +623,17 @@ def run_backtest(
         if abs(position_qty) < 1e-12:
             position_qty = signed_qty
             avg_entry_price = price
-            open_trade = {
-                "side": side,
-                "entry_time": time_value,
-                "entry_price": price,
-                "zone_events": [f"{side[0].upper()}{zone}"],
-            }
+            entry_side = side
+            entry_time = time_value
+            entry_price = price
+            if include_details:
+                zone_events[:] = [f"{side[0].upper()}{zone}"]
         else:
             total_qty = abs(position_qty) + qty
             avg_entry_price = ((avg_entry_price * abs(position_qty)) + (price * qty)) / max(total_qty, 1e-12)
             position_qty += signed_qty
-            if open_trade is not None:
-                open_trade["zone_events"].append(f"{side[0].upper()}{zone}")
+            if include_details:
+                zone_events.append(f"{side[0].upper()}{zone}")
 
         if side == "long":
             long_zone_used[zone - 1] = True
@@ -453,58 +643,70 @@ def run_backtest(
             last_short_zone = zone
 
     def close_position(price: float, time_value: pd.Timestamp, reason: str) -> None:
-        nonlocal equity, position_qty, avg_entry_price, open_trade
-        if abs(position_qty) < 1e-12 or open_trade is None:
+        nonlocal equity, position_qty, avg_entry_price, entry_side, entry_time, entry_price
+        nonlocal gross_profit, gross_loss, trade_count, win_count
+        if abs(position_qty) < 1e-12 or not entry_side:
             return
         pnl = position_qty * (price - avg_entry_price)
         fee = abs(position_qty) * price * fee_rate
-        equity += pnl - fee
-        gross_cost = abs(position_qty) * avg_entry_price
-        return_pct = (pnl / gross_cost * 100.0) if gross_cost else 0.0
-        trades.append(
-            TradeRecord(
-                side=str(open_trade["side"]),
-                entry_time=pd.Timestamp(open_trade["entry_time"]),
-                exit_time=pd.Timestamp(time_value),
-                entry_price=float(open_trade["entry_price"]),
-                exit_price=float(price),
-                quantity=float(abs(position_qty)),
-                pnl=float(pnl - fee),
-                return_pct=float(return_pct),
-                reason=reason,
-                zones=",".join(open_trade["zone_events"]),
+        net_pnl = pnl - fee
+        equity += net_pnl
+        trade_count += 1
+        if net_pnl > 0:
+            gross_profit += net_pnl
+            win_count += 1
+        else:
+            gross_loss += abs(net_pnl)
+        if include_details:
+            gross_cost = abs(position_qty) * avg_entry_price
+            return_pct = (pnl / gross_cost * 100.0) if gross_cost else 0.0
+            trades.append(
+                TradeRecord(
+                    side=entry_side,
+                    entry_time=entry_time,
+                    exit_time=time_value,
+                    entry_price=float(entry_price),
+                    exit_price=float(price),
+                    quantity=float(abs(position_qty)),
+                    pnl=float(net_pnl),
+                    return_pct=float(return_pct),
+                    reason=reason,
+                    zones=",".join(zone_events),
+                )
             )
-        )
+            zone_events.clear()
         position_qty = 0.0
         avg_entry_price = 0.0
-        open_trade = None
+        entry_side = ""
+        entry_price = 0.0
         reset_zones()
 
-    for row in active_indicators.itertuples(index=False):
-        current_price = float(row.close)
-        current_time = pd.Timestamp(row.time)
+    for index in range(active_count):
+        current_price = close_values[index]
+        current_time = pd.Timestamp(time_values[index])
 
         if abs(position_qty) < 1e-12:
             reset_zones()
 
-        if row.trend_to_short and position_qty > 0:
+        if trend_to_short_values[index] and position_qty > 0:
             close_position(current_price, current_time, "trend_to_short")
-        if row.trend_to_long and position_qty < 0:
+        if trend_to_long_values[index] and position_qty < 0:
             close_position(current_price, current_time, "trend_to_long")
-        if row.final_bear and position_qty > 0:
+        if final_bear_values[index] and position_qty > 0:
             close_position(current_price, current_time, "opposite_signal")
-        if row.final_bull and position_qty < 0:
+        if final_bull_values[index] and position_qty < 0:
             close_position(current_price, current_time, "opposite_signal")
 
         if abs(position_qty) < 1e-12:
             reset_zones()
 
-        can_long_z1 = (not settings.beast_mode) and row.is_long_trend and row.final_bull and row.lev_zone == 1 and (not long_zone_used[0]) and last_long_zone == 0
-        can_long_z2 = row.is_long_trend and row.final_bull and row.lev_zone == 2 and (not long_zone_used[1]) and last_long_zone in (0, 1)
-        can_long_z3 = row.is_long_trend and row.final_bull and row.lev_zone == 3 and (not long_zone_used[2]) and last_long_zone in (0, 2)
-        can_short_z1 = (not settings.beast_mode) and row.is_short_trend and row.final_bear and row.lev_zone == 1 and (not short_zone_used[0]) and last_short_zone == 0
-        can_short_z2 = row.is_short_trend and row.final_bear and row.lev_zone == 2 and (not short_zone_used[1]) and last_short_zone in (0, 1)
-        can_short_z3 = row.is_short_trend and row.final_bear and row.lev_zone == 3 and (not short_zone_used[2]) and last_short_zone in (0, 2)
+        lev_zone = lev_zone_values[index]
+        can_long_z1 = (not settings.beast_mode) and is_long_trend_values[index] and final_bull_values[index] and lev_zone == 1 and (not long_zone_used[0]) and last_long_zone == 0
+        can_long_z2 = is_long_trend_values[index] and final_bull_values[index] and lev_zone == 2 and (not long_zone_used[1]) and last_long_zone in (0, 1)
+        can_long_z3 = is_long_trend_values[index] and final_bull_values[index] and lev_zone == 3 and (not long_zone_used[2]) and last_long_zone in (0, 2)
+        can_short_z1 = (not settings.beast_mode) and is_short_trend_values[index] and final_bear_values[index] and lev_zone == 1 and (not short_zone_used[0]) and last_short_zone == 0
+        can_short_z2 = is_short_trend_values[index] and final_bear_values[index] and lev_zone == 2 and (not short_zone_used[1]) and last_short_zone in (0, 1)
+        can_short_z3 = is_short_trend_values[index] and final_bear_values[index] and lev_zone == 3 and (not short_zone_used[2]) and last_short_zone in (0, 2)
 
         if can_long_z1:
             add_position("long", current_price, current_time, 1)
@@ -520,40 +722,34 @@ def run_backtest(
             add_position("short", current_price, current_time, 3)
 
         unrealized = position_qty * (current_price - avg_entry_price) if abs(position_qty) > 1e-12 else 0.0
-        equity_curve.append(equity + unrealized)
+        equity_curve_values[index] = equity + unrealized
 
-    if abs(position_qty) > 1e-12:
-        final_row = active_indicators.iloc[-1]
-        close_position(float(final_row["close"]), pd.Timestamp(final_row["time"]), "end_of_test")
-        equity_curve[-1] = equity
+    if abs(position_qty) > 1e-12 and active_count:
+        close_position(close_values[-1], pd.Timestamp(time_values[-1]), "end_of_test")
+        equity_curve_values[-1] = equity
 
-    gross_profit = sum(max(trade.pnl, 0.0) for trade in trades)
-    gross_loss = abs(sum(min(trade.pnl, 0.0) for trade in trades))
-    trade_count = len(trades)
-    win_rate = (sum(1 for trade in trades if trade.pnl > 0) / trade_count * 100.0) if trade_count else 0.0
+    if equity_curve_values.size:
+        peaks = np.maximum.accumulate(equity_curve_values)
+        drawdown_pct = np.divide(
+            equity_curve_values - peaks,
+            peaks,
+            out=np.zeros_like(equity_curve_values),
+            where=peaks != 0.0,
+        ) * 100.0
+        max_drawdown_pct = abs(float(drawdown_pct.min()))
+    else:
+        max_drawdown_pct = 0.0
+
+    win_rate = (win_count / trade_count * 100.0) if trade_count else 0.0
     profit_factor = (gross_profit / gross_loss) if gross_loss else float("inf" if gross_profit > 0 else 0.0)
 
-    if equity_curve:
-        curve_index = active_indicators["time"].iloc[: len(equity_curve)]
-        curve = pd.Series(equity_curve, index=curve_index, dtype=float)
+    if include_details:
+        if equity_curve_values.size:
+            curve = pd.Series(equity_curve_values, index=active_indicators["time"].iloc[: len(equity_curve_values)], dtype=float)
+        else:
+            curve = pd.Series([starting_equity], index=[result_indicators["time"].iloc[0]], dtype=float)
     else:
-        curve = pd.Series([starting_equity], index=[result_indicators["time"].iloc[0]], dtype=float)
-    peaks = curve.cummax()
-    drawdown_pct = ((curve - peaks) / peaks.replace(0.0, np.nan)).fillna(0.0) * 100.0
-    max_drawdown_pct = abs(float(drawdown_pct.min())) if not drawdown_pct.empty else 0.0
-
-    latest_state = {
-        "trend": "LONG" if bool(latest["is_long_trend"]) else "SHORT",
-        "zone": int(latest["lev_zone"]),
-        "final_bull": bool(latest["final_bull"]),
-        "final_bear": bool(latest["final_bear"]),
-        "qip_bull": bool(latest["qip_final_bull"]),
-        "qip_bear": bool(latest["qip_final_bear"]),
-        "qtp_bull": bool(latest["qtp_final_bull"]),
-        "qtp_bear": bool(latest["qtp_final_bear"]),
-        "rsi": float(latest["rsi"]) if np.isfinite(latest["rsi"]) else float("nan"),
-        "dist_atr": float(latest["dist_atr"]) if np.isfinite(latest["dist_atr"]) else float("nan"),
-    }
+        curve = pd.Series(dtype=float)
 
     metrics = StrategyMetrics(
         total_return_pct=((equity - starting_equity) / starting_equity) * 100.0,
@@ -562,6 +758,48 @@ def run_backtest(
         trade_count=trade_count,
         win_rate_pct=win_rate,
         profit_factor=float(profit_factor if math.isfinite(profit_factor) else 999.0),
+    )
+    latest_state = _build_latest_state(latest) if include_details else {}
+    indicator_frame = compact_indicator_frame(result_indicators, RESULT_INDICATOR_COLUMNS) if include_details else result_indicators.tail(1)
+    return metrics, trades, curve, indicator_frame, latest_state
+
+
+def run_backtest_metrics(
+    df: pd.DataFrame,
+    settings: StrategySettings,
+    fee_rate: float = 0.0004,
+    starting_equity: float = 1_000.0,
+    backtest_start_time: Optional[pd.Timestamp | str] = None,
+    indicator_cache: Optional[Dict[Tuple[object, ...], object]] = None,
+) -> StrategyMetrics:
+    indicators = compute_indicators(df, settings, cache=indicator_cache)
+    metrics, _, _, _, _ = _run_backtest_core(
+        indicators,
+        settings=settings,
+        fee_rate=fee_rate,
+        starting_equity=starting_equity,
+        backtest_start_time=backtest_start_time,
+        include_details=False,
+    )
+    return metrics
+
+
+def run_backtest(
+    df: pd.DataFrame,
+    settings: StrategySettings,
+    fee_rate: float = 0.0004,
+    starting_equity: float = 1_000.0,
+    backtest_start_time: Optional[pd.Timestamp | str] = None,
+    indicator_cache: Optional[Dict[Tuple[object, ...], object]] = None,
+) -> BacktestResult:
+    indicators = compute_indicators(df, settings, cache=indicator_cache)
+    metrics, trades, curve, result_indicators, latest_state = _run_backtest_core(
+        indicators,
+        settings=settings,
+        fee_rate=fee_rate,
+        starting_equity=starting_equity,
+        backtest_start_time=backtest_start_time,
+        include_details=True,
     )
     return BacktestResult(
         settings=settings,

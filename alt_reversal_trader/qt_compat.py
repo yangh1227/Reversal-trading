@@ -2,6 +2,7 @@ from __future__ import annotations
 
 try:
     from PyQt5.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal as Signal
+    from PyQt5.QtGui import QBrush, QColor
     from PyQt5.QtWebEngineWidgets import QWebEngineSettings, QWebEngineView
     from PyQt5.QtWidgets import (
         QAbstractItemView,
@@ -20,6 +21,7 @@ try:
         QMessageBox,
         QPlainTextEdit,
         QPushButton,
+        QRadioButton,
         QScrollArea,
         QSpinBox as _QSpinBox,
         QSplitter,
@@ -47,6 +49,7 @@ try:
 
 except ImportError:
     from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal as Signal
+    from PyQt6.QtGui import QBrush, QColor
     from PyQt6.QtWebEngineCore import QWebEngineSettings
     from PyQt6.QtWebEngineWidgets import QWebEngineView
     from PyQt6.QtWidgets import (
@@ -66,6 +69,7 @@ except ImportError:
         QMessageBox,
         QPlainTextEdit,
         QPushButton,
+        QRadioButton,
         QScrollArea,
         QSpinBox as _QSpinBox,
         QSplitter,
@@ -120,7 +124,9 @@ __all__ = [
     "VERTICAL",
     "WEB_ATTR_FILE_URLS",
     "QApplication",
+    "QBrush",
     "QCheckBox",
+    "QColor",
     "QComboBox",
     "QDoubleSpinBox",
     "QFormLayout",
@@ -134,6 +140,7 @@ __all__ = [
     "QMessageBox",
     "QPlainTextEdit",
     "QPushButton",
+    "QRadioButton",
     "QScrollArea",
     "QSpinBox",
     "QSplitter",

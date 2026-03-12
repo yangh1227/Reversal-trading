@@ -27,6 +27,9 @@ ACCOUNT_PATH = "/fapi/v2/account"
 POSITION_RISK_PATH = "/fapi/v2/positionRisk"
 LEVERAGE_PATH = "/fapi/v1/leverage"
 REQUEST_MIN_INTERVAL_SECONDS = 0.25
+CUSTOM_INTERVAL_BASE = {
+    "2m": "1m",
+}
 
 
 @dataclass(frozen=True)
@@ -55,6 +58,14 @@ class PositionSnapshot:
     mark_price: float
     unrealized_pnl: float
     leverage: int
+
+
+def _normalize_unrealized_pnl(amount: float, entry_price: float, mark_price: float, fallback: float) -> float:
+    if math.isfinite(amount) and math.isfinite(entry_price) and math.isfinite(mark_price) and entry_price > 0 and mark_price > 0:
+        calculated = (mark_price - entry_price) * amount
+        if math.isfinite(calculated):
+            return 0.0 if abs(calculated) < 1e-10 else float(calculated)
+    return float(fallback)
 
 
 def _interval_to_ms(interval: str) -> int:
@@ -116,6 +127,47 @@ def _rows_to_ohlcv_frame(rows: List[List[Any]]) -> pd.DataFrame:
     now_ms = int(time.time() * 1000)
     frame = frame[frame["close_time_ms"].astype(np.int64) <= now_ms]
     return frame[["time", "open", "high", "low", "close", "volume", "quote_volume"]].reset_index(drop=True)
+
+
+def resolve_base_interval(interval: str) -> str:
+    return CUSTOM_INTERVAL_BASE.get(interval, interval)
+
+
+def resample_ohlcv(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+    if df.empty:
+        columns = ["time", "open", "high", "low", "close", "volume"]
+        if "quote_volume" in df.columns:
+            columns.append("quote_volume")
+        return pd.DataFrame(columns=columns)
+
+    frame = df.copy()
+    frame["time"] = pd.to_datetime(frame["time"])
+    numeric_columns = [column for column in ("open", "high", "low", "close", "volume", "quote_volume") if column in frame.columns]
+    frame[numeric_columns] = frame[numeric_columns].astype(float)
+    frame = frame.sort_values("time").reset_index(drop=True)
+
+    if interval != "2m":
+        ordered_columns = ["time", "open", "high", "low", "close", "volume"]
+        if "quote_volume" in frame.columns:
+            ordered_columns.append("quote_volume")
+        return frame[ordered_columns].reset_index(drop=True)
+
+    indexed = frame.set_index("time")
+    aggregations = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }
+    if "quote_volume" in indexed.columns:
+        aggregations["quote_volume"] = "sum"
+    resampled = indexed.resample("2min", label="left", closed="left").agg(aggregations)
+    resampled = resampled.dropna(subset=["open", "high", "low", "close"]).reset_index()
+    ordered_columns = ["time", "open", "high", "low", "close", "volume"]
+    if "quote_volume" in resampled.columns:
+        ordered_columns.append("quote_volume")
+    return resampled[ordered_columns].reset_index(drop=True)
 
 
 def _retry_after_seconds(response: requests.Response) -> Optional[float]:
@@ -287,6 +339,10 @@ class BinanceFuturesClient:
         start_time: int,
         end_time: Optional[int] = None,
     ) -> pd.DataFrame:
+        base_interval = resolve_base_interval(interval)
+        if base_interval != interval:
+            base_df = self.historical_ohlcv(symbol, base_interval, start_time=start_time, end_time=end_time)
+            return resample_ohlcv(base_df, interval)
         step_ms = _interval_to_ms(interval)
         end_ms = end_time or int(time.time() * 1000)
         cursor = int(start_time)
@@ -311,6 +367,12 @@ class BinanceFuturesClient:
         bars: int,
         end_time: Optional[int] = None,
     ) -> pd.DataFrame:
+        base_interval = resolve_base_interval(interval)
+        if base_interval != interval:
+            base_bars = max(int(bars), 1) * max(1, _interval_to_ms(interval) // _interval_to_ms(base_interval)) + 2
+            base_df = self.historical_ohlcv_recent(symbol, base_interval, bars=base_bars, end_time=end_time)
+            resampled = resample_ohlcv(base_df, interval)
+            return resampled.tail(max(int(bars), 1)).reset_index(drop=True)
         target_bars = max(int(bars), 1)
         cursor_end = int(end_time or time.time() * 1000)
         rows: List[List[Any]] = []
@@ -376,22 +438,33 @@ class BinanceFuturesClient:
         return BalanceSnapshot(wallet, available, equity, unrealized)
 
     def get_position(self, symbol: str) -> Optional[PositionSnapshot]:
+        for position in self.get_open_positions():
+            if position.symbol == symbol:
+                return position
+        return None
+
+    def get_open_positions(self) -> List[PositionSnapshot]:
         payload = self._request("GET", POSITION_RISK_PATH, signed=True)
+        positions: List[PositionSnapshot] = []
         for entry in payload:
-            if entry.get("symbol") != symbol:
-                continue
             amount = float(entry.get("positionAmt", 0.0))
             if abs(amount) < 1e-12:
-                return None
-            return PositionSnapshot(
-                symbol=symbol,
-                amount=amount,
-                entry_price=float(entry.get("entryPrice", 0.0)),
-                mark_price=float(entry.get("markPrice", 0.0)),
-                unrealized_pnl=float(entry.get("unRealizedProfit", 0.0)),
-                leverage=int(float(entry.get("leverage", 0.0) or 0.0)),
+                continue
+            entry_price = float(entry.get("entryPrice", 0.0))
+            mark_price = float(entry.get("markPrice", 0.0))
+            api_unrealized = float(entry.get("unRealizedProfit", 0.0))
+            positions.append(
+                PositionSnapshot(
+                    symbol=str(entry.get("symbol", "")),
+                    amount=amount,
+                    entry_price=entry_price,
+                    mark_price=mark_price,
+                    unrealized_pnl=_normalize_unrealized_pnl(amount, entry_price, mark_price, api_unrealized),
+                    leverage=int(float(entry.get("leverage", 0.0) or 0.0)),
+                )
             )
-        return None
+        positions.sort(key=lambda item: (item.symbol,))
+        return positions
 
     def set_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
         return self._request("POST", LEVERAGE_PATH, params={"symbol": symbol, "leverage": int(leverage)}, signed=True)
@@ -441,6 +514,7 @@ class BinanceFuturesClient:
         rsi_upper: float,
         workers: int = 8,
         log_callback: Optional[Callable[[str], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> List[CandidateSymbol]:
         def log(message: str) -> None:
             if log_callback:
@@ -449,6 +523,8 @@ class BinanceFuturesClient:
         ticker_map = self.ticker_24h()
         pre_symbols = []
         for symbol in self.usdt_perpetual_symbols():
+            if should_stop and should_stop():
+                return []
             ticker = ticker_map.get(symbol)
             if not ticker:
                 continue
@@ -457,10 +533,14 @@ class BinanceFuturesClient:
         log(f"거래량 사전선별 {len(pre_symbols)}개: 24h 거래량 {quote_volume_min:,.0f} USDT 이상")
 
         def enrich(symbol: str) -> Optional[CandidateSymbol]:
+            if should_stop and should_stop():
+                return None
             ticker = ticker_map[symbol]
             daily_df = _rows_to_ohlcv_frame(self.klines(symbol, "1d", limit=3, ttl_seconds=0.0))
             daily_vol = _daily_volatility_from_klines(daily_df)
             if not np.isfinite(daily_vol) or daily_vol < daily_volatility_min:
+                return None
+            if should_stop and should_stop():
                 return None
             minute_limit = min(max(rsi_length * 3, 60), 99)
             minute_df = _rows_to_ohlcv_frame(self.klines(symbol, "1m", limit=minute_limit, ttl_seconds=0.0))
@@ -489,6 +569,8 @@ class BinanceFuturesClient:
             futures = {executor.submit(enrich, symbol): symbol for symbol in pre_symbols}
             done = 0
             for future in as_completed(futures):
+                if should_stop and should_stop():
+                    break
                 done += 1
                 result = future.result()
                 if result is not None:

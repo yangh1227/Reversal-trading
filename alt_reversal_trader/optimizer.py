@@ -2,22 +2,155 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from itertools import product
-from typing import Dict, List, Tuple
+import math
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import time
-
 import pandas as pd
 
-from .config import PARAMETER_SPECS, ParameterSpec, StrategySettings
-from .strategy import BacktestResult, run_backtest
+from .config import DEFAULT_OPTIMIZATION_PROFILE_SCALE, PARAMETER_SPECS, ParameterSpec, StrategySettings
+from .strategy import BacktestResult, StrategyMetrics, prepare_ohlcv, run_backtest, run_backtest_metrics
 
 
 @dataclass(frozen=True)
 class OptimizationResult:
     symbol: str
+    best_interval: str
     best_backtest: BacktestResult
     combinations_tested: int
     duration_seconds: float
     trimmed_grid: bool
+
+
+PARAMETER_SPEC_BY_KEY = {spec.key: spec for spec in PARAMETER_SPECS}
+
+
+def optimize_symbol_process_entry(
+    symbol: str,
+    df: pd.DataFrame,
+    base_settings: StrategySettings,
+    optimize_flags: Dict[str, bool],
+    span_pct: float,
+    steps: int,
+    max_combinations: int,
+    fee_rate: float,
+    backtest_start_time: pd.Timestamp | str | None = None,
+    result_interval: Optional[str] = None,
+) -> OptimizationResult:
+    return optimize_symbol(
+        symbol=symbol,
+        df=df,
+        base_settings=base_settings,
+        optimize_flags=optimize_flags,
+        span_pct=span_pct,
+        steps=steps,
+        max_combinations=max_combinations,
+        fee_rate=fee_rate,
+        backtest_start_time=backtest_start_time,
+        result_interval=result_interval,
+    )
+
+
+def _profile_scale(span_pct: float) -> float:
+    return max(0.25, float(span_pct) / DEFAULT_OPTIMIZATION_PROFILE_SCALE)
+
+
+def _numeric_step(spec: ParameterSpec):
+    if spec.optimize_step is not None:
+        return spec.optimize_step
+    if spec.step is not None:
+        return spec.step
+    return 1 if spec.kind == "int" else 0.1
+
+
+def _snap_numeric_value(spec: ParameterSpec, value, step):
+    if spec.kind == "int":
+        step = max(1, int(step or 1))
+        snapped = int(round(float(value) / step) * step)
+    else:
+        step = float(step or 0.01)
+        precision = len(str(step).rstrip("0").split(".")[-1]) if "." in str(step) else 0
+        snapped = round(round(float(value) / step) * step, precision)
+    if spec.minimum is not None:
+        snapped = max(spec.minimum, snapped)
+    if spec.maximum is not None:
+        snapped = min(spec.maximum, snapped)
+    return snapped
+
+
+def _thin_values(values: Sequence, target_count: int, base_index: int) -> List:
+    items = list(values)
+    if target_count <= 0:
+        return []
+    if len(items) <= target_count:
+        return items
+    if target_count == 1:
+        return [items[base_index]]
+
+    indices = {int(round((len(items) - 1) * idx / (target_count - 1))) for idx in range(target_count)}
+    indices.add(base_index)
+    protected = {0, len(items) - 1, base_index}
+
+    while len(indices) < target_count:
+        candidates = [idx for idx in range(len(items)) if idx not in indices]
+        if not candidates:
+            break
+        best_idx = max(candidates, key=lambda idx: min(abs(idx - selected) for selected in indices))
+        indices.add(best_idx)
+
+    while len(indices) > target_count:
+        removable = [idx for idx in sorted(indices) if idx not in protected]
+        if not removable:
+            removable = [idx for idx in sorted(indices) if idx != base_index]
+        if not removable:
+            break
+        drop_idx = min(
+            removable,
+            key=lambda idx: (
+                min(abs(idx - other) for other in indices if other != idx),
+                abs(idx - base_index),
+            ),
+        )
+        indices.remove(drop_idx)
+
+    return [items[idx] for idx in sorted(indices)]
+
+
+def _choice_range(spec: ParameterSpec, base_value, span_pct: float, steps: int) -> List:
+    choices = list(spec.choices)
+    if base_value not in choices:
+        return [base_value]
+    center = choices.index(base_value)
+    radius = max(1, int(round(spec.optimize_choice_radius * _profile_scale(span_pct))))
+    start = max(0, center - radius)
+    end = min(len(choices), center + radius + 1)
+    values = choices[start:end]
+    base_index = values.index(base_value)
+    return _thin_values(values, min(max(steps, 1), len(values)), base_index)
+
+
+def _numeric_range(spec: ParameterSpec, base_value, span_pct: float, steps: int) -> List:
+    original_base = int(base_value) if spec.kind == "int" else float(base_value)
+    step = _numeric_step(spec)
+    span = spec.optimize_span
+    if span is None:
+        span = max(step, abs(float(base_value)) * 0.2)
+    effective_span = max(step, float(span) * _profile_scale(span_pct))
+    half_steps = max(1, int(round(effective_span / float(step))))
+    values: List = []
+    for offset in range(-half_steps, half_steps + 1):
+        value = _snap_numeric_value(spec, float(base_value) + (offset * float(step)), step)
+        if value not in values:
+            values.append(value)
+    base_value = original_base
+    if spec.minimum is not None:
+        base_value = max(spec.minimum, base_value)
+    if spec.maximum is not None:
+        base_value = min(spec.maximum, base_value)
+    if base_value not in values:
+        values.append(base_value)
+    values = sorted(values)
+    base_index = values.index(base_value)
+    return _thin_values(values, min(max(steps, 1), len(values)), base_index)
 
 
 def _value_range(spec: ParameterSpec, base_value, span_pct: float, steps: int, enabled: bool) -> List:
@@ -28,33 +161,23 @@ def _value_range(spec: ParameterSpec, base_value, span_pct: float, steps: int, e
         return [False, True]
 
     if spec.kind == "choice":
-        choices = list(spec.choices)
-        if base_value not in choices:
-            return [base_value]
-        center = choices.index(base_value)
-        span = max(1, round(len(choices) * (span_pct / 100.0)))
-        return choices[max(0, center - span) : min(len(choices), center + span + 1)]
+        return _choice_range(spec, base_value, span_pct, steps)
 
-    values: List = []
-    ratios = [1.0] if steps <= 1 else [1.0 - (span_pct / 100.0) + ((2 * span_pct / 100.0) * idx / (steps - 1)) for idx in range(steps)]
-    for ratio in ratios:
-        value = float(base_value) * ratio
-        if spec.kind == "int":
-            step = int(spec.step or 1)
-            value = int(round(value / step) * step)
-        else:
-            step = float(spec.step or 0.01)
-            precision = len(str(step).rstrip("0").split(".")[-1]) if "." in str(step) else 0
-            value = round(round(value / step) * step, precision)
-        if spec.minimum is not None:
-            value = max(spec.minimum, value)
-        if spec.maximum is not None:
-            value = min(spec.maximum, value)
-        if value not in values:
-            values.append(value)
-    if base_value not in values:
-        values.append(base_value)
-    return sorted(values)
+    return _numeric_range(spec, base_value, span_pct, steps)
+
+
+def _settings_are_valid(settings: StrategySettings) -> bool:
+    if settings.qip_ema_fast >= settings.qip_ema_slow:
+        return False
+    if settings.qtp_ema_fast_len >= settings.qtp_ema_slow_len:
+        return False
+    if settings.qtp_min_pvt_left > settings.qtp_max_pvt_left:
+        return False
+    if settings.qip_rsi_bull_max >= settings.qip_rsi_bear_min:
+        return False
+    if settings.qtp_rsi_bull_max >= settings.qtp_rsi_bear_min:
+        return False
+    return True
 
 
 def generate_parameter_grid(
@@ -84,23 +207,37 @@ def generate_parameter_grid(
     trimmed = False
     while count() > max_combinations:
         trimmed = True
-        key = max(values_by_key, key=lambda current: len(values_by_key[current]))
-        current_values = values_by_key[key]
-        if len(current_values) <= 1:
+        candidates = [key for key, values in values_by_key.items() if len(values) > 1]
+        if not candidates:
             break
-        mid = current_values[len(current_values) // 2]
-        reduced = [current_values[0], mid, current_values[-1]]
-        deduped = []
-        for value in reduced:
-            if value not in deduped:
-                deduped.append(value)
-        values_by_key[key] = deduped if len(deduped) < len(current_values) else [mid]
+        key = max(
+            candidates,
+            key=lambda current: (
+                PARAMETER_SPEC_BY_KEY[current].optimize_priority,
+                len(values_by_key[current]),
+            ),
+        )
+        current_values = values_by_key[key]
+        next_size = max(1, len(current_values) - (2 if len(current_values) > 4 else 1))
+        base_value = getattr(base_settings, key)
+        if base_value in current_values:
+            base_index = current_values.index(base_value)
+        else:
+            base_index = len(current_values) // 2
+        values_by_key[key] = _thin_values(current_values, next_size, base_index)
 
     keys = list(values_by_key.keys())
     grid: List[StrategySettings] = []
+    seen_settings: set[StrategySettings] = set()
     for combo in product(*(values_by_key[key] for key in keys)):
         payload = {key: combo[idx] for idx, key in enumerate(keys)}
-        grid.append(replace(base_settings, **payload))
+        settings = replace(base_settings, **payload)
+        if not _settings_are_valid(settings):
+            continue
+        if settings in seen_settings:
+            continue
+        seen_settings.add(settings)
+        grid.append(settings)
     return grid, trimmed
 
 
@@ -114,24 +251,34 @@ def optimize_symbol(
     max_combinations: int,
     fee_rate: float,
     backtest_start_time: pd.Timestamp | str | None = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    result_interval: Optional[str] = None,
 ) -> OptimizationResult:
     started = time.perf_counter()
     grid, trimmed = generate_parameter_grid(base_settings, optimize_flags, span_pct, steps, max_combinations)
-    best_result: BacktestResult | None = None
+    prepared_df = prepare_ohlcv(df)
+    indicator_cache: Dict[tuple[object, ...], object] = {}
+    best_metrics: StrategyMetrics | None = None
+    best_settings: StrategySettings | None = None
+    combinations_tested = 0
 
     for settings in grid:
-        result = run_backtest(
-            df,
+        if should_stop and should_stop():
+            break
+        current = run_backtest_metrics(
+            prepared_df,
             settings=settings,
             fee_rate=fee_rate,
             backtest_start_time=backtest_start_time,
+            indicator_cache=indicator_cache,
         )
-        if best_result is None:
-            best_result = result
+        combinations_tested += 1
+        if best_metrics is None:
+            best_settings = settings
+            best_metrics = current
             continue
 
-        current = result.metrics
-        best = best_result.metrics
+        best = best_metrics
         current_key = (
             current.total_return_pct,
             -current.max_drawdown_pct,
@@ -147,15 +294,105 @@ def optimize_symbol(
             best.profit_factor,
         )
         if current_key > best_key:
-            best_result = result
+            best_settings = settings
+            best_metrics = current
 
-    if best_result is None:
-        raise RuntimeError(f"no optimization result for {symbol}")
+    if best_settings is None or best_metrics is None:
+        raise RuntimeError(f"optimization cancelled for {symbol}" if should_stop and should_stop() else f"no optimization result for {symbol}")
+
+    best_result: BacktestResult = run_backtest(
+        prepared_df,
+        settings=best_settings,
+        fee_rate=fee_rate,
+        backtest_start_time=backtest_start_time,
+        indicator_cache=indicator_cache,
+    )
 
     return OptimizationResult(
         symbol=symbol,
+        best_interval=result_interval or "",
         best_backtest=best_result,
-        combinations_tested=len(grid),
+        combinations_tested=combinations_tested,
         duration_seconds=time.perf_counter() - started,
         trimmed_grid=trimmed,
+    )
+
+
+def optimize_symbol_intervals(
+    symbol: str,
+    histories_by_interval: Dict[str, pd.DataFrame],
+    base_settings: StrategySettings,
+    optimize_flags: Dict[str, bool],
+    interval_candidates: List[str],
+    span_pct: float,
+    steps: int,
+    max_combinations: int,
+    fee_rate: float,
+    backtest_start_time: pd.Timestamp | str | None = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> Tuple[OptimizationResult, pd.DataFrame]:
+    best_result: Optional[OptimizationResult] = None
+    best_history: Optional[pd.DataFrame] = None
+    total_combinations = 0
+    trimmed_any = False
+    started = time.perf_counter()
+
+    for interval in interval_candidates:
+        if should_stop and should_stop():
+            break
+        history = histories_by_interval.get(interval)
+        if history is None or history.empty:
+            continue
+        current = optimize_symbol(
+            symbol=symbol,
+            df=history,
+            base_settings=base_settings,
+            optimize_flags=optimize_flags,
+            span_pct=span_pct,
+            steps=steps,
+            max_combinations=max_combinations,
+            fee_rate=fee_rate,
+            backtest_start_time=backtest_start_time,
+            should_stop=should_stop,
+            result_interval=interval,
+        )
+        total_combinations += current.combinations_tested
+        trimmed_any = trimmed_any or current.trimmed_grid
+        if best_result is None:
+            best_result = current
+            best_history = history
+            continue
+        current_metrics = current.best_backtest.metrics
+        best_metrics = best_result.best_backtest.metrics
+        current_key = (
+            current_metrics.total_return_pct,
+            -current_metrics.max_drawdown_pct,
+            current_metrics.win_rate_pct,
+            current_metrics.trade_count,
+            current_metrics.profit_factor,
+        )
+        best_key = (
+            best_metrics.total_return_pct,
+            -best_metrics.max_drawdown_pct,
+            best_metrics.win_rate_pct,
+            best_metrics.trade_count,
+            best_metrics.profit_factor,
+        )
+        if current_key > best_key:
+            best_result = current
+            best_history = history
+
+    if best_result is None or best_history is None:
+        raise RuntimeError(f"optimization cancelled for {symbol}" if should_stop and should_stop() else f"no optimization result for {symbol}")
+
+    return (
+        OptimizationResult(
+            symbol=symbol,
+            best_interval=best_result.best_interval,
+            best_backtest=best_result.best_backtest,
+            combinations_tested=total_combinations,
+            duration_seconds=time.perf_counter() - started,
+            trimmed_grid=trimmed_any,
+        ),
+        best_history,
     )

@@ -6,8 +6,9 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from alt_reversal_trader.config import DEFAULT_OPTIMIZE_FLAGS, StrategySettings
-from alt_reversal_trader.optimizer import generate_parameter_grid
-from alt_reversal_trader.strategy import run_backtest
+from alt_reversal_trader.binance_futures import BinanceFuturesClient, resample_ohlcv
+from alt_reversal_trader.optimizer import generate_parameter_grid, optimize_symbol_intervals
+from alt_reversal_trader.strategy import run_backtest, run_backtest_metrics
 
 
 def make_sample_ohlcv(rows: int = 500) -> pd.DataFrame:
@@ -62,3 +63,120 @@ def test_parameter_grid_respects_limits() -> None:
     )
     assert len(grid) <= 150
     assert trimmed is True
+
+
+def test_parameter_grid_uses_profiled_ranges() -> None:
+    flags = {key: False for key in DEFAULT_OPTIMIZE_FLAGS}
+    flags["atr_period"] = True
+    flags["factor"] = True
+    grid, trimmed = generate_parameter_grid(
+        StrategySettings(),
+        optimize_flags=flags,
+        span_pct=20.0,
+        steps=5,
+        max_combinations=100,
+    )
+    assert trimmed is False
+    assert sorted({settings.atr_period for settings in grid}) == [6, 8, 10, 12, 14]
+    assert sorted({settings.factor for settings in grid}) == [2.2, 2.6, 3.0, 3.4, 3.8]
+
+
+def test_parameter_grid_filters_invalid_combinations() -> None:
+    base = StrategySettings(
+        qip_ema_fast=40,
+        qip_ema_slow=42,
+        qtp_ema_fast_len=10,
+        qtp_ema_slow_len=12,
+        qtp_min_pvt_left=4,
+        qtp_max_pvt_left=5,
+        qip_rsi_bull_max=45,
+        qip_rsi_bear_min=47,
+        qtp_rsi_bull_max=44,
+        qtp_rsi_bear_min=54,
+    )
+    flags = {key: False for key in DEFAULT_OPTIMIZE_FLAGS}
+    for key in (
+        "qip_ema_fast",
+        "qip_ema_slow",
+        "qtp_ema_fast_len",
+        "qtp_ema_slow_len",
+        "qtp_min_pvt_left",
+        "qtp_max_pvt_left",
+        "qip_rsi_bull_max",
+        "qip_rsi_bear_min",
+        "qtp_rsi_bull_max",
+        "qtp_rsi_bear_min",
+    ):
+        flags[key] = True
+    grid, _ = generate_parameter_grid(
+        base,
+        optimize_flags=flags,
+        span_pct=40.0,
+        steps=7,
+        max_combinations=800,
+    )
+    assert grid
+    for settings in grid:
+        assert settings.qip_ema_fast < settings.qip_ema_slow
+        assert settings.qtp_ema_fast_len < settings.qtp_ema_slow_len
+        assert settings.qtp_min_pvt_left <= settings.qtp_max_pvt_left
+        assert settings.qip_rsi_bull_max < settings.qip_rsi_bear_min
+        assert settings.qtp_rsi_bull_max < settings.qtp_rsi_bear_min
+
+
+def test_backtest_metrics_match_full_result() -> None:
+    df = make_sample_ohlcv(900)
+    start_time = df["time"].iloc[300]
+    full = run_backtest(df, settings=StrategySettings(), backtest_start_time=start_time)
+    metrics_only = run_backtest_metrics(df, settings=StrategySettings(), backtest_start_time=start_time)
+    assert metrics_only == full.metrics
+
+
+def test_resample_ohlcv_to_2m() -> None:
+    df = make_sample_ohlcv(6)
+    resampled = resample_ohlcv(df, "2m")
+    assert len(resampled) == 3
+    assert resampled["time"].iloc[0] == df["time"].iloc[0]
+    assert resampled["open"].iloc[0] == df["open"].iloc[0]
+    assert resampled["close"].iloc[0] == df["close"].iloc[1]
+
+
+def test_optimize_symbol_intervals_returns_best_interval() -> None:
+    df = make_sample_ohlcv(720)
+    histories = {
+        "1m": df,
+        "2m": resample_ohlcv(df, "2m"),
+    }
+    flags = DEFAULT_OPTIMIZE_FLAGS.copy()
+    flags["atr_period"] = True
+    result, history = optimize_symbol_intervals(
+        symbol="TESTUSDT",
+        histories_by_interval=histories,
+        base_settings=StrategySettings(),
+        optimize_flags=flags,
+        interval_candidates=["1m", "2m"],
+        span_pct=10.0,
+        steps=3,
+        max_combinations=50,
+        fee_rate=0.0005,
+        backtest_start_time=df["time"].iloc[200],
+    )
+    assert result.best_interval in {"1m", "2m"}
+    assert not history.empty
+
+
+def test_get_open_positions_recomputes_unrealized_pnl() -> None:
+    client = BinanceFuturesClient()
+    client._request = lambda *args, **kwargs: [  # type: ignore[method-assign]
+        {
+            "symbol": "TESTUSDT",
+            "positionAmt": "2.5",
+            "entryPrice": "100",
+            "markPrice": "104",
+            "unRealizedProfit": "9999",
+            "leverage": "3",
+        }
+    ]
+    positions = client.get_open_positions()
+    assert len(positions) == 1
+    assert abs(positions[0].unrealized_pnl - 10.0) < 1e-9

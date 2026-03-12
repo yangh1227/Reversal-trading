@@ -5,7 +5,7 @@ import json
 import multiprocessing as mp
 from pathlib import Path
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import traceback
 
 import pandas as pd
@@ -30,7 +30,9 @@ from .qt_compat import (
     VERTICAL,
     WEB_ATTR_FILE_URLS,
     QApplication,
+    QBrush,
     QCheckBox,
+    QColor,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
@@ -42,6 +44,7 @@ from .qt_compat import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSpinBox,
     QSplitter,
@@ -72,7 +75,8 @@ CHART_HISTORY_FETCH_FALLBACK_MIN_BARS = 2_000
 BACKTEST_WARMUP_BAR_FLOOR = 1_500
 DEFAULT_CHART_LOOKBACK_HOURS = 3
 DEFAULT_CHART_RIGHT_PAD_BARS = 4
-LIVE_RENDER_INTERVAL_MS = 500
+LIVE_RENDER_INTERVAL_MS = 120
+PLOTLY_LIVE_RENDER_INTERVAL_MS = 350
 OPTIMIZED_TABLE_REFRESH_MS = 250
 HISTORY_CACHE_SYMBOL_LIMIT = 10
 
@@ -107,27 +111,33 @@ def _ws_kline_timestamp(time_ms: int) -> pd.Timestamp:
 def _merge_live_bar(df: pd.DataFrame, bar: Dict[str, object], max_rows: Optional[int] = None) -> pd.DataFrame:
     columns = ["time", "open", "high", "low", "close", "volume"]
     frame = df.copy() if df is not None and not df.empty else pd.DataFrame(columns=columns)
-    row = {key: bar[key] for key in columns}
+    row_time = pd.Timestamp(bar["time"])
+    row_values = [
+        row_time,
+        float(bar["open"]),
+        float(bar["high"]),
+        float(bar["low"]),
+        float(bar["close"]),
+        float(bar["volume"]),
+    ]
     if frame.empty:
-        frame = pd.DataFrame([row], columns=columns)
+        frame = pd.DataFrame([row_values], columns=columns)
     else:
-        frame["time"] = pd.to_datetime(frame["time"])
-        row_time = pd.Timestamp(row["time"])
         last_time = pd.Timestamp(frame["time"].iloc[-1])
         if last_time == row_time:
-            for key in columns[1:]:
-                frame.at[frame.index[-1], key] = row[key]
+            for key, value in zip(columns[1:], row_values[1:]):
+                frame.at[frame.index[-1], key] = value
         elif last_time < row_time:
-            frame = pd.concat([frame, pd.DataFrame([row], columns=columns)], ignore_index=True)
+            frame.loc[len(frame)] = row_values
         else:
             matches = frame["time"] == row_time
             if matches.any():
                 idx = frame.index[matches][-1]
-                for key in columns[1:]:
-                    frame.at[idx, key] = row[key]
+                for key, value in zip(columns[1:], row_values[1:]):
+                    frame.at[idx, key] = value
             else:
                 frame = (
-                    pd.concat([frame, pd.DataFrame([row], columns=columns)], ignore_index=True)
+                    pd.concat([frame, pd.DataFrame([row_values], columns=columns)], ignore_index=True)
                     .drop_duplicates(subset=["time"], keep="last")
                     .sort_values("time")
                     .reset_index(drop=True)
@@ -137,10 +147,136 @@ def _merge_live_bar(df: pd.DataFrame, bar: Dict[str, object], max_rows: Optional
     return frame
 
 
+def _frame_matches_interval(frame: Optional[pd.DataFrame], interval: str) -> bool:
+    if frame is None or frame.empty or "time" not in frame.columns or len(frame) < 2:
+        return True
+    diffs = pd.to_datetime(frame["time"]).sort_values().diff().dropna()
+    if diffs.empty:
+        return True
+    expected = pd.Timedelta(milliseconds=_interval_to_ms(interval))
+    modes = diffs.mode()
+    observed = modes.iloc[0] if not modes.empty else diffs.iloc[-1]
+    return abs(observed - expected) <= pd.Timedelta(seconds=1)
+
+
+def _chart_indicators_from_backtest(
+    backtest: BacktestResult,
+    chart_history: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    indicators = backtest.indicators.sort_values("time").drop_duplicates(subset=["time"]).reset_index(drop=True)
+    if chart_history is not None and not chart_history.empty and "time" in chart_history.columns:
+        chart_times = pd.to_datetime(chart_history["time"])
+        start_time = chart_times.iloc[0]
+        end_time = chart_times.iloc[-1]
+        sliced = indicators[
+            (pd.to_datetime(indicators["time"]) >= start_time) & (pd.to_datetime(indicators["time"]) <= end_time)
+        ]
+        if not sliced.empty:
+            indicators = sliced.reset_index(drop=True)
+    if len(indicators) > CHART_HISTORY_BAR_LIMIT:
+        indicators = indicators.tail(CHART_HISTORY_BAR_LIMIT).reset_index(drop=True)
+    return compact_indicator_frame(indicators, CHART_INDICATOR_COLUMNS)
+
+
+def _backtest_matches_history(backtest: Optional[BacktestResult], history: Optional[pd.DataFrame]) -> bool:
+    if backtest is None or history is None or history.empty or backtest.indicators.empty:
+        return False
+    return pd.Timestamp(backtest.indicators["time"].iloc[-1]) == pd.Timestamp(history["time"].iloc[-1])
+
+
 def _is_provisional_exit_trade(trade, latest_time: Optional[pd.Timestamp]) -> bool:
     if latest_time is None:
         return False
     return trade.reason == "end_of_test" and pd.Timestamp(trade.exit_time) == latest_time
+
+
+def _extract_auto_close_state(latest: pd.Series) -> Dict[str, bool]:
+    return {
+        "trend_to_long": bool(latest.get("trend_to_long", False)),
+        "trend_to_short": bool(latest.get("trend_to_short", False)),
+        "final_bull": bool(latest.get("final_bull", False)),
+        "final_bear": bool(latest.get("final_bear", False)),
+    }
+
+
+def _auto_close_reason(position: Optional[PositionSnapshot], latest_state: Dict[str, object]) -> Optional[str]:
+    if position is None:
+        return None
+    if position.amount > 0:
+        if bool(latest_state.get("trend_to_short")):
+            return "trend_to_short"
+        if bool(latest_state.get("final_bear")):
+            return "opposite_signal"
+        return None
+    if bool(latest_state.get("trend_to_long")):
+        return "trend_to_long"
+    if bool(latest_state.get("final_bull")):
+        return "opposite_signal"
+    return None
+
+
+def _auto_close_reason_text(reason: str) -> str:
+    labels = {
+        "trend_to_long": "추세 전환 LONG",
+        "trend_to_short": "추세 전환 SHORT",
+        "opposite_signal": "반대 신호",
+    }
+    return labels.get(reason, reason)
+
+
+def _confirmed_signal_events(indicators: pd.DataFrame) -> List[Dict[str, object]]:
+    if indicators is None or indicators.empty:
+        return []
+    frame = indicators
+    missing = [
+        column
+        for column in ("trend_to_long", "trend_to_short", "final_bull", "final_bear")
+        if column not in frame.columns
+    ]
+    if missing:
+        frame = indicators.copy()
+        for column in missing:
+            frame[column] = False
+
+    events: List[Dict[str, object]] = []
+    for row in frame.itertuples(index=False):
+        def _row_flag(name: str) -> bool:
+            value = getattr(row, name, False)
+            return bool(value) if pd.notna(value) else False
+
+        bull_parts: List[str] = []
+        bear_parts: List[str] = []
+        if _row_flag("final_bull"):
+            bull_parts.append("BULL")
+        if _row_flag("trend_to_long"):
+            bull_parts.append("TL")
+        if _row_flag("final_bear"):
+            bear_parts.append("BEAR")
+        if _row_flag("trend_to_short"):
+            bear_parts.append("TS")
+
+        signal_time = pd.Timestamp(getattr(row, "time"))
+        if bull_parts:
+            events.append(
+                {
+                    "time": signal_time,
+                    "price": float(getattr(row, "low")),
+                    "side": "bull",
+                    "text": " / ".join(bull_parts),
+                    "color": "#17c964" if "BULL" in bull_parts else "#00b8ff",
+                }
+            )
+        if bear_parts:
+            events.append(
+                {
+                    "time": signal_time,
+                    "price": float(getattr(row, "high")),
+                    "side": "bear",
+                    "text": " / ".join(bear_parts),
+                    "color": "#f31260" if "BEAR" in bear_parts else "#ff9100",
+                }
+            )
+    return events
 
 
 class KlineStreamWorker(QThread):
@@ -212,10 +348,12 @@ class KlineStreamWorker(QThread):
     def _transform_bar(self, bar: Dict[str, object]) -> List[Dict[str, object]]:
         if self.interval != "2m":
             return [bar]
-        if not bool(bar.get("closed")):
-            return []
-        bucket_time = pd.Timestamp(bar["time"]).floor("2min")
-        if self._aggregate_bar is None or pd.Timestamp(self._aggregate_bar["time"]) != bucket_time:
+
+        bar_time = pd.Timestamp(bar["time"])
+        bucket_time = bar_time.floor("2min")
+        is_first_minute = bar_time == bucket_time
+
+        if is_first_minute:
             self._aggregate_bar = {
                 "symbol": self.symbol,
                 "interval": self.interval,
@@ -225,17 +363,25 @@ class KlineStreamWorker(QThread):
                 "low": float(bar["low"]),
                 "close": float(bar["close"]),
                 "volume": float(bar["volume"]),
+                "base_volume": float(bar["volume"]),
                 "closed": False,
             }
-            return [dict(self._aggregate_bar)]
+            return [{key: value for key, value in self._aggregate_bar.items() if key != "base_volume"}]
+
+        if self._aggregate_bar is None or pd.Timestamp(self._aggregate_bar["time"]) != bucket_time:
+            provisional = dict(bar)
+            provisional["time"] = bucket_time
+            provisional["closed"] = False
+            return [provisional]
 
         self._aggregate_bar["high"] = max(float(self._aggregate_bar["high"]), float(bar["high"]))
         self._aggregate_bar["low"] = min(float(self._aggregate_bar["low"]), float(bar["low"]))
         self._aggregate_bar["close"] = float(bar["close"])
-        self._aggregate_bar["volume"] = float(self._aggregate_bar["volume"]) + float(bar["volume"])
-        self._aggregate_bar["closed"] = True
-        completed = dict(self._aggregate_bar)
-        self._aggregate_bar = None
+        self._aggregate_bar["volume"] = float(self._aggregate_bar["base_volume"]) + float(bar["volume"])
+        self._aggregate_bar["closed"] = bool(bar.get("closed", False))
+        completed = {key: value for key, value in self._aggregate_bar.items() if key != "base_volume"}
+        if completed["closed"]:
+            self._aggregate_bar = None
         return [completed]
 
 
@@ -526,10 +672,7 @@ class SymbolLoadWorker(QThread):
             )
             if self.isInterruptionRequested():
                 return
-            chart_indicators = compact_indicator_frame(
-                compute_indicators(chart_history, backtest.settings),
-                CHART_INDICATOR_COLUMNS,
-            )
+            chart_indicators = _chart_indicators_from_backtest(backtest, chart_history)
             self.loaded.emit(
                 {
                     "request_id": self.request_id,
@@ -575,10 +718,7 @@ class LiveBacktestWorker(QThread):
             )
             if self.isInterruptionRequested():
                 return
-            chart_indicators = compact_indicator_frame(
-                compute_indicators(self.chart_history, backtest.settings),
-                CHART_INDICATOR_COLUMNS,
-            )
+            chart_indicators = _chart_indicators_from_backtest(backtest, self.chart_history)
             self.completed.emit(
                 {
                     "symbol": self.symbol,
@@ -586,6 +726,87 @@ class LiveBacktestWorker(QThread):
                     "chart_history": self.chart_history,
                     "backtest": backtest,
                     "chart_indicators": chart_indicators,
+                }
+            )
+        except Exception:
+            if not self.isInterruptionRequested():
+                self.failed.emit(traceback.format_exc())
+
+
+class AutoCloseHistoryWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        settings: AppSettings,
+        symbol: str,
+        interval: str,
+        history: Optional[pd.DataFrame] = None,
+    ) -> None:
+        super().__init__()
+        self.settings = settings
+        self.symbol = symbol
+        self.interval = interval
+        self.history = history
+
+    def run(self) -> None:
+        try:
+            history = self.history
+            if history is None:
+                client = BinanceFuturesClient()
+                history = client.historical_ohlcv(
+                    self.symbol,
+                    self.interval,
+                    start_time=_history_fetch_start_time_ms(self.settings, self.interval),
+                )
+            if history is None or history.empty:
+                raise RuntimeError(f"{self.symbol} auto-close history is empty.")
+            history = prepare_ohlcv(history)
+            if self.isInterruptionRequested():
+                return
+            self.completed.emit(
+                {
+                    "symbol": self.symbol,
+                    "interval": self.interval,
+                    "history": history,
+                }
+            )
+        except Exception:
+            if not self.isInterruptionRequested():
+                self.failed.emit(traceback.format_exc())
+
+
+class AutoCloseSignalWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        symbol: str,
+        history: pd.DataFrame,
+        strategy_settings: StrategySettings,
+    ) -> None:
+        super().__init__()
+        self.symbol = symbol
+        self.history = prepare_ohlcv(history.copy())
+        self.strategy_settings = strategy_settings
+
+    def run(self) -> None:
+        try:
+            indicators = compute_indicators(self.history, self.strategy_settings)
+            if indicators.empty:
+                raise RuntimeError(f"{self.symbol} auto-close indicators are empty.")
+            latest = indicators.iloc[-1]
+            latest_time = pd.Timestamp(latest["time"]) if "time" in indicators.columns else pd.Timestamp(self.history["time"].iloc[-1])
+            if self.isInterruptionRequested():
+                return
+            self.completed.emit(
+                {
+                    "symbol": self.symbol,
+                    "history": self.history,
+                    "bar_time": latest_time,
+                    "latest_state": _extract_auto_close_state(latest),
                 }
             )
         except Exception:
@@ -635,6 +856,7 @@ class OrderWorker(QThread):
         leverage: int,
         side: Optional[str] = None,
         fraction: Optional[float] = None,
+        margin: Optional[float] = None,
         close_only: bool = False,
     ) -> None:
         super().__init__()
@@ -644,6 +866,7 @@ class OrderWorker(QThread):
         self.leverage = int(leverage)
         self.side = side
         self.fraction = fraction
+        self.margin = float(margin) if margin is not None else None
         self.close_only = close_only
 
     def run(self) -> None:
@@ -659,10 +882,15 @@ class OrderWorker(QThread):
                 self.completed.emit({"symbol": self.symbol, "message": message})
                 return
 
-            if self.side is None or self.fraction is None:
+            if self.side is None or (self.fraction is None and self.margin is None):
                 raise RuntimeError("order parameters are incomplete")
-            balance = client.get_balance_snapshot()
-            margin = balance.available_balance * float(self.fraction)
+            if self.margin is not None:
+                margin = float(self.margin)
+            else:
+                balance = client.get_balance_snapshot()
+                margin = balance.available_balance * float(self.fraction)
+            if margin <= 0:
+                raise RuntimeError("order amount must be positive")
             client.set_leverage(self.symbol, self.leverage)
             quantity = client.build_order_quantity(self.symbol, margin, self.leverage)
             result = client.place_market_order(self.symbol, self.side, quantity)
@@ -688,6 +916,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.optimized_results: Dict[str, OptimizationResult] = {}
         self.history_cache: Dict[str, pd.DataFrame] = {}
         self.chart_history_cache: Dict[str, pd.DataFrame] = {}
+        self.backtest_cache: Dict[Tuple[str, str], BacktestResult] = {}
+        self.chart_indicator_cache: Dict[Tuple[str, str], pd.DataFrame] = {}
         self.price_precision_cache: Dict[str, int] = {}
         self.pending_candidates: List[CandidateSymbol] = []
         self.pending_optimized_results: Dict[str, OptimizationResult] = {}
@@ -712,6 +942,18 @@ class AltReversalTraderWindow(QMainWindow):
         self.live_stream_worker: Optional[KlineStreamWorker] = None
         self.live_pending_bar: Optional[Dict[str, object]] = None
         self._tracked_threads: set[QThread] = set()
+        self.auto_close_enabled_symbols: set[str] = set()
+        self.auto_close_monitor_histories: Dict[str, pd.DataFrame] = {}
+        self.auto_close_monitor_intervals: Dict[str, str] = {}
+        self.auto_close_stream_workers: Dict[str, KlineStreamWorker] = {}
+        self.auto_close_history_workers: Dict[str, AutoCloseHistoryWorker] = {}
+        self.auto_close_signal_workers: Dict[str, AutoCloseSignalWorker] = {}
+        self.auto_close_signal_pending: set[str] = set()
+        self.auto_close_order_pending: set[str] = set()
+        self.auto_close_queued_orders: Dict[str, Tuple[str, Optional[pd.Timestamp]]] = {}
+        self.auto_close_last_trigger_time: Dict[str, pd.Timestamp] = {}
+        self.order_worker_symbol: Optional[str] = None
+        self.order_worker_is_auto_close = False
         self.auto_refresh_minutes = 10
         self.auto_refresh_timer = QTimer(self)
         self.live_update_timer = QTimer(self)
@@ -731,7 +973,9 @@ class AltReversalTraderWindow(QMainWindow):
         self.zone3_line = None
         self.ema_fast_line = None
         self.ema_slow_line = None
+        self.simple_order_buttons: List[QPushButton] = []
         self.position_close_buttons: List[QPushButton] = []
+        self.position_action_widgets: List[QWidget] = []
         self.price_label_timer = QTimer(self)
 
         self.setWindowTitle("Binance Alt Mean Reversion Trader")
@@ -743,7 +987,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.live_update_timer.timeout.connect(self._flush_live_update)
         self.optimized_table_timer.setSingleShot(True)
         self.optimized_table_timer.timeout.connect(self._flush_optimized_table)
-        self.price_label_timer.setInterval(1000)
+        self.price_label_timer.setInterval(250)
         self.price_label_timer.timeout.connect(self._refresh_live_labels)
         self.price_label_timer.start()
         self.chart_engine_combo.currentTextChanged.connect(self.on_chart_engine_changed)
@@ -806,29 +1050,41 @@ class AltReversalTraderWindow(QMainWindow):
         summary_layout.addWidget(self.summary_box)
         right_layout.addWidget(summary_group, 2)
 
-        self.chart_host = QWidget()
-        self.chart_host_layout = QVBoxLayout(self.chart_host)
-        self.chart_host_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.addWidget(self.chart_host, 7)
-
-        header_group = QGroupBox("Selection")
-        header_layout = QVBoxLayout(header_group)
+        balance_panel = QWidget()
+        balance_layout = QHBoxLayout(balance_panel)
+        balance_layout.setContentsMargins(8, 2, 8, 2)
         self.symbol_label = QLabel("종목: -")
         self.signal_label = QLabel("신호: -")
         self.current_price_label = QLabel("현재가: -")
-        self.balance_label = QLabel("잔고: API 미입력")
         self.position_label = QLabel("포지션: -")
-        header_layout.addWidget(self.symbol_label)
-        header_layout.addWidget(self.signal_label)
-        header_layout.addWidget(self.current_price_label)
-        header_layout.addWidget(self.balance_label)
-        header_layout.addWidget(self.position_label)
-        right_layout.addWidget(header_group)
+        self.balance_label = QLabel("잔고: API 미입력")
+        self.balance_label.setStyleSheet("font-weight: 700; font-size: 13px;")
+        balance_layout.addWidget(self.balance_label)
+        balance_layout.addStretch(1)
+        self._set_balance_label_status("API 미입력")
+        self.chart_host = QWidget()
+        self.chart_host_layout = QVBoxLayout(self.chart_host)
+        self.chart_host_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(self.chart_host, 8)
+        right_layout.addWidget(balance_panel)
 
         right_layout.addWidget(self._build_positions_group(), 2)
 
         order_group = QGroupBox("Live Order")
         order_layout = QVBoxLayout(order_group)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("주문 모드"))
+        self.compound_order_radio = QRadioButton("복리")
+        self.simple_order_radio = QRadioButton("단리")
+        self.compound_order_radio.toggled.connect(self._on_order_mode_toggled)
+        self.simple_order_radio.toggled.connect(self._on_order_mode_toggled)
+        mode_row.addWidget(self.compound_order_radio)
+        mode_row.addWidget(self.simple_order_radio)
+        mode_row.addStretch(1)
+        self.compound_order_widget = QWidget()
+        compound_layout = QVBoxLayout(self.compound_order_widget)
+        compound_layout.setContentsMargins(0, 0, 0, 0)
+        compound_layout.setSpacing(6)
         long_row = QHBoxLayout()
         short_row = QHBoxLayout()
         self.long_buttons = []
@@ -843,16 +1099,71 @@ class AltReversalTraderWindow(QMainWindow):
             button.clicked.connect(lambda _=False, value=fraction: self.place_fractional_order("SELL", value))
             self.short_buttons.append(button)
             short_row.addWidget(button)
+        compound_layout.addLayout(long_row)
+        compound_layout.addLayout(short_row)
+        self.simple_order_widget = QWidget()
+        simple_layout = QVBoxLayout(self.simple_order_widget)
+        simple_layout.setContentsMargins(0, 0, 0, 0)
+        simple_layout.setSpacing(6)
+        self.simple_order_buttons = []
+
+        simple_long_row = QHBoxLayout()
+        simple_long_row.addWidget(QLabel("LONG"))
+        self.simple_long_amount_spin = QDoubleSpinBox()
+        self.simple_long_amount_spin.setRange(1.0, 1_000_000.0)
+        self.simple_long_amount_spin.setDecimals(2)
+        self.simple_long_amount_spin.setSingleStep(10.0)
+        self.simple_long_amount_spin.setSuffix(" USDT")
+        self.simple_long_amount_spin.setToolTip("단리 LONG 주문금액")
+        self.simple_long_button = QPushButton("LONG")
+        self.simple_long_button.clicked.connect(lambda _=False: self.place_simple_order("BUY"))
+        self.simple_order_buttons.append(self.simple_long_button)
+        simple_long_row.addWidget(self.simple_long_amount_spin, 1)
+        simple_long_row.addWidget(self.simple_long_button)
+
+        simple_short_row = QHBoxLayout()
+        simple_short_row.addWidget(QLabel("SHORT"))
+        self.simple_short_amount_spin = QDoubleSpinBox()
+        self.simple_short_amount_spin.setRange(1.0, 1_000_000.0)
+        self.simple_short_amount_spin.setDecimals(2)
+        self.simple_short_amount_spin.setSingleStep(10.0)
+        self.simple_short_amount_spin.setSuffix(" USDT")
+        self.simple_short_amount_spin.setToolTip("단리 SHORT 주문금액")
+        self.simple_short_button = QPushButton("SHORT")
+        self.simple_short_button.clicked.connect(lambda _=False: self.place_simple_order("SELL"))
+        self.simple_order_buttons.append(self.simple_short_button)
+        simple_short_row.addWidget(self.simple_short_amount_spin, 1)
+        simple_short_row.addWidget(self.simple_short_button)
+
+        simple_layout.addLayout(simple_long_row)
+        simple_layout.addLayout(simple_short_row)
         self.close_position_button = QPushButton("포지션 청산")
         self.close_position_button.clicked.connect(self.close_selected_position)
-        order_layout.addLayout(long_row)
-        order_layout.addLayout(short_row)
-        order_layout.addWidget(self.close_position_button)
+        self.close_position_button.setText("청산")
+        self.close_position_button.setFixedWidth(88)
+        self.close_position_button.setToolTip("선택 종목 포지션 청산")
+        close_row = QHBoxLayout()
+        close_row.addStretch(1)
+        close_row.addWidget(self.close_position_button)
+        close_row.addStretch(1)
+        order_layout.addLayout(mode_row)
+        order_layout.addWidget(self.compound_order_widget)
+        order_layout.addWidget(self.simple_order_widget)
+        order_layout.addLayout(close_row)
         right_layout.addWidget(order_group)
 
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
         splitter.setSizes([560, 1120])
+
+    def _on_order_mode_toggled(self, checked: bool) -> None:
+        if checked:
+            self._refresh_order_mode_ui()
+
+    def _refresh_order_mode_ui(self) -> None:
+        simple_mode = self.simple_order_radio.isChecked()
+        self.compound_order_widget.setVisible(not simple_mode)
+        self.simple_order_widget.setVisible(simple_mode)
 
     def _build_api_group(self) -> QGroupBox:
         group = QGroupBox("Binance API")
@@ -923,18 +1234,32 @@ class AltReversalTraderWindow(QMainWindow):
         self.fee_spin.setRange(0.0, 5.0)
         self.fee_spin.setDecimals(4)
         self.fee_spin.setSingleStep(0.01)
+        def _set_row_label(editor, label: str) -> None:
+            field_label = layout.labelForField(editor)
+            if field_label is not None:
+                field_label.setText(label)
+        self.optimize_timeframe_check.setText("1m / 2m 최적화")
         layout.addRow("범위 ±%", self.opt_span_spin)
         layout.addRow("격자 단계수", self.opt_steps_spin)
         layout.addRow("최대 조합수", self.max_combo_spin)
         layout.addRow("최적화 프로세스", self.opt_process_spin)
         layout.addRow("타임프레임", self.optimize_timeframe_check)
         layout.addRow("수수료 %", self.fee_spin)
+        _set_row_label(self.opt_span_spin, "범위 스케일 (20=기본)")
+        _set_row_label(self.opt_steps_spin, "항목별 샘플 상한")
+        _set_row_label(self.max_combo_spin, "최대 조합수")
+        _set_row_label(self.opt_process_spin, "최적화 프로세스")
+        _set_row_label(self.optimize_timeframe_check, "타임프레임")
+        _set_row_label(self.fee_spin, "수수료 %")
         return group
 
     def _build_parameter_tabs(self) -> QGroupBox:
         group = QGroupBox("Strategy Parameters")
         outer_layout = QVBoxLayout(group)
-        help_label = QLabel("입력값이 기준 전략값이며, `Opt`를 체크한 항목만 현재 값 기준으로 ±최적화 범위를 탐색합니다.")
+        help_label = QLabel(
+            "Opt를 체크한 항목만 최적화합니다. 각 항목은 퍼센트 일괄 범위가 아니라 "
+            "옵션별 기본 프로필로 탐색하고, 범위 스케일은 그 폭을 전체적으로 조절합니다."
+        )
         help_label.setWordWrap(True)
         outer_layout.addWidget(help_label)
         tabs = QTabWidget()
@@ -1023,6 +1348,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.positions_table.setSelectionMode(SINGLE_SELECTION)
         self.positions_table.setEditTriggers(NO_EDIT_TRIGGERS)
         self.positions_table.horizontalHeader().setStretchLastSection(True)
+        self.positions_table.itemSelectionChanged.connect(self.on_positions_selection_changed)
+        self.positions_table.cellClicked.connect(self.on_positions_cell_clicked)
         layout.addWidget(self.positions_table)
         return group
 
@@ -1094,7 +1421,6 @@ class AltReversalTraderWindow(QMainWindow):
             priceLineColor: "#22f202"
         }})""")
         self.chart.volume_config(up_color="rgba(216, 243, 220, 0.30)", down_color="rgba(255, 93, 115, 0.28)")
-        self.chart.watermark("ALT MR", color="rgba(240, 242, 245, 0.16)")
         self.chart.crosshair(mode="normal")
         self.chart.time_scale(time_visible=True, seconds_visible=False, min_bar_spacing=0.01, right_offset=0)
         self.equity_subchart = self.chart.create_subchart(
@@ -1164,27 +1490,51 @@ class AltReversalTraderWindow(QMainWindow):
                 const label = document.createElement("div");
                 Object.assign(label.style, {{
                     position: "absolute",
-                    right: "6px",
+                    right: "8px",
                     top: "0px",
                     display: "none",
+                    minWidth: "62px",
                     padding: "2px 6px",
-                    borderRadius: "3px",
-                    background: "#22f202",
-                    color: "#0f1419",
+                    borderRadius: "4px",
+                    border: "1px solid rgba(34, 242, 2, 0.92)",
+                    background: "rgba(15, 20, 25, 0.96)",
+                    color: "#22f202",
                     fontFamily: "Consolas, monospace",
                     fontSize: "11px",
                     fontWeight: "700",
                     lineHeight: "1.25",
+                    textAlign: "center",
                     letterSpacing: "0.02em",
-                    zIndex: "3200",
+                    fontVariantNumeric: "tabular-nums",
+                    zIndex: "4200",
                     pointerEvents: "none",
                     whiteSpace: "nowrap",
-                    boxShadow: "0 1px 6px rgba(0, 0, 0, 0.35)",
+                    boxShadow: "0 2px 10px rgba(0, 0, 0, 0.45)",
                 }});
                 handler.div.appendChild(label);
+                const reposition = () => {{
+                    const overlay = handler.barCloseCountdown;
+                    if (!overlay || !overlay.state.text || !Number.isFinite(overlay.state.price)) {{
+                        label.style.display = "none";
+                        return;
+                    }}
+                    const y = handler.series.priceToCoordinate(overlay.state.price);
+                    if (y === null || y === undefined || !Number.isFinite(y)) {{
+                        label.style.display = "none";
+                        return;
+                    }}
+                    label.textContent = overlay.state.text;
+                    label.style.display = "block";
+                    const labelHeight = label.offsetHeight || 18;
+                    const rawTop = Math.round(y + 26);
+                    const maxTop = Math.max(4, handler.div.clientHeight - labelHeight - 4);
+                    const top = Math.max(4, Math.min(rawTop, maxTop));
+                    label.style.top = `${{top}}px`;
+                }};
                 handler.barCloseCountdown = {{
                     label,
                     state: {{ text: "", price: null }},
+                    reposition,
                 }};
                 handler.updateBarCloseCountdown = (text, price) => {{
                     const overlay = handler.barCloseCountdown;
@@ -1196,17 +1546,7 @@ class AltReversalTraderWindow(QMainWindow):
                         overlay.label.style.display = "none";
                         return;
                     }}
-                    const y = handler.series.priceToCoordinate(price);
-                    if (y === null || y === undefined || !Number.isFinite(y)) {{
-                        overlay.label.style.display = "none";
-                        return;
-                    }}
-                    overlay.label.textContent = text;
-                    overlay.label.style.display = "block";
-                    const rawTop = Math.round(y) + 18;
-                    const maxTop = Math.max(4, handler.div.clientHeight - overlay.label.offsetHeight - 4);
-                    const top = Math.max(4, Math.min(rawTop, maxTop));
-                    overlay.label.style.top = `${{top}}px`;
+                    overlay.reposition();
                 }};
                 handler.hideBarCloseCountdown = () => {{
                     const overlay = handler.barCloseCountdown;
@@ -1218,16 +1558,18 @@ class AltReversalTraderWindow(QMainWindow):
                 }};
                 handler.chart.timeScale().subscribeVisibleLogicalRangeChange(() => {{
                     const overlay = handler.barCloseCountdown;
-                    if (overlay && overlay.state.text) {{
-                        handler.updateBarCloseCountdown(overlay.state.text, overlay.state.price);
+                    if (overlay && overlay.state.text && overlay.reposition) {{
+                        overlay.reposition();
                     }}
                 }});
-                window.addEventListener("resize", () => {{
+                const baseResize = handler.reSize.bind(handler);
+                handler.reSize = () => {{
+                    baseResize();
                     const overlay = handler.barCloseCountdown;
-                    if (overlay && overlay.state.text) {{
-                        handler.updateBarCloseCountdown(overlay.state.text, overlay.state.price);
+                    if (overlay && overlay.state.text && overlay.reposition) {{
+                        overlay.reposition();
                     }}
-                }});
+                }};
             }})();
             """
         )
@@ -1301,6 +1643,13 @@ class AltReversalTraderWindow(QMainWindow):
         self.opt_process_spin.setValue(settings.optimize_processes)
         self.optimize_timeframe_check.setChecked(settings.optimize_timeframe)
         self.fee_spin.setValue(settings.fee_rate * 100.0)
+        self.simple_long_amount_spin.setValue(settings.simple_long_order_amount)
+        self.simple_short_amount_spin.setValue(settings.simple_short_order_amount)
+        if settings.order_mode == "simple":
+            self.simple_order_radio.setChecked(True)
+        else:
+            self.compound_order_radio.setChecked(True)
+        self._refresh_order_mode_ui()
 
     def collect_settings(self) -> AppSettings:
         strategy_payload: Dict[str, object] = {}
@@ -1321,6 +1670,9 @@ class AltReversalTraderWindow(QMainWindow):
             api_secret=self.api_secret_edit.text().strip(),
             chart_engine=self.chart_engine_combo.currentText(),
             leverage=int(self.leverage_spin.value()),
+            order_mode="simple" if self.simple_order_radio.isChecked() else "compound",
+            simple_long_order_amount=float(self.simple_long_amount_spin.value()),
+            simple_short_order_amount=float(self.simple_short_amount_spin.value()),
             fee_rate=float(self.fee_spin.value()) / 100.0,
             history_days=int(self.history_days_spin.value()),
             kline_interval=self.interval_combo.currentText(),
@@ -1351,10 +1703,20 @@ class AltReversalTraderWindow(QMainWindow):
             self._stop_load_worker()
             self._stop_live_backtest_worker()
             self._stop_live_stream()
+            self._stop_all_auto_close_monitors()
             self.history_cache.clear()
             self.chart_history_cache.clear()
             self.current_chart_indicators = None
             self.price_precision_cache.clear()
+        if previous != self.settings:
+            self.backtest_cache.clear()
+            self.chart_indicator_cache.clear()
+            self.auto_close_signal_pending.clear()
+            self.auto_close_order_pending.clear()
+            self.auto_close_queued_orders.clear()
+            self.auto_close_last_trigger_time.clear()
+            self._stop_all_auto_close_monitors()
+            self._refresh_auto_close_monitors()
         if persist:
             self.settings.save()
             self.public_client = BinanceFuturesClient()
@@ -1373,6 +1735,53 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _candidate_by_symbol(self, symbol: str) -> Optional[CandidateSymbol]:
         return next((candidate for candidate in self.candidates if candidate.symbol == symbol), None)
+
+    def _symbol_interval_key(self, symbol: str, interval: Optional[str] = None) -> Tuple[str, str]:
+        return (symbol, interval or self.current_interval or self.settings.kline_interval)
+
+    def _active_interval_for_symbol(self, symbol: str) -> str:
+        optimization = self.optimized_results.get(symbol)
+        return (optimization.best_interval or self.settings.kline_interval) if optimization else self.settings.kline_interval
+
+    def _find_open_position(self, symbol: str) -> Optional[PositionSnapshot]:
+        return next((position for position in self.open_positions if position.symbol == symbol), None)
+
+    def _set_auto_close_button_state(self, button: QPushButton, enabled: bool) -> None:
+        button.setCheckable(True)
+        button.setChecked(enabled)
+        button.setText("자동청산 ON" if enabled else "자동청산 OFF")
+        button.setStyleSheet(
+            """
+            QPushButton {
+                font-weight: 700;
+                font-size: 11px;
+                color: #d8dee9;
+                background-color: #3b4252;
+                border: 1px solid #495468;
+                border-radius: 4px;
+                padding: 2px 8px;
+            }
+            QPushButton:hover {
+                background-color: #465166;
+                border-color: #5b6880;
+            }
+            QPushButton:pressed {
+                background-color: #2f3745;
+            }
+            QPushButton:checked {
+                color: #ffffff;
+                background-color: #1f8f47;
+                border-color: #166636;
+            }
+            QPushButton:checked:hover {
+                background-color: #249d50;
+                border-color: #1a7a40;
+            }
+            QPushButton:checked:pressed {
+                background-color: #17713a;
+            }
+            """
+        )
 
     def _resolve_price_precision(self, symbol: str, candle_df: pd.DataFrame) -> int:
         cached = self.price_precision_cache.get(symbol)
@@ -1468,6 +1877,17 @@ class AltReversalTraderWindow(QMainWindow):
 
         worker.finished.connect(_cleanup_thread)
 
+    def _track_mapped_thread(self, worker: QThread, registry: Dict[str, QThread], key: str) -> None:
+        self._tracked_threads.add(worker)
+
+        def _cleanup_thread() -> None:
+            if registry.get(key) is worker:
+                registry.pop(key, None)
+            self._tracked_threads.discard(worker)
+            worker.deleteLater()
+
+        worker.finished.connect(_cleanup_thread)
+
     def _prune_caches(self) -> None:
         keep_symbols = set()
         if self.current_symbol:
@@ -1492,6 +1912,268 @@ class AltReversalTraderWindow(QMainWindow):
             for symbol, frame in self.chart_history_cache.items()
             if symbol in chart_keep
         }
+        self.backtest_cache = {
+            key: value
+            for key, value in self.backtest_cache.items()
+            if key[0] in keep_symbols
+        }
+        self.chart_indicator_cache = {
+            key: value
+            for key, value in self.chart_indicator_cache.items()
+            if key[0] in keep_symbols
+        }
+
+    def _stop_auto_close_history_worker(self, symbol: str) -> None:
+        worker = self.auto_close_history_workers.pop(symbol, None)
+        if worker is not None and worker.isRunning():
+            worker.requestInterruption()
+            worker.wait(1500)
+
+    def _stop_auto_close_signal_worker(self, symbol: str) -> None:
+        worker = self.auto_close_signal_workers.pop(symbol, None)
+        if worker is not None and worker.isRunning():
+            worker.requestInterruption()
+            worker.wait(1500)
+        self.auto_close_signal_pending.discard(symbol)
+
+    def _stop_auto_close_stream_worker(self, symbol: str) -> None:
+        worker = self.auto_close_stream_workers.pop(symbol, None)
+        if worker is not None:
+            worker.stop()
+            worker.wait(1500)
+
+    def _stop_auto_close_monitor(self, symbol: str) -> None:
+        self._stop_auto_close_history_worker(symbol)
+        self._stop_auto_close_signal_worker(symbol)
+        self._stop_auto_close_stream_worker(symbol)
+        self.auto_close_monitor_histories.pop(symbol, None)
+        self.auto_close_monitor_intervals.pop(symbol, None)
+
+    def _clear_auto_close_symbol(self, symbol: str) -> None:
+        self.auto_close_enabled_symbols.discard(symbol)
+        self.auto_close_signal_pending.discard(symbol)
+        self.auto_close_order_pending.discard(symbol)
+        self.auto_close_queued_orders.pop(symbol, None)
+        self.auto_close_last_trigger_time.pop(symbol, None)
+        self._stop_auto_close_monitor(symbol)
+
+    def _stop_all_auto_close_monitors(self) -> None:
+        symbols = set(self.auto_close_history_workers) | set(self.auto_close_signal_workers) | set(self.auto_close_stream_workers)
+        for symbol in list(symbols):
+            self._stop_auto_close_monitor(symbol)
+        self.auto_close_monitor_histories.clear()
+        self.auto_close_monitor_intervals.clear()
+        self.auto_close_signal_pending.clear()
+
+    def _start_auto_close_history_worker(self, symbol: str, interval: str) -> None:
+        if symbol not in self.auto_close_enabled_symbols or symbol == self.current_symbol:
+            return
+        self._stop_auto_close_history_worker(symbol)
+        history = self.auto_close_monitor_histories.get(symbol)
+        if not _frame_matches_interval(history, interval):
+            history = self.history_cache.get(symbol)
+        if not _frame_matches_interval(history, interval):
+            history = None
+        worker = AutoCloseHistoryWorker(self.settings, symbol, interval, history)
+        worker.completed.connect(self._on_auto_close_history_completed)
+        worker.failed.connect(lambda message, symbol=symbol: self._on_auto_close_history_failed(symbol, message))
+        self.auto_close_history_workers[symbol] = worker
+        self._track_mapped_thread(worker, self.auto_close_history_workers, symbol)
+        worker.start()
+
+    def _start_auto_close_stream_worker(self, symbol: str, interval: str) -> None:
+        if symbol not in self.auto_close_enabled_symbols or symbol == self.current_symbol:
+            return
+        existing = self.auto_close_stream_workers.get(symbol)
+        if existing is not None and self.auto_close_monitor_intervals.get(symbol) == interval:
+            return
+        self._stop_auto_close_stream_worker(symbol)
+        worker = KlineStreamWorker(symbol, interval)
+        worker.kline.connect(self._on_auto_close_kline)
+        self.auto_close_stream_workers[symbol] = worker
+        self._track_mapped_thread(worker, self.auto_close_stream_workers, symbol)
+        worker.start()
+
+    def _schedule_auto_close_signal(self, symbol: str) -> None:
+        if symbol not in self.auto_close_enabled_symbols or symbol == self.current_symbol:
+            return
+        history = self.auto_close_monitor_histories.get(symbol)
+        if history is None or history.empty:
+            return
+        desired_interval = self._active_interval_for_symbol(symbol)
+        if self.auto_close_monitor_intervals.get(symbol) != desired_interval:
+            self._stop_auto_close_monitor(symbol)
+            self._start_auto_close_history_worker(symbol, desired_interval)
+            return
+        worker = self.auto_close_signal_workers.get(symbol)
+        if worker is not None and worker.isRunning():
+            self.auto_close_signal_pending.add(symbol)
+            return
+        self.auto_close_signal_pending.discard(symbol)
+        worker = AutoCloseSignalWorker(symbol, history, self._active_backtest_settings(symbol))
+        worker.completed.connect(self._on_auto_close_signal_completed)
+        worker.failed.connect(lambda message, symbol=symbol: self._on_auto_close_signal_failed(symbol, message))
+        self.auto_close_signal_workers[symbol] = worker
+        self._track_mapped_thread(worker, self.auto_close_signal_workers, symbol)
+        worker.start()
+
+    def _toggle_auto_close_for_symbol(self, symbol: str, enabled: bool) -> None:
+        if enabled:
+            self.auto_close_enabled_symbols.add(symbol)
+            self.log(f"{symbol} 자동청산 활성화")
+            self._refresh_auto_close_monitors()
+            if symbol == self.current_symbol and self.current_backtest is not None:
+                self._evaluate_backtest_auto_close(symbol, self.current_backtest)
+            return
+        self.log(f"{symbol} 자동청산 비활성화")
+        self._clear_auto_close_symbol(symbol)
+        self.update_positions_table()
+
+    def _refresh_auto_close_monitors(self) -> None:
+        open_symbols = {position.symbol for position in self.open_positions}
+        for symbol in list(self.auto_close_enabled_symbols):
+            if symbol not in open_symbols:
+                self._clear_auto_close_symbol(symbol)
+
+        for symbol in list(self.auto_close_history_workers):
+            if symbol not in self.auto_close_enabled_symbols or symbol == self.current_symbol:
+                self._stop_auto_close_monitor(symbol)
+        for symbol in list(self.auto_close_signal_workers):
+            if symbol not in self.auto_close_enabled_symbols or symbol == self.current_symbol:
+                self._stop_auto_close_monitor(symbol)
+        for symbol in list(self.auto_close_stream_workers):
+            if symbol not in self.auto_close_enabled_symbols or symbol == self.current_symbol:
+                self._stop_auto_close_monitor(symbol)
+
+        for symbol in list(self.auto_close_enabled_symbols):
+            if symbol == self.current_symbol:
+                self._stop_auto_close_monitor(symbol)
+                if self.current_backtest is not None:
+                    self._evaluate_backtest_auto_close(symbol, self.current_backtest)
+                continue
+            desired_interval = self._active_interval_for_symbol(symbol)
+            if self.auto_close_monitor_intervals.get(symbol) != desired_interval:
+                self._stop_auto_close_monitor(symbol)
+            if symbol not in self.auto_close_monitor_histories:
+                if symbol not in self.auto_close_history_workers:
+                    self._start_auto_close_history_worker(symbol, desired_interval)
+                continue
+            self.auto_close_monitor_intervals[symbol] = desired_interval
+            self._start_auto_close_stream_worker(symbol, desired_interval)
+            self._schedule_auto_close_signal(symbol)
+
+    def _on_auto_close_history_completed(self, payload: object) -> None:
+        result = dict(payload)
+        symbol = str(result["symbol"])
+        interval = str(result["interval"])
+        if symbol not in self.auto_close_enabled_symbols or symbol == self.current_symbol:
+            self._stop_auto_close_monitor(symbol)
+            return
+        desired_interval = self._active_interval_for_symbol(symbol)
+        if interval != desired_interval:
+            self._stop_auto_close_monitor(symbol)
+            self._start_auto_close_history_worker(symbol, desired_interval)
+            return
+        self.auto_close_monitor_histories[symbol] = result["history"]
+        self.auto_close_monitor_intervals[symbol] = interval
+        self._start_auto_close_stream_worker(symbol, interval)
+        self._schedule_auto_close_signal(symbol)
+
+    def _on_auto_close_history_failed(self, symbol: str, message: str) -> None:
+        if symbol in self.auto_close_enabled_symbols:
+            self.log(message)
+
+    def _on_auto_close_kline(self, payload: object) -> None:
+        bar = dict(payload)
+        symbol = str(bar.get("symbol", ""))
+        if symbol not in self.auto_close_enabled_symbols or symbol == self.current_symbol:
+            return
+        if not bool(bar.get("closed")):
+            return
+        history = self.auto_close_monitor_histories.get(symbol)
+        if history is None or history.empty:
+            return
+        self.auto_close_monitor_histories[symbol] = _merge_live_bar(history, bar)
+        self._schedule_auto_close_signal(symbol)
+
+    def _on_auto_close_signal_completed(self, payload: object) -> None:
+        result = dict(payload)
+        symbol = str(result["symbol"])
+        if symbol not in self.auto_close_enabled_symbols or symbol == self.current_symbol:
+            return
+        bar_time = result.get("bar_time")
+        if isinstance(bar_time, pd.Timestamp):
+            bar_time = pd.Timestamp(bar_time)
+        self._maybe_trigger_auto_close(symbol, result["latest_state"], bar_time)
+        if symbol in self.auto_close_signal_pending:
+            self.auto_close_signal_pending.discard(symbol)
+            self._schedule_auto_close_signal(symbol)
+
+    def _on_auto_close_signal_failed(self, symbol: str, message: str) -> None:
+        self.auto_close_signal_pending.discard(symbol)
+        if symbol in self.auto_close_enabled_symbols:
+            self.log(message)
+
+    def _evaluate_backtest_auto_close(self, symbol: str, backtest: BacktestResult) -> None:
+        if symbol not in self.auto_close_enabled_symbols:
+            return
+        if backtest.indicators.empty:
+            return
+        bar_time = pd.Timestamp(backtest.indicators["time"].iloc[-1]) if "time" in backtest.indicators.columns else None
+        self._maybe_trigger_auto_close(symbol, backtest.latest_state, bar_time)
+
+    def _maybe_trigger_auto_close(
+        self,
+        symbol: str,
+        latest_state: Dict[str, object],
+        bar_time: Optional[pd.Timestamp],
+    ) -> None:
+        if symbol not in self.auto_close_enabled_symbols:
+            return
+        position = self._find_open_position(symbol)
+        if position is None:
+            self._clear_auto_close_symbol(symbol)
+            self.update_positions_table()
+            return
+        reason = _auto_close_reason(position, latest_state)
+        if reason is None:
+            return
+        if symbol in self.auto_close_order_pending:
+            return
+        normalized_bar_time = pd.Timestamp(bar_time) if bar_time is not None else None
+        if normalized_bar_time is not None and self.auto_close_last_trigger_time.get(symbol) == normalized_bar_time:
+            return
+        if self.order_worker is not None and self.order_worker.isRunning():
+            if symbol not in self.auto_close_queued_orders:
+                self.log(f"{symbol} 자동청산 대기: 기존 주문 처리 중")
+            self.auto_close_queued_orders[symbol] = (reason, normalized_bar_time)
+            return
+        if self._submit_close_position(symbol, auto_close_reason=reason):
+            self.auto_close_order_pending.add(symbol)
+            self.auto_close_queued_orders.pop(symbol, None)
+            if normalized_bar_time is not None:
+                self.auto_close_last_trigger_time[symbol] = normalized_bar_time
+
+    def _flush_queued_auto_close_orders(self) -> None:
+        if self.order_worker is not None and self.order_worker.isRunning():
+            return
+        for symbol, (reason, bar_time) in list(self.auto_close_queued_orders.items()):
+            if symbol not in self.auto_close_enabled_symbols:
+                self.auto_close_queued_orders.pop(symbol, None)
+                continue
+            position = self._find_open_position(symbol)
+            if position is None:
+                self._clear_auto_close_symbol(symbol)
+                continue
+            if bar_time is not None and self.auto_close_last_trigger_time.get(symbol) == bar_time:
+                self.auto_close_queued_orders.pop(symbol, None)
+                continue
+            if self._submit_close_position(symbol, auto_close_reason=reason):
+                self.auto_close_order_pending.add(symbol)
+                self.auto_close_queued_orders.pop(symbol, None)
+                if bar_time is not None:
+                    self.auto_close_last_trigger_time[symbol] = bar_time
+                return
 
     def _stop_scan_worker(self) -> None:
         worker = self.scan_worker
@@ -1533,6 +2215,8 @@ class AltReversalTraderWindow(QMainWindow):
     def _stop_order_worker(self) -> None:
         worker = self.order_worker
         self.order_worker = None
+        self.order_worker_symbol = None
+        self.order_worker_is_auto_close = False
         if worker is not None and worker.isRunning():
             worker.requestInterruption()
             worker.wait(1500)
@@ -1595,7 +2279,12 @@ class AltReversalTraderWindow(QMainWindow):
         if bar.get("symbol") != self.current_symbol:
             return
         self.live_pending_bar = bar
-        self.live_update_timer.setInterval(LIVE_RENDER_INTERVAL_MS if self.chart_mode == "Lightweight" else 1000)
+        if self.chart_mode == "Lightweight" and not bool(bar.get("closed")):
+            self._flush_live_update()
+            return
+        self.live_update_timer.setInterval(
+            LIVE_RENDER_INTERVAL_MS if self.chart_mode == "Lightweight" else PLOTLY_LIVE_RENDER_INTERVAL_MS
+        )
         if not self.live_update_timer.isActive():
             self.live_update_timer.start()
 
@@ -1669,9 +2358,13 @@ class AltReversalTraderWindow(QMainWindow):
         self.chart_history_cache[symbol] = result["chart_history"]
         self.current_backtest = result["backtest"]
         self.current_chart_indicators = result["chart_indicators"]
+        cache_key = self._symbol_interval_key(symbol)
+        self.backtest_cache[cache_key] = self.current_backtest
+        self.chart_indicator_cache[cache_key] = self.current_chart_indicators
         self._prune_caches()
         self.render_chart(symbol, self.current_backtest, reset_view=False)
         self.update_summary(symbol, self.current_backtest, self.optimized_results.get(symbol))
+        self._evaluate_backtest_auto_close(symbol, self.current_backtest)
         if self.live_recalc_pending:
             self.live_recalc_pending = False
             self._schedule_live_backtest(symbol)
@@ -1681,8 +2374,12 @@ class AltReversalTraderWindow(QMainWindow):
         self.log(message)
 
     def _set_order_buttons_enabled(self, enabled: bool) -> None:
-        for button in self.long_buttons + self.short_buttons:
+        for button in self.long_buttons + self.short_buttons + self.simple_order_buttons:
             button.setEnabled(enabled)
+        self.compound_order_radio.setEnabled(enabled)
+        self.simple_order_radio.setEnabled(enabled)
+        self.simple_long_amount_spin.setEnabled(enabled)
+        self.simple_short_amount_spin.setEnabled(enabled)
         self.close_position_button.setEnabled(enabled)
         self._set_position_close_buttons_enabled(enabled)
 
@@ -1779,28 +2476,58 @@ class AltReversalTraderWindow(QMainWindow):
     def update_positions_table(self) -> None:
         if not hasattr(self, "positions_table"):
             return
-        for button in self.position_close_buttons:
-            button.deleteLater()
+        for widget in self.position_action_widgets:
+            widget.deleteLater()
+        self.position_action_widgets.clear()
         self.position_close_buttons.clear()
         self.positions_table.setRowCount(len(self.open_positions))
         for row, position in enumerate(self.open_positions):
             side = "LONG" if position.amount > 0 else "SHORT"
             entry_text = f"{position.entry_price:.8f}".rstrip("0").rstrip(".")
+            upnl_value = float(position.unrealized_pnl)
             values = [
                 position.symbol,
                 side,
                 f"{abs(position.amount):.6f}",
                 entry_text,
-                f"{position.unrealized_pnl:.2f}",
+                f"{upnl_value:.2f}",
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setData(USER_ROLE, position.symbol)
+                if col == 4:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                    if upnl_value > 0:
+                        item.setForeground(QBrush(QColor("#17c964")))
+                    elif upnl_value < 0:
+                        item.setForeground(QBrush(QColor("#f31260")))
                 self.positions_table.setItem(row, col, item)
             button = QPushButton("청산")
             button.clicked.connect(lambda _=False, symbol=position.symbol: self.close_position_for_symbol(symbol))
-            self.positions_table.setCellWidget(row, 5, button)
+            button.setText("청산")
+            button.setFixedWidth(54)
+
+            auto_button = QPushButton()
+            auto_button.setFixedWidth(124)
+            auto_button.setMinimumHeight(24)
+            self._set_auto_close_button_state(auto_button, position.symbol in self.auto_close_enabled_symbols)
+            auto_button.toggled.connect(
+                lambda checked, symbol=position.symbol: self._toggle_auto_close_for_symbol(symbol, checked)
+            )
+
+            action_widget = QWidget()
+            action_layout = QHBoxLayout(action_widget)
+            action_layout.setContentsMargins(4, 2, 4, 2)
+            action_layout.setSpacing(4)
+            action_layout.addWidget(button)
+            action_layout.addWidget(auto_button)
+            action_layout.addStretch(1)
+
+            self.positions_table.setCellWidget(row, 5, action_widget)
             self.position_close_buttons.append(button)
+            self.position_action_widgets.append(action_widget)
         self._set_position_close_buttons_enabled(self.order_worker is None or not self.order_worker.isRunning())
 
     def update_candidate_table(self) -> None:
@@ -1888,6 +2615,8 @@ class AltReversalTraderWindow(QMainWindow):
             self.optimized_results.clear()
             self.history_cache.clear()
             self.chart_history_cache.clear()
+            self.backtest_cache.clear()
+            self.chart_indicator_cache.clear()
             self.current_symbol = None
             self.current_backtest = None
             self.current_chart_indicators = None
@@ -1944,6 +2673,9 @@ class AltReversalTraderWindow(QMainWindow):
         candidate: CandidateSymbol = result["candidate"]
         optimization: OptimizationResult = result["optimization"]
         history: pd.DataFrame = result["history"]
+        cache_key = self._symbol_interval_key(candidate.symbol, optimization.best_interval or self.settings.kline_interval)
+        self.backtest_cache[cache_key] = optimization.best_backtest
+        self.chart_indicator_cache[cache_key] = _chart_indicators_from_backtest(optimization.best_backtest)
         if self.preserve_lists_during_refresh:
             self.pending_optimized_results[candidate.symbol] = optimization
             self.pending_history_cache[candidate.symbol] = history
@@ -1952,6 +2684,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.history_cache[candidate.symbol] = history
         self._prune_caches()
         self._schedule_optimized_table_refresh()
+        if candidate.symbol in self.auto_close_enabled_symbols:
+            self._refresh_auto_close_monitors()
 
     def on_optimization_completed(self) -> None:
         preserved_refresh = self.preserve_lists_during_refresh
@@ -1973,6 +2707,7 @@ class AltReversalTraderWindow(QMainWindow):
             self._flush_optimized_table()
         if not preserved_refresh and self.optimized_table.rowCount() > 0:
             self.optimized_table.selectRow(0)
+        self._refresh_auto_close_monitors()
         self._set_refresh_running(False)
 
     def on_worker_failed(self, message: str) -> None:
@@ -2041,20 +2776,46 @@ class AltReversalTraderWindow(QMainWindow):
         if item:
             self._request_symbol_load(item.data(USER_ROLE) or item.text())
 
+    def on_positions_selection_changed(self) -> None:
+        selected = self.positions_table.selectedItems()
+        if selected:
+            self._request_symbol_load(selected[0].data(USER_ROLE) or selected[0].text())
+
+    def on_positions_cell_clicked(self, row: int, _column: int) -> None:
+        item = self.positions_table.item(row, 0)
+        if item:
+            self._request_symbol_load(item.data(USER_ROLE) or item.text())
+
     def load_symbol(self, symbol: str) -> None:
         self._sync_settings()
         self._stop_live_stream()
         self._stop_live_backtest_worker()
         self._stop_load_worker()
         self.current_symbol = symbol
+        self._refresh_auto_close_monitors()
         optimization = self.optimized_results.get(symbol)
-        target_interval = (optimization.best_interval or self.settings.kline_interval) if optimization else self.settings.kline_interval
+        target_interval = self._active_interval_for_symbol(symbol)
+        cache_key = self._symbol_interval_key(symbol, target_interval)
         self.current_interval = target_interval
-        self.current_backtest = None
-        self.current_chart_indicators = None
+        cached_history = self.history_cache.get(symbol)
+        if not _frame_matches_interval(cached_history, target_interval):
+            cached_history = None
+        cached_chart_history = self.chart_history_cache.get(symbol)
+        if not _frame_matches_interval(cached_chart_history, target_interval):
+            cached_chart_history = None
+        cached_backtest = self.backtest_cache.get(cache_key)
+        if cached_backtest is None and optimization is not None and optimization.best_interval == target_interval:
+            cached_backtest = optimization.best_backtest
+        cached_chart_indicators = self.chart_indicator_cache.get(cache_key)
+        if cached_chart_indicators is None and cached_backtest is not None:
+            cached_chart_indicators = _chart_indicators_from_backtest(cached_backtest, cached_chart_history)
+        self.current_backtest = cached_backtest
+        self.current_chart_indicators = cached_chart_indicators
+        worker_backtest = cached_backtest if _backtest_matches_history(cached_backtest, cached_history) else None
         self.load_request_id += 1
-        cached_history = self.history_cache.get(symbol) if target_interval == self.settings.kline_interval else None
-        cached_chart_history = self.chart_history_cache.get(symbol) if target_interval == self.settings.kline_interval else None
+        if cached_backtest is not None:
+            self.render_chart(symbol, cached_backtest, reset_view=True, chart_indicators=cached_chart_indicators)
+            self.update_summary(symbol, cached_backtest, optimization)
         worker = SymbolLoadWorker(
             self.load_request_id,
             self.settings,
@@ -2062,7 +2823,7 @@ class AltReversalTraderWindow(QMainWindow):
             target_interval,
             cached_history,
             cached_chart_history,
-            optimization.best_backtest if optimization else None,
+            worker_backtest,
         )
         worker.loaded.connect(self._on_symbol_loaded)
         worker.failed.connect(self._on_symbol_load_failed)
@@ -2082,10 +2843,15 @@ class AltReversalTraderWindow(QMainWindow):
         self.chart_history_cache[symbol] = result["chart_history"]
         self.current_backtest = result["backtest"]
         self.current_chart_indicators = result["chart_indicators"]
+        cache_key = self._symbol_interval_key(symbol, self.current_interval)
+        self.backtest_cache[cache_key] = self.current_backtest
+        self.chart_indicator_cache[cache_key] = self.current_chart_indicators
         self._prune_caches()
         optimization = self.optimized_results.get(symbol)
         self.render_chart(symbol, self.current_backtest, reset_view=True, chart_indicators=self.current_chart_indicators)
         self.update_summary(symbol, self.current_backtest, optimization)
+        self._refresh_auto_close_monitors()
+        self._evaluate_backtest_auto_close(symbol, self.current_backtest)
         self.refresh_account_info()
         self._start_live_stream(symbol)
 
@@ -2103,13 +2869,7 @@ class AltReversalTraderWindow(QMainWindow):
             chart_indicators = self.current_chart_indicators
         if chart_indicators is None:
             chart_history = self.chart_history_cache.get(symbol)
-            if chart_history is not None and not chart_history.empty:
-                chart_indicators = compact_indicator_frame(
-                    compute_indicators(prepare_ohlcv(chart_history), result.settings),
-                    CHART_INDICATOR_COLUMNS,
-                )
-            else:
-                chart_indicators = result.indicators
+            chart_indicators = _chart_indicators_from_backtest(result, chart_history)
         indicators = chart_indicators.sort_values("time").drop_duplicates(subset=["time"]).reset_index(drop=True)
         candle_df = indicators[["time", "open", "high", "low", "close", "volume"]].copy()
         equity_df = (
@@ -2189,6 +2949,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.equity_line.set(equity_df)
         range_start, range_end = self._default_chart_time_range(candle_df)
         latest_time = pd.Timestamp(candle_df["time"].iloc[-1]) if not candle_df.empty else None
+        signal_events = _confirmed_signal_events(indicators)
 
         markers = []
         for trade in trades:
@@ -2211,6 +2972,16 @@ class AltReversalTraderWindow(QMainWindow):
                         "text": f"{trade.return_pct:+.1f}%",
                     }
                 )
+        for event in signal_events:
+            markers.append(
+                {
+                    "time": event["time"],
+                    "position": "below" if event["side"] == "bull" else "above",
+                    "shape": "square",
+                    "color": event["color"],
+                    "text": str(event["text"]),
+                }
+            )
         if markers:
             self.chart.marker_list(markers)
         if reset_view:
@@ -2334,6 +3105,7 @@ class AltReversalTraderWindow(QMainWindow):
             )
 
         latest_time = pd.Timestamp(candle_df["time"].iloc[-1]) if not candle_df.empty else None
+        signal_events = _confirmed_signal_events(indicators)
         plotted_trades = [trade for trade in trades if not _is_provisional_exit_trade(trade, latest_time)]
         long_entries = [trade for trade in trades if trade.side == "long"]
         short_entries = [trade for trade in trades if trade.side == "short"]
@@ -2377,6 +3149,46 @@ class AltReversalTraderWindow(QMainWindow):
                     text=[f"{trade.return_pct:+.1f}%" for trade in plotted_trades],
                     textposition="middle right",
                     marker={"symbol": "x", "size": 9, "color": "#f801e8"},
+                ),
+                row=1,
+                col=1,
+                secondary_y=False,
+            )
+        bull_signals = [event for event in signal_events if event["side"] == "bull"]
+        bear_signals = [event for event in signal_events if event["side"] == "bear"]
+        if bull_signals:
+            fig.add_trace(
+                go.Scatter(
+                    x=[event["time"] for event in bull_signals],
+                    y=[event["price"] for event in bull_signals],
+                    mode="markers+text",
+                    name="Bull Confirmed",
+                    text=[event["text"] for event in bull_signals],
+                    textposition="bottom center",
+                    marker={
+                        "symbol": "square",
+                        "size": 8,
+                        "color": [event["color"] for event in bull_signals],
+                    },
+                ),
+                row=1,
+                col=1,
+                secondary_y=False,
+            )
+        if bear_signals:
+            fig.add_trace(
+                go.Scatter(
+                    x=[event["time"] for event in bear_signals],
+                    y=[event["price"] for event in bear_signals],
+                    mode="markers+text",
+                    name="Bear Confirmed",
+                    text=[event["text"] for event in bear_signals],
+                    textposition="top center",
+                    marker={
+                        "symbol": "square",
+                        "size": 8,
+                        "color": [event["color"] for event in bear_signals],
+                    },
                 ),
                 row=1,
                 col=1,
@@ -2544,14 +3356,34 @@ class AltReversalTraderWindow(QMainWindow):
             )
         self.summary_box.setPlainText("\n".join(lines))
 
+    def _balance_label_html(self, body: str) -> str:
+        return (
+            '<span style="color: #000000; font-weight: 700;">잔고:</span> '
+            f'<span style="color: #000000; font-weight: 700;">{body}</span>'
+        )
+
+    def _set_balance_label_status(self, status: str) -> None:
+        self.balance_label.setText(self._balance_label_html(status))
+
+    def _set_balance_label_values(self, equity: float, available: float) -> None:
+        body = (
+            'Equity <span style="color: #1546b0; font-weight: 700;">'
+            f"{equity:.2f}"
+            '</span> USDT | Available <span style="color: #1546b0; font-weight: 700;">'
+            f"{available:.2f}"
+            "</span> USDT"
+        )
+        self.balance_label.setText(self._balance_label_html(body))
+
     def refresh_account_info(self) -> None:
         self._sync_settings()
         if not self.settings.api_key or not self.settings.api_secret:
             self._stop_account_worker()
             self.open_positions = []
             self.current_position_snapshot = None
-            self.balance_label.setText("잔고: API 미입력")
+            self._set_balance_label_status("API 미입력")
             self.position_label.setText("포지션: API 미입력")
+            self._refresh_auto_close_monitors()
             self.update_positions_table()
             self._clear_entry_price_overlay()
             return
@@ -2583,9 +3415,7 @@ class AltReversalTraderWindow(QMainWindow):
         position = result["position"]
         self.open_positions = list(result.get("positions", []))
         self.current_position_snapshot = position if (self.current_symbol and requested_symbol == self.current_symbol) else None
-        self.balance_label.setText(
-            f"잔고: Equity {balance.equity:.2f} USDT | Available {balance.available_balance:.2f} USDT"
-        )
+        self._set_balance_label_values(balance.equity, balance.available_balance)
         if self.current_symbol and requested_symbol == self.current_symbol:
             if position is None:
                 self.position_label.setText("포지션: 없음")
@@ -2597,6 +3427,7 @@ class AltReversalTraderWindow(QMainWindow):
                 )
         else:
             self.position_label.setText("포지션: 종목 미선택")
+        self._refresh_auto_close_monitors()
         self.update_positions_table()
         if self.current_backtest and self.current_symbol:
             if self.chart_mode == "Lightweight":
@@ -2612,7 +3443,7 @@ class AltReversalTraderWindow(QMainWindow):
     def _on_account_info_failed(self, message: str) -> None:
         self.open_positions = []
         self.current_position_snapshot = None
-        self.balance_label.setText("잔고 조회 실패")
+        self._set_balance_label_status("조회 실패")
         self.position_label.setText("포지션: 조회 실패")
         self.update_positions_table()
         self._clear_entry_price_overlay()
@@ -2624,6 +3455,22 @@ class AltReversalTraderWindow(QMainWindow):
             self.refresh_account_info()
 
     def place_fractional_order(self, side: str, fraction: float) -> None:
+        self._submit_open_order(side, fraction=fraction)
+
+    def place_simple_order(self, side: str) -> None:
+        amount = (
+            float(self.simple_long_amount_spin.value())
+            if side.upper() == "BUY"
+            else float(self.simple_short_amount_spin.value())
+        )
+        self._submit_open_order(side, margin=amount)
+
+    def _submit_open_order(
+        self,
+        side: str,
+        fraction: Optional[float] = None,
+        margin: Optional[float] = None,
+    ) -> None:
         self._sync_settings()
         if not self.current_symbol:
             self.show_warning("주문할 종목을 먼저 선택하세요.")
@@ -2634,6 +3481,9 @@ class AltReversalTraderWindow(QMainWindow):
         if self.order_worker is not None and self.order_worker.isRunning():
             self.show_warning("이미 주문 처리 중입니다.")
             return
+        if margin is not None and margin <= 0:
+            self.show_warning("?⑤━ 二쇰Ц 湲덉븸??0蹂대떎 而ㅼ빞 ?⑸땲??")
+            return
         worker = OrderWorker(
             self.settings.api_key,
             self.settings.api_secret,
@@ -2641,10 +3491,13 @@ class AltReversalTraderWindow(QMainWindow):
             self.settings.leverage,
             side=side,
             fraction=fraction,
+            margin=margin,
         )
         worker.completed.connect(self._on_order_completed)
         worker.failed.connect(self._on_order_failed)
         self.order_worker = worker
+        self.order_worker_symbol = self.current_symbol
+        self.order_worker_is_auto_close = False
         self._track_thread(worker, "order_worker")
         self._set_order_buttons_enabled(False)
         self.statusBar().showMessage(f"{self.current_symbol} 주문 처리 중...", 3000)
@@ -2656,14 +3509,18 @@ class AltReversalTraderWindow(QMainWindow):
             return
         self.close_position_for_symbol(self.current_symbol)
 
-    def close_position_for_symbol(self, symbol: str) -> None:
+    def _submit_close_position(self, symbol: str, auto_close_reason: Optional[str] = None) -> bool:
         self._sync_settings()
         if not self.settings.api_key or not self.settings.api_secret:
-            self.show_warning("API Key / Secret을 입력해야 실제 주문할 수 있습니다.")
-            return
+            if auto_close_reason is None:
+                self.show_warning("API Key / Secret을 입력해야 실제 주문이 가능합니다.")
+            else:
+                self.log(f"{symbol} 자동청산 실패: API Key / Secret이 없습니다.")
+            return False
         if self.order_worker is not None and self.order_worker.isRunning():
-            self.show_warning("이미 주문 처리 중입니다.")
-            return
+            if auto_close_reason is None:
+                self.show_warning("이미 주문 처리 중입니다.")
+            return False
         worker = OrderWorker(
             self.settings.api_key,
             self.settings.api_secret,
@@ -2674,21 +3531,46 @@ class AltReversalTraderWindow(QMainWindow):
         worker.completed.connect(self._on_order_completed)
         worker.failed.connect(self._on_order_failed)
         self.order_worker = worker
+        self.order_worker_symbol = symbol
+        self.order_worker_is_auto_close = auto_close_reason is not None
         self._track_thread(worker, "order_worker")
         self._set_order_buttons_enabled(False)
-        self.statusBar().showMessage(f"{symbol} 청산 처리 중...", 3000)
+        if auto_close_reason is None:
+            self.statusBar().showMessage(f"{symbol} 청산 처리 중...", 3000)
+        else:
+            self.log(f"{symbol} 자동청산 실행: {_auto_close_reason_text(auto_close_reason)}")
+            self.statusBar().showMessage(f"{symbol} 자동청산 처리 중...", 3000)
         worker.start()
+        return True
+
+    def close_position_for_symbol(self, symbol: str) -> None:
+        self._submit_close_position(symbol)
 
     def _on_order_completed(self, payload: object) -> None:
         self._set_order_buttons_enabled(True)
         result = dict(payload)
+        order_symbol = self.order_worker_symbol or str(result.get("symbol", ""))
+        if self.order_worker_is_auto_close and order_symbol:
+            self.auto_close_order_pending.discard(order_symbol)
+        self.order_worker_symbol = None
+        self.order_worker_is_auto_close = False
         self.log(str(result.get("message", "주문 완료")))
         self.refresh_account_info()
+        QTimer.singleShot(0, self._flush_queued_auto_close_orders)
 
     def _on_order_failed(self, message: str) -> None:
+        order_symbol = self.order_worker_symbol
+        was_auto_close = self.order_worker_is_auto_close
+        if was_auto_close and order_symbol:
+            self.auto_close_order_pending.discard(order_symbol)
+            self.auto_close_last_trigger_time.pop(order_symbol, None)
+        self.order_worker_symbol = None
+        self.order_worker_is_auto_close = False
         self._set_order_buttons_enabled(True)
         self.log(message)
-        self.show_error("주문 처리 중 오류가 발생했습니다. 로그를 확인하세요.")
+        if not was_auto_close:
+            self.show_error("주문 처리 중 오류가 발생했습니다. 로그를 확인하세요.")
+        QTimer.singleShot(0, self._flush_queued_auto_close_orders)
 
     def show_warning(self, message: str) -> None:
         QMessageBox.warning(self, "Warning", message)
@@ -2708,6 +3590,7 @@ class AltReversalTraderWindow(QMainWindow):
             self._stop_account_worker()
             self._stop_order_worker()
             self._stop_live_stream()
+            self._stop_all_auto_close_monitors()
             self._drain_tracked_threads()
             self.save_settings()
         finally:
