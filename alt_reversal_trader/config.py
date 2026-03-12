@@ -80,8 +80,7 @@ class AppSettings:
     chart_engine: str = "Plotly"
     leverage: int = 3
     order_mode: str = "compound"
-    simple_long_order_amount: float = 50.0
-    simple_short_order_amount: float = 50.0
+    simple_order_amount: float = 50.0
     fee_rate: float = 0.0005
     history_days: int = 5
     kline_interval: str = "1m"
@@ -104,8 +103,7 @@ class AppSettings:
             self.chart_engine = CHART_ENGINE_OPTIONS[0]
         if self.order_mode not in {"compound", "simple"}:
             self.order_mode = "compound"
-        self.simple_long_order_amount = max(1.0, float(self.simple_long_order_amount))
-        self.simple_short_order_amount = max(1.0, float(self.simple_short_order_amount))
+        self.simple_order_amount = max(1.0, float(self.simple_order_amount))
         self.scan_workers = max(1, int(self.scan_workers))
         self.optimize_processes = max(1, int(self.optimize_processes))
         if not self.optimize_flags:
@@ -118,8 +116,7 @@ class AppSettings:
             "chart_engine": self.chart_engine,
             "leverage": self.leverage,
             "order_mode": self.order_mode,
-            "simple_long_order_amount": self.simple_long_order_amount,
-            "simple_short_order_amount": self.simple_short_order_amount,
+            "simple_order_amount": self.simple_order_amount,
             "fee_rate": self.fee_rate,
             "history_days": self.history_days,
             "kline_interval": self.kline_interval,
@@ -143,6 +140,13 @@ class AppSettings:
         payload = dict(data or {})
         strategy_payload = payload.pop("strategy", {}) or {}
         optimize_flags = payload.pop("optimize_flags", {}) or {}
+        simple_order_amount = payload.pop("simple_order_amount", None)
+        legacy_simple_long = payload.pop("simple_long_order_amount", None)
+        legacy_simple_short = payload.pop("simple_short_order_amount", None)
+        if simple_order_amount is None:
+            simple_order_amount = legacy_simple_long if legacy_simple_long is not None else legacy_simple_short
+        if simple_order_amount is not None:
+            payload["simple_order_amount"] = simple_order_amount
         strategy = StrategySettings(
             **{k: v for k, v in strategy_payload.items() if k in StrategySettings.__dataclass_fields__}
         )

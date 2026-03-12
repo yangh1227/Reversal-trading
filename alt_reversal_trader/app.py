@@ -86,6 +86,7 @@ LIVE_RENDER_INTERVAL_MS = 120
 PLOTLY_LIVE_RENDER_INTERVAL_MS = 350
 OPTIMIZED_TABLE_REFRESH_MS = 250
 HISTORY_CACHE_SYMBOL_LIMIT = 10
+RECENT_SYMBOL_CACHE_LIMIT = 8
 
 
 def _interval_to_ms(interval: str) -> int:
@@ -156,6 +157,73 @@ def _merge_live_bar(df: pd.DataFrame, bar: Dict[str, object], max_rows: Optional
     if max_rows is not None and len(frame) > max_rows:
         frame = frame.iloc[-max_rows:].reset_index(drop=True)
     return frame
+
+
+def _merge_ohlcv_frames(
+    base: Optional[pd.DataFrame],
+    updates: Optional[pd.DataFrame],
+    max_rows: Optional[int] = None,
+) -> pd.DataFrame:
+    columns: List[str] = []
+    frames: List[pd.DataFrame] = []
+    for frame in (base, updates):
+        if frame is None or frame.empty:
+            continue
+        for column in frame.columns:
+            if column not in columns:
+                columns.append(column)
+        frames.append(frame)
+    if not frames:
+        default_columns = ["time", "open", "high", "low", "close", "volume"]
+        return pd.DataFrame(columns=default_columns)
+    merged = pd.concat([frame.reindex(columns=columns) for frame in frames], ignore_index=True)
+    if "time" in merged.columns:
+        merged["time"] = pd.to_datetime(merged["time"])
+        merged = merged.drop_duplicates(subset=["time"], keep="last").sort_values("time").reset_index(drop=True)
+    if max_rows is not None and len(merged) > max_rows:
+        merged = merged.iloc[-max_rows:].reset_index(drop=True)
+    return merged
+
+
+def _frame_tail_signature(frame: Optional[pd.DataFrame]) -> Tuple[object, ...]:
+    if frame is None or frame.empty or "time" not in frame.columns:
+        return (None, 0)
+    last = frame.iloc[-1]
+    values: List[object] = [pd.Timestamp(last["time"]), int(len(frame))]
+    for column in ("open", "high", "low", "close", "volume", "quote_volume"):
+        if column not in frame.columns:
+            continue
+        value = last[column]
+        values.append(None if pd.isna(value) else float(value))
+    return tuple(values)
+
+
+def _refresh_cached_ohlcv(
+    client: BinanceFuturesClient,
+    symbol: str,
+    interval: str,
+    cached: Optional[pd.DataFrame],
+    min_start_time_ms: int,
+    max_rows: Optional[int] = None,
+) -> Tuple[Optional[pd.DataFrame], bool]:
+    if cached is None or cached.empty:
+        return cached, False
+    base = prepare_ohlcv(cached.copy())
+    if base.empty:
+        return base, False
+    compare_base = base.tail(max_rows).reset_index(drop=True) if max_rows is not None else base
+    interval_ms = _interval_to_ms(interval)
+    last_time = pd.Timestamp(base["time"].iloc[-1])
+    refresh_start_ms = max(
+        int((last_time - pd.Timedelta(milliseconds=interval_ms * 2)).timestamp() * 1000),
+        int(min_start_time_ms),
+    )
+    refreshed = client.historical_ohlcv(symbol, interval, start_time=refresh_start_ms)
+    if refreshed.empty:
+        return compare_base, False
+    refreshed = prepare_ohlcv(refreshed)
+    merged = _merge_ohlcv_frames(base, refreshed, max_rows=max_rows)
+    return merged, _frame_tail_signature(merged) != _frame_tail_signature(compare_base)
 
 
 def _frame_matches_interval(frame: Optional[pd.DataFrame], interval: str) -> bool:
@@ -601,11 +669,21 @@ class SymbolLoadWorker(QThread):
         try:
             client = BinanceFuturesClient()
             history = self.history
+            history_updated = False
             if history is None:
                 history = client.historical_ohlcv(
                     self.symbol,
                     self.interval,
                     start_time=_history_fetch_start_time_ms(self.settings, self.interval),
+                )
+                history_updated = True
+            else:
+                history, history_updated = _refresh_cached_ohlcv(
+                    client,
+                    self.symbol,
+                    self.interval,
+                    history,
+                    _history_fetch_start_time_ms(self.settings, self.interval),
                 )
             if history.empty:
                 raise RuntimeError(f"{self.symbol} 히스토리 데이터가 없습니다.")
@@ -614,7 +692,7 @@ class SymbolLoadWorker(QThread):
                 return
 
             chart_history = self.chart_history
-            if chart_history is None:
+            if chart_history is None or history_updated:
                 if len(history) >= CHART_HISTORY_FETCH_FALLBACK_MIN_BARS:
                     chart_history = history.tail(CHART_HISTORY_BAR_LIMIT).copy().reset_index(drop=True)
                 else:
@@ -625,12 +703,26 @@ class SymbolLoadWorker(QThread):
                     )
                     if chart_history.empty:
                         chart_history = history.tail(CHART_HISTORY_BAR_LIMIT).copy().reset_index(drop=True)
+            else:
+                chart_history, _ = _refresh_cached_ohlcv(
+                    client,
+                    self.symbol,
+                    self.interval,
+                    chart_history,
+                    _history_fetch_start_time_ms(self.settings, self.interval),
+                    max_rows=CHART_HISTORY_BAR_LIMIT,
+                )
             chart_history = prepare_ohlcv(chart_history)
             if self.isInterruptionRequested():
                 return
 
             backtest_start_time = pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms")
-            backtest = self.existing_backtest or run_backtest(
+            use_existing_backtest = (
+                self.existing_backtest is not None
+                and not history_updated
+                and _backtest_matches_history(self.existing_backtest, history)
+            )
+            backtest = self.existing_backtest if use_existing_backtest else run_backtest(
                 history,
                 settings=self.settings.strategy,
                 fee_rate=self.settings.fee_rate,
@@ -909,6 +1001,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.position_price_workers: Dict[str, KlineStreamWorker] = {}
         self.account_balance_snapshot: Optional[BalanceSnapshot] = None
         self.live_pending_bar: Optional[Dict[str, object]] = None
+        self.recent_symbol_cache_keys: deque[str] = deque(maxlen=RECENT_SYMBOL_CACHE_LIMIT)
         self._tracked_threads: set[QThread] = set()
         self.auto_close_enabled_symbols: set[str] = set()
         self.auto_close_monitor_histories: Dict[str, pd.DataFrame] = {}
@@ -947,7 +1040,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.price_label_timer = QTimer(self)
 
         self.setWindowTitle("Binance Alt Mean Reversion Trader")
-        self.resize(1680, 960)
+        self.resize(1848, 1056)
         self._build_ui()
         self._apply_loaded_settings()
         self._init_chart()
@@ -1075,40 +1168,38 @@ class AltReversalTraderWindow(QMainWindow):
         simple_layout.setSpacing(6)
         self.simple_order_buttons = []
 
-        simple_long_row = QHBoxLayout()
-        simple_long_row.addWidget(QLabel("LONG"))
-        self.simple_long_amount_spin = QDoubleSpinBox()
-        self.simple_long_amount_spin.setRange(1.0, 1_000_000.0)
-        self.simple_long_amount_spin.setDecimals(2)
-        self.simple_long_amount_spin.setSingleStep(10.0)
-        self.simple_long_amount_spin.setSuffix(" USDT")
-        self.simple_long_amount_spin.setToolTip("단리 LONG 주문금액")
+        simple_amount_row = QHBoxLayout()
+        simple_amount_row.addWidget(QLabel("주문금액"))
+        self.simple_order_amount_spin = QDoubleSpinBox()
+        self.simple_order_amount_spin.setRange(1.0, 1_000_000.0)
+        self.simple_order_amount_spin.setDecimals(2)
+        self.simple_order_amount_spin.setSingleStep(10.0)
+        self.simple_order_amount_spin.setSuffix(" USDT")
+        self.simple_order_amount_spin.setToolTip("단리 공통 주문금액")
+        simple_amount_row.addWidget(self.simple_order_amount_spin, 1)
+
+        simple_button_row = QHBoxLayout()
         self.simple_long_button = QPushButton("LONG")
         self.simple_long_button.clicked.connect(lambda _=False: self.place_simple_order("BUY"))
+        self.simple_long_button.setMinimumWidth(140)
+        self.simple_long_button.setMinimumHeight(28)
         self.simple_order_buttons.append(self.simple_long_button)
-        simple_long_row.addWidget(self.simple_long_amount_spin, 1)
-        simple_long_row.addWidget(self.simple_long_button)
-
-        simple_short_row = QHBoxLayout()
-        simple_short_row.addWidget(QLabel("SHORT"))
-        self.simple_short_amount_spin = QDoubleSpinBox()
-        self.simple_short_amount_spin.setRange(1.0, 1_000_000.0)
-        self.simple_short_amount_spin.setDecimals(2)
-        self.simple_short_amount_spin.setSingleStep(10.0)
-        self.simple_short_amount_spin.setSuffix(" USDT")
-        self.simple_short_amount_spin.setToolTip("단리 SHORT 주문금액")
         self.simple_short_button = QPushButton("SHORT")
         self.simple_short_button.clicked.connect(lambda _=False: self.place_simple_order("SELL"))
+        self.simple_short_button.setMinimumWidth(140)
+        self.simple_short_button.setMinimumHeight(28)
         self.simple_order_buttons.append(self.simple_short_button)
-        simple_short_row.addWidget(self.simple_short_amount_spin, 1)
-        simple_short_row.addWidget(self.simple_short_button)
+        simple_button_row.addWidget(self.simple_long_button, 1)
+        simple_button_row.addWidget(self.simple_short_button, 1)
 
-        simple_layout.addLayout(simple_long_row)
-        simple_layout.addLayout(simple_short_row)
+        simple_layout.addLayout(simple_amount_row)
+        simple_layout.addLayout(simple_button_row)
         self.close_position_button = QPushButton("포지션 청산")
         self.close_position_button.clicked.connect(self.close_selected_position)
         self.close_position_button.setText("청산")
         self.close_position_button.setFixedWidth(88)
+        self.close_position_button.setMinimumHeight(24)
+        self._style_close_button(self.close_position_button)
         self.close_position_button.setToolTip("선택 종목 포지션 청산")
         close_row = QHBoxLayout()
         close_row.addStretch(1)
@@ -1612,8 +1703,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.opt_process_spin.setValue(settings.optimize_processes)
         self.optimize_timeframe_check.setChecked(settings.optimize_timeframe)
         self.fee_spin.setValue(settings.fee_rate * 100.0)
-        self.simple_long_amount_spin.setValue(settings.simple_long_order_amount)
-        self.simple_short_amount_spin.setValue(settings.simple_short_order_amount)
+        self.simple_order_amount_spin.setValue(settings.simple_order_amount)
         if settings.order_mode == "simple":
             self.simple_order_radio.setChecked(True)
         else:
@@ -1640,8 +1730,7 @@ class AltReversalTraderWindow(QMainWindow):
             chart_engine=self.chart_engine_combo.currentText(),
             leverage=int(self.leverage_spin.value()),
             order_mode="simple" if self.simple_order_radio.isChecked() else "compound",
-            simple_long_order_amount=float(self.simple_long_amount_spin.value()),
-            simple_short_order_amount=float(self.simple_short_amount_spin.value()),
+            simple_order_amount=float(self.simple_order_amount_spin.value()),
             fee_rate=float(self.fee_spin.value()) / 100.0,
             history_days=int(self.history_days_spin.value()),
             kline_interval=self.interval_combo.currentText(),
@@ -1748,6 +1837,34 @@ class AltReversalTraderWindow(QMainWindow):
             }
             QPushButton:checked:pressed {
                 background-color: #17713a;
+            }
+            """
+        )
+
+    def _style_close_button(self, button: QPushButton) -> None:
+        button.setStyleSheet(
+            """
+            QPushButton {
+                font-weight: 700;
+                font-size: 11px;
+                color: #ffffff;
+                background-color: #cc334f;
+                border: 1px solid #9e2239;
+                border-radius: 4px;
+                padding: 2px 10px;
+            }
+            QPushButton:hover {
+                background-color: #dd3b59;
+                border-color: #b32741;
+            }
+            QPushButton:pressed {
+                background-color: #a6263d;
+                border-color: #7e1c2f;
+            }
+            QPushButton:disabled {
+                color: #f3d5db;
+                background-color: #b67b87;
+                border-color: #95626c;
             }
             """
         )
@@ -1861,6 +1978,7 @@ class AltReversalTraderWindow(QMainWindow):
         keep_symbols = set()
         if self.current_symbol:
             keep_symbols.add(self.current_symbol)
+        keep_symbols.update(self.recent_symbol_cache_keys)
         ordered_symbols = [
             result.symbol
             for result in sorted(
@@ -1875,11 +1993,10 @@ class AltReversalTraderWindow(QMainWindow):
             for symbol, frame in self.history_cache.items()
             if symbol in keep_symbols
         }
-        chart_keep = {self.current_symbol} if self.current_symbol else set()
         self.chart_history_cache = {
             symbol: frame
             for symbol, frame in self.chart_history_cache.items()
-            if symbol in chart_keep
+            if symbol in keep_symbols
         }
         self.backtest_cache = {
             key: value
@@ -1891,6 +2008,15 @@ class AltReversalTraderWindow(QMainWindow):
             for key, value in self.chart_indicator_cache.items()
             if key[0] in keep_symbols
         }
+
+    def _remember_recent_symbol(self, symbol: str) -> None:
+        if not symbol:
+            return
+        try:
+            self.recent_symbol_cache_keys.remove(symbol)
+        except ValueError:
+            pass
+        self.recent_symbol_cache_keys.append(symbol)
 
     def _stop_auto_close_history_worker(self, symbol: str) -> None:
         worker = self.auto_close_history_workers.pop(symbol, None)
@@ -2382,8 +2508,7 @@ class AltReversalTraderWindow(QMainWindow):
             button.setEnabled(enabled)
         self.compound_order_radio.setEnabled(enabled)
         self.simple_order_radio.setEnabled(enabled)
-        self.simple_long_amount_spin.setEnabled(enabled)
-        self.simple_short_amount_spin.setEnabled(enabled)
+        self.simple_order_amount_spin.setEnabled(enabled)
         self.close_position_button.setEnabled(enabled)
         self._set_position_close_buttons_enabled(enabled)
 
@@ -2579,6 +2704,8 @@ class AltReversalTraderWindow(QMainWindow):
             button.clicked.connect(lambda _=False, symbol=position.symbol: self.close_position_for_symbol(symbol))
             button.setText("청산")
             button.setFixedWidth(54)
+            button.setMinimumHeight(24)
+            self._style_close_button(button)
 
             auto_button = QPushButton()
             auto_button.setFixedWidth(124)
@@ -2811,8 +2938,6 @@ class AltReversalTraderWindow(QMainWindow):
             return
         optimization = self.optimized_results.get(symbol)
         target_interval = (optimization.best_interval or self.settings.kline_interval) if optimization else self.settings.kline_interval
-        if self.load_worker is not None and self.load_worker.isRunning():
-            return
         if (
             symbol == self.current_symbol
             and target_interval == self.current_interval
@@ -2863,6 +2988,7 @@ class AltReversalTraderWindow(QMainWindow):
         self._stop_live_backtest_worker()
         self._stop_load_worker()
         self.current_symbol = symbol
+        self._remember_recent_symbol(symbol)
         self.current_position_snapshot = self._find_open_position(symbol)
         self._refresh_position_status_label()
         self._refresh_position_price_streams()
@@ -3506,11 +3632,7 @@ class AltReversalTraderWindow(QMainWindow):
         self._submit_open_order(side, fraction=fraction)
 
     def place_simple_order(self, side: str) -> None:
-        amount = (
-            float(self.simple_long_amount_spin.value())
-            if side.upper() == "BUY"
-            else float(self.simple_short_amount_spin.value())
-        )
+        amount = float(self.simple_order_amount_spin.value())
         self._submit_open_order(side, margin=amount)
 
     def _submit_open_order(
