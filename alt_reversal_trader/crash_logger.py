@@ -73,7 +73,7 @@ def _format_exception(exc_type, exc_value, exc_traceback) -> str:
 
 
 def _handle_unhandled_exception(exc_type, exc_value, exc_traceback) -> None:
-    path = write_log("Unhandled Exception", _format_exception(exc_type, exc_value, exc_traceback), open_notepad=True)
+    path = write_log("Unhandled Exception", _format_exception(exc_type, exc_value, exc_traceback), open_notepad=False)
     sys.stderr.write(f"\nUnhandled exception logged to: {path}\n")
 
 
@@ -84,7 +84,7 @@ def _threading_excepthook(args) -> None:
             _format_exception(args.exc_type, args.exc_value, args.exc_traceback),
         ]
     )
-    write_log("Unhandled Thread Exception", body, open_notepad=True)
+    write_log("Unhandled Thread Exception", body, open_notepad=False)
 
 
 def _unraisable_hook(args) -> None:

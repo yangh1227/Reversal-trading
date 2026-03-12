@@ -16,7 +16,14 @@ from plotly.subplots import make_subplots
 from lightweight_charts.widgets import QtChart
 import websocket
 
-from .binance_futures import BinanceFuturesClient, CandidateSymbol, PositionSnapshot, resample_ohlcv, resolve_base_interval
+from .binance_futures import (
+    BalanceSnapshot,
+    BinanceFuturesClient,
+    CandidateSymbol,
+    PositionSnapshot,
+    resample_ohlcv,
+    resolve_base_interval,
+)
 from .config import APP_INTERVAL_OPTIONS, CHART_ENGINE_OPTIONS, PARAMETER_SPECS, AppSettings, StrategySettings
 from .crash_logger import log_runtime_event
 from .optimizer import OptimizationResult, optimize_symbol_intervals
@@ -110,6 +117,8 @@ def _ws_kline_timestamp(time_ms: int) -> pd.Timestamp:
 
 def _merge_live_bar(df: pd.DataFrame, bar: Dict[str, object], max_rows: Optional[int] = None) -> pd.DataFrame:
     columns = ["time", "open", "high", "low", "close", "volume"]
+    if (df is not None and "quote_volume" in df.columns) or "quote_volume" in bar:
+        columns.append("quote_volume")
     frame = df.copy() if df is not None and not df.empty else pd.DataFrame(columns=columns)
     row_time = pd.Timestamp(bar["time"])
     row_values = [
@@ -120,6 +129,8 @@ def _merge_live_bar(df: pd.DataFrame, bar: Dict[str, object], max_rows: Optional
         float(bar["close"]),
         float(bar["volume"]),
     ]
+    if "quote_volume" in columns:
+        row_values.append(float(bar.get("quote_volume", float(bar["close"]) * float(bar["volume"]))))
     if frame.empty:
         frame = pd.DataFrame([row_values], columns=columns)
     else:
@@ -224,59 +235,13 @@ def _auto_close_reason_text(reason: str) -> str:
     return labels.get(reason, reason)
 
 
-def _confirmed_signal_events(indicators: pd.DataFrame) -> List[Dict[str, object]]:
-    if indicators is None or indicators.empty:
-        return []
-    frame = indicators
-    missing = [
-        column
-        for column in ("trend_to_long", "trend_to_short", "final_bull", "final_bear")
-        if column not in frame.columns
-    ]
-    if missing:
-        frame = indicators.copy()
-        for column in missing:
-            frame[column] = False
-
-    events: List[Dict[str, object]] = []
-    for row in frame.itertuples(index=False):
-        def _row_flag(name: str) -> bool:
-            value = getattr(row, name, False)
-            return bool(value) if pd.notna(value) else False
-
-        bull_parts: List[str] = []
-        bear_parts: List[str] = []
-        if _row_flag("final_bull"):
-            bull_parts.append("BULL")
-        if _row_flag("trend_to_long"):
-            bull_parts.append("TL")
-        if _row_flag("final_bear"):
-            bear_parts.append("BEAR")
-        if _row_flag("trend_to_short"):
-            bear_parts.append("TS")
-
-        signal_time = pd.Timestamp(getattr(row, "time"))
-        if bull_parts:
-            events.append(
-                {
-                    "time": signal_time,
-                    "price": float(getattr(row, "low")),
-                    "side": "bull",
-                    "text": " / ".join(bull_parts),
-                    "color": "#17c964" if "BULL" in bull_parts else "#00b8ff",
-                }
-            )
-        if bear_parts:
-            events.append(
-                {
-                    "time": signal_time,
-                    "price": float(getattr(row, "high")),
-                    "side": "bear",
-                    "text": " / ".join(bear_parts),
-                    "color": "#f31260" if "BEAR" in bear_parts else "#ff9100",
-                }
-            )
-    return events
+def _position_return_pct(position: PositionSnapshot) -> float:
+    notional = abs(float(position.amount)) * float(position.entry_price)
+    leverage = max(1, int(position.leverage) or 1)
+    margin = notional / leverage if notional > 0 else 0.0
+    if margin <= 0:
+        return 0.0
+    return float(position.unrealized_pnl) / margin * 100.0
 
 
 class KlineStreamWorker(QThread):
@@ -327,6 +292,7 @@ class KlineStreamWorker(QThread):
                         "low": float(kline["l"]),
                         "close": float(kline["c"]),
                         "volume": float(kline["v"]),
+                        "quote_volume": float(kline.get("q", 0.0) or 0.0),
                         "closed": bool(kline.get("x", False)),
                     }
                     for event in self._transform_bar(bar):
@@ -940,6 +906,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.live_recalc_pending = False
         self.pending_account_refresh = False
         self.live_stream_worker: Optional[KlineStreamWorker] = None
+        self.position_price_workers: Dict[str, KlineStreamWorker] = {}
+        self.account_balance_snapshot: Optional[BalanceSnapshot] = None
         self.live_pending_bar: Optional[Dict[str, object]] = None
         self._tracked_threads: set[QThread] = set()
         self.auto_close_enabled_symbols: set[str] = set()
@@ -1342,8 +1310,8 @@ class AltReversalTraderWindow(QMainWindow):
     def _build_positions_group(self) -> QGroupBox:
         group = QGroupBox("Open Positions")
         layout = QVBoxLayout(group)
-        self.positions_table = QTableWidget(0, 6)
-        self.positions_table.setHorizontalHeaderLabels(["Symbol", "Side", "Amount", "Entry", "UPnL", "Action"])
+        self.positions_table = QTableWidget(0, 7)
+        self.positions_table.setHorizontalHeaderLabels(["Symbol", "Side", "Amount", "Entry", "UPnL", "수익률", "Action"])
         self.positions_table.setSelectionBehavior(SELECT_ROWS)
         self.positions_table.setSelectionMode(SINGLE_SELECTION)
         self.positions_table.setEditTriggers(NO_EDIT_TRIGGERS)
@@ -1385,6 +1353,7 @@ class AltReversalTraderWindow(QMainWindow):
     def _rebuild_chart_engine(self, force: bool = False) -> None:
         engine = self.chart_engine_combo.currentText() if hasattr(self, "chart_engine_combo") else self.settings.chart_engine
         if not force and engine == self.chart_mode:
+            self.update_positions_table()
             return
         self._clear_chart_host()
         if engine == "Lightweight":
@@ -2018,6 +1987,9 @@ class AltReversalTraderWindow(QMainWindow):
         worker.start()
 
     def _toggle_auto_close_for_symbol(self, symbol: str, enabled: bool) -> None:
+        button = self.sender()
+        if isinstance(button, QPushButton):
+            self._set_auto_close_button_state(button, enabled)
         if enabled:
             self.auto_close_enabled_symbols.add(symbol)
             self.log(f"{symbol} 자동청산 활성화")
@@ -2262,6 +2234,37 @@ class AltReversalTraderWindow(QMainWindow):
             worker.stop()
             worker.wait(1500)
 
+    def _stop_position_price_worker(self, symbol: str) -> None:
+        worker = self.position_price_workers.pop(symbol, None)
+        if worker is not None:
+            worker.stop()
+            worker.wait(1500)
+
+    def _refresh_position_price_streams(self) -> None:
+        open_symbols = {position.symbol for position in self.open_positions}
+        if self.current_symbol:
+            open_symbols.discard(self.current_symbol)
+
+        for symbol in list(self.position_price_workers):
+            if symbol not in open_symbols:
+                self._stop_position_price_worker(symbol)
+
+        for symbol in sorted(open_symbols):
+            if symbol in self.position_price_workers:
+                continue
+            worker = KlineStreamWorker(symbol, "1m")
+            worker.kline.connect(self._on_position_price_kline)
+            self.position_price_workers[symbol] = worker
+            self._track_mapped_thread(worker, self.position_price_workers, symbol)
+            worker.start()
+
+    def _on_position_price_kline(self, payload: object) -> None:
+        bar = dict(payload)
+        symbol = str(bar.get("symbol", ""))
+        if not symbol or symbol == self.current_symbol:
+            return
+        self._apply_live_position_price(symbol, float(bar["close"]))
+
     def _start_live_stream(self, symbol: str) -> None:
         self._stop_live_stream()
         worker = KlineStreamWorker(symbol, self.current_interval or self.settings.kline_interval)
@@ -2301,6 +2304,7 @@ class AltReversalTraderWindow(QMainWindow):
 
         self.history_cache[symbol] = _merge_live_bar(history, bar)
         self.chart_history_cache[symbol] = _merge_live_bar(chart_history, bar, max_rows=CHART_HISTORY_BAR_LIMIT)
+        self._apply_live_position_price(symbol, float(bar["close"]))
         if not bool(bar.get("closed")):
             if self.chart_mode == "Lightweight":
                 self._apply_live_lightweight_bar(symbol, bar)
@@ -2473,6 +2477,94 @@ class AltReversalTraderWindow(QMainWindow):
             countdown = f"{minutes:02d}:{seconds:02d}"
         self._set_lightweight_bar_close_overlay(countdown, latest_price)
 
+    def _position_display_values(self, position: PositionSnapshot) -> Tuple[List[str], float, float]:
+        side = "LONG" if position.amount > 0 else "SHORT"
+        entry_text = f"{position.entry_price:.8f}".rstrip("0").rstrip(".")
+        upnl_value = float(position.unrealized_pnl)
+        return_pct = _position_return_pct(position)
+        return (
+            [
+                position.symbol,
+                side,
+                f"{abs(position.amount):.6f}",
+                entry_text,
+                f"{upnl_value:.2f}",
+                f"{return_pct:+.2f}%",
+            ],
+            upnl_value,
+            return_pct,
+        )
+
+    def _populate_position_row(self, row: int, position: PositionSnapshot) -> None:
+        values, upnl_value, return_pct = self._position_display_values(position)
+        for col, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            item.setData(USER_ROLE, position.symbol)
+            if col in (4, 5):
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+                color_value = upnl_value if col == 4 else return_pct
+                if color_value > 0:
+                    item.setForeground(QBrush(QColor("#17c964")))
+                elif color_value < 0:
+                    item.setForeground(QBrush(QColor("#f31260")))
+            self.positions_table.setItem(row, col, item)
+
+    def _refresh_position_status_label(self) -> None:
+        if self.current_symbol:
+            position = self.current_position_snapshot
+            if position is None:
+                self.position_label.setText("포지션: 없음")
+            else:
+                side = "LONG" if position.amount > 0 else "SHORT"
+                self.position_label.setText(
+                    f"포지션: {side} {abs(position.amount):.6f} @ {position.entry_price:.6f} | "
+                    f"UPnL {position.unrealized_pnl:.2f} | 수익률 {_position_return_pct(position):+.2f}%"
+                )
+        else:
+            self.position_label.setText("포지션: 종목 미선택")
+
+    def _apply_live_position_price(self, symbol: str, mark_price: float) -> None:
+        if mark_price <= 0:
+            return
+        updated_positions: List[PositionSnapshot] = []
+        changed = False
+        for position in self.open_positions:
+            if position.symbol != symbol:
+                updated_positions.append(position)
+                continue
+            updated_positions.append(
+                PositionSnapshot(
+                    symbol=position.symbol,
+                    amount=position.amount,
+                    entry_price=position.entry_price,
+                    mark_price=mark_price,
+                    unrealized_pnl=(mark_price - position.entry_price) * position.amount,
+                    leverage=position.leverage,
+                )
+            )
+            changed = True
+        if not changed:
+            return
+        self.open_positions = updated_positions
+        self._refresh_balance_label_values()
+        if self.current_symbol == symbol:
+            self.current_position_snapshot = self._find_open_position(symbol)
+            self._refresh_position_status_label()
+        if not hasattr(self, "positions_table"):
+            return
+        for row in range(self.positions_table.rowCount()):
+            item = self.positions_table.item(row, 0)
+            if item is None:
+                continue
+            if (item.data(USER_ROLE) or item.text()) != symbol:
+                continue
+            position = next((entry for entry in self.open_positions if entry.symbol == symbol), None)
+            if position is not None:
+                self._populate_position_row(row, position)
+            break
+
     def update_positions_table(self) -> None:
         if not hasattr(self, "positions_table"):
             return
@@ -2482,28 +2574,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.position_close_buttons.clear()
         self.positions_table.setRowCount(len(self.open_positions))
         for row, position in enumerate(self.open_positions):
-            side = "LONG" if position.amount > 0 else "SHORT"
-            entry_text = f"{position.entry_price:.8f}".rstrip("0").rstrip(".")
-            upnl_value = float(position.unrealized_pnl)
-            values = [
-                position.symbol,
-                side,
-                f"{abs(position.amount):.6f}",
-                entry_text,
-                f"{upnl_value:.2f}",
-            ]
-            for col, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                item.setData(USER_ROLE, position.symbol)
-                if col == 4:
-                    font = item.font()
-                    font.setBold(True)
-                    item.setFont(font)
-                    if upnl_value > 0:
-                        item.setForeground(QBrush(QColor("#17c964")))
-                    elif upnl_value < 0:
-                        item.setForeground(QBrush(QColor("#f31260")))
-                self.positions_table.setItem(row, col, item)
+            self._populate_position_row(row, position)
             button = QPushButton("청산")
             button.clicked.connect(lambda _=False, symbol=position.symbol: self.close_position_for_symbol(symbol))
             button.setText("청산")
@@ -2525,7 +2596,7 @@ class AltReversalTraderWindow(QMainWindow):
             action_layout.addWidget(auto_button)
             action_layout.addStretch(1)
 
-            self.positions_table.setCellWidget(row, 5, action_widget)
+            self.positions_table.setCellWidget(row, 6, action_widget)
             self.position_close_buttons.append(button)
             self.position_action_widgets.append(action_widget)
         self._set_position_close_buttons_enabled(self.order_worker is None or not self.order_worker.isRunning())
@@ -2792,6 +2863,9 @@ class AltReversalTraderWindow(QMainWindow):
         self._stop_live_backtest_worker()
         self._stop_load_worker()
         self.current_symbol = symbol
+        self.current_position_snapshot = self._find_open_position(symbol)
+        self._refresh_position_status_label()
+        self._refresh_position_price_streams()
         self._refresh_auto_close_monitors()
         optimization = self.optimized_results.get(symbol)
         target_interval = self._active_interval_for_symbol(symbol)
@@ -2949,7 +3023,6 @@ class AltReversalTraderWindow(QMainWindow):
         self.equity_line.set(equity_df)
         range_start, range_end = self._default_chart_time_range(candle_df)
         latest_time = pd.Timestamp(candle_df["time"].iloc[-1]) if not candle_df.empty else None
-        signal_events = _confirmed_signal_events(indicators)
 
         markers = []
         for trade in trades:
@@ -2972,16 +3045,6 @@ class AltReversalTraderWindow(QMainWindow):
                         "text": f"{trade.return_pct:+.1f}%",
                     }
                 )
-        for event in signal_events:
-            markers.append(
-                {
-                    "time": event["time"],
-                    "position": "below" if event["side"] == "bull" else "above",
-                    "shape": "square",
-                    "color": event["color"],
-                    "text": str(event["text"]),
-                }
-            )
         if markers:
             self.chart.marker_list(markers)
         if reset_view:
@@ -3105,7 +3168,6 @@ class AltReversalTraderWindow(QMainWindow):
             )
 
         latest_time = pd.Timestamp(candle_df["time"].iloc[-1]) if not candle_df.empty else None
-        signal_events = _confirmed_signal_events(indicators)
         plotted_trades = [trade for trade in trades if not _is_provisional_exit_trade(trade, latest_time)]
         long_entries = [trade for trade in trades if trade.side == "long"]
         short_entries = [trade for trade in trades if trade.side == "short"]
@@ -3149,46 +3211,6 @@ class AltReversalTraderWindow(QMainWindow):
                     text=[f"{trade.return_pct:+.1f}%" for trade in plotted_trades],
                     textposition="middle right",
                     marker={"symbol": "x", "size": 9, "color": "#f801e8"},
-                ),
-                row=1,
-                col=1,
-                secondary_y=False,
-            )
-        bull_signals = [event for event in signal_events if event["side"] == "bull"]
-        bear_signals = [event for event in signal_events if event["side"] == "bear"]
-        if bull_signals:
-            fig.add_trace(
-                go.Scatter(
-                    x=[event["time"] for event in bull_signals],
-                    y=[event["price"] for event in bull_signals],
-                    mode="markers+text",
-                    name="Bull Confirmed",
-                    text=[event["text"] for event in bull_signals],
-                    textposition="bottom center",
-                    marker={
-                        "symbol": "square",
-                        "size": 8,
-                        "color": [event["color"] for event in bull_signals],
-                    },
-                ),
-                row=1,
-                col=1,
-                secondary_y=False,
-            )
-        if bear_signals:
-            fig.add_trace(
-                go.Scatter(
-                    x=[event["time"] for event in bear_signals],
-                    y=[event["price"] for event in bear_signals],
-                    mode="markers+text",
-                    name="Bear Confirmed",
-                    text=[event["text"] for event in bear_signals],
-                    textposition="top center",
-                    marker={
-                        "symbol": "square",
-                        "size": 8,
-                        "color": [event["color"] for event in bear_signals],
-                    },
                 ),
                 row=1,
                 col=1,
@@ -3375,12 +3397,28 @@ class AltReversalTraderWindow(QMainWindow):
         )
         self.balance_label.setText(self._balance_label_html(body))
 
+    def _live_total_unrealized_pnl(self) -> float:
+        return float(sum(float(position.unrealized_pnl) for position in self.open_positions))
+
+    def _refresh_balance_label_values(self) -> None:
+        snapshot = self.account_balance_snapshot
+        if snapshot is None:
+            return
+        live_unrealized = self._live_total_unrealized_pnl()
+        unrealized_delta = live_unrealized - float(snapshot.unrealized_pnl)
+        self._set_balance_label_values(
+            float(snapshot.equity) + unrealized_delta,
+            float(snapshot.available_balance) + unrealized_delta,
+        )
+
     def refresh_account_info(self) -> None:
         self._sync_settings()
         if not self.settings.api_key or not self.settings.api_secret:
             self._stop_account_worker()
             self.open_positions = []
             self.current_position_snapshot = None
+            self.account_balance_snapshot = None
+            self._refresh_position_price_streams()
             self._set_balance_label_status("API 미입력")
             self.position_label.setText("포지션: API 미입력")
             self._refresh_auto_close_monitors()
@@ -3414,8 +3452,14 @@ class AltReversalTraderWindow(QMainWindow):
         balance = result["balance"]
         position = result["position"]
         self.open_positions = list(result.get("positions", []))
-        self.current_position_snapshot = position if (self.current_symbol and requested_symbol == self.current_symbol) else None
-        self._set_balance_label_values(balance.equity, balance.available_balance)
+        if self.current_symbol and requested_symbol == self.current_symbol:
+            self.current_position_snapshot = position
+        elif self.current_symbol:
+            self.current_position_snapshot = self._find_open_position(self.current_symbol)
+        else:
+            self.current_position_snapshot = None
+        self.account_balance_snapshot = balance
+        self._refresh_balance_label_values()
         if self.current_symbol and requested_symbol == self.current_symbol:
             if position is None:
                 self.position_label.setText("포지션: 없음")
@@ -3427,6 +3471,8 @@ class AltReversalTraderWindow(QMainWindow):
                 )
         else:
             self.position_label.setText("포지션: 종목 미선택")
+        self._refresh_position_status_label()
+        self._refresh_position_price_streams()
         self._refresh_auto_close_monitors()
         self.update_positions_table()
         if self.current_backtest and self.current_symbol:
@@ -3443,6 +3489,8 @@ class AltReversalTraderWindow(QMainWindow):
     def _on_account_info_failed(self, message: str) -> None:
         self.open_positions = []
         self.current_position_snapshot = None
+        self.account_balance_snapshot = None
+        self._refresh_position_price_streams()
         self._set_balance_label_status("조회 실패")
         self.position_label.setText("포지션: 조회 실패")
         self.update_positions_table()
@@ -3590,6 +3638,8 @@ class AltReversalTraderWindow(QMainWindow):
             self._stop_account_worker()
             self._stop_order_worker()
             self._stop_live_stream()
+            for symbol in list(self.position_price_workers):
+                self._stop_position_price_worker(symbol)
             self._stop_all_auto_close_monitors()
             self._drain_tracked_threads()
             self.save_settings()
