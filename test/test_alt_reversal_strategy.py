@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from alt_reversal_trader.config import DEFAULT_OPTIMIZE_FLAGS, StrategySettings
 from alt_reversal_trader.binance_futures import BinanceFuturesClient, resample_ohlcv
 from alt_reversal_trader.optimizer import generate_parameter_grid, optimize_symbol_intervals
-from alt_reversal_trader.strategy import run_backtest, run_backtest_metrics
+from alt_reversal_trader.strategy import resume_backtest, run_backtest, run_backtest_metrics
 
 
 def make_sample_ohlcv(rows: int = 500) -> pd.DataFrame:
@@ -130,6 +130,22 @@ def test_backtest_metrics_match_full_result() -> None:
     full = run_backtest(df, settings=StrategySettings(), backtest_start_time=start_time)
     metrics_only = run_backtest_metrics(df, settings=StrategySettings(), backtest_start_time=start_time)
     assert metrics_only == full.metrics
+
+
+def test_resume_backtest_matches_full_rebuild() -> None:
+    df = make_sample_ohlcv(960)
+    start_time = df["time"].iloc[240]
+    partial = df.iloc[:720].reset_index(drop=True)
+    extended = df.iloc[:780].reset_index(drop=True)
+    initial = run_backtest(partial, settings=StrategySettings(), backtest_start_time=start_time)
+    resumed = resume_backtest(extended, initial, settings=StrategySettings(), backtest_start_time=start_time)
+    full = run_backtest(extended, settings=StrategySettings(), backtest_start_time=start_time)
+    assert resumed.metrics == full.metrics
+    assert resumed.latest_state == full.latest_state
+    assert resumed.trades == full.trades
+    assert resumed.cursor == full.cursor
+    pd.testing.assert_frame_equal(resumed.indicators.reset_index(drop=True), full.indicators.reset_index(drop=True))
+    pd.testing.assert_series_equal(resumed.equity_curve, full.equity_curve)
 
 
 def test_resample_ohlcv_to_2m() -> None:

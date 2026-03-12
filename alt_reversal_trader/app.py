@@ -37,9 +37,7 @@ from .qt_compat import (
     VERTICAL,
     WEB_ATTR_FILE_URLS,
     QApplication,
-    QBrush,
     QCheckBox,
-    QColor,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
@@ -73,6 +71,7 @@ from .strategy import (
     compute_indicators,
     estimate_warmup_bars,
     prepare_ohlcv,
+    resume_backtest,
     run_backtest,
 )
 
@@ -90,6 +89,8 @@ PLOTLY_LIVE_RENDER_INTERVAL_MS = 350
 OPTIMIZED_TABLE_REFRESH_MS = 250
 HISTORY_CACHE_SYMBOL_LIMIT = 10
 RECENT_SYMBOL_CACHE_LIMIT = 8
+FULL_HISTORY_REFRESH_COOLDOWN_SECONDS = 300.0
+PERFORMANCE_LOG_THRESHOLD_MS = 100.0
 
 
 def _interval_to_ms(interval: str) -> int:
@@ -289,6 +290,14 @@ def _backtest_matches_history(backtest: Optional[BacktestResult], history: Optio
     if backtest is None or history is None or history.empty or backtest.indicators.empty:
         return False
     return pd.Timestamp(backtest.indicators["time"].iloc[-1]) == pd.Timestamp(history["time"].iloc[-1])
+
+
+def _history_can_resume_backtest(backtest: Optional[BacktestResult], history: Optional[pd.DataFrame]) -> bool:
+    if backtest is None or history is None or history.empty or backtest.indicators.empty or backtest.cursor is None:
+        return False
+    history_times = pd.to_datetime(history["time"])
+    backtest_last_time = pd.Timestamp(backtest.indicators["time"].iloc[-1])
+    return bool((history_times == backtest_last_time).any()) and pd.Timestamp(history_times.iloc[-1]) > backtest_last_time
 
 
 def _is_provisional_exit_trade(trade, latest_time: Optional[pd.Timestamp]) -> bool:
@@ -683,6 +692,7 @@ class SymbolLoadWorker(QThread):
         history: Optional[pd.DataFrame],
         chart_history: Optional[pd.DataFrame],
         existing_backtest: Optional[BacktestResult],
+        history_last_refresh_at: Optional[float],
     ) -> None:
         super().__init__()
         self.request_id = request_id
@@ -692,12 +702,14 @@ class SymbolLoadWorker(QThread):
         self.history = history
         self.chart_history = chart_history
         self.existing_backtest = existing_backtest
+        self.history_last_refresh_at = history_last_refresh_at
 
     def run(self) -> None:
         try:
             client = BinanceFuturesClient()
             history = self.history
             history_updated = False
+            refreshed_at = float(self.history_last_refresh_at or 0.0)
             if history is None:
                 history = client.historical_ohlcv(
                     self.symbol,
@@ -705,14 +717,31 @@ class SymbolLoadWorker(QThread):
                     start_time=_history_fetch_start_time_ms(self.settings, self.interval),
                 )
                 history_updated = True
+                refreshed_at = time.time()
             else:
-                history, history_updated = _refresh_cached_ohlcv(
-                    client,
-                    self.symbol,
-                    self.interval,
-                    history,
-                    _history_fetch_start_time_ms(self.settings, self.interval),
+                latest_bar_time = pd.Timestamp(history["time"].iloc[-1]) if not history.empty else None
+                latest_bar_stale = (
+                    latest_bar_time is None
+                    or (pd.Timestamp.utcnow().tz_localize(None) - latest_bar_time)
+                    >= pd.Timedelta(milliseconds=_interval_to_ms(self.interval) * 2)
                 )
+                should_refresh = (
+                    latest_bar_stale
+                    or
+                    self.history_last_refresh_at is None
+                    or (time.time() - float(self.history_last_refresh_at)) >= FULL_HISTORY_REFRESH_COOLDOWN_SECONDS
+                )
+                if should_refresh:
+                    history, history_updated = _refresh_cached_ohlcv(
+                        client,
+                        self.symbol,
+                        self.interval,
+                        history,
+                        _history_fetch_start_time_ms(self.settings, self.interval),
+                    )
+                    refreshed_at = time.time()
+                else:
+                    history = prepare_ohlcv(history.copy())
             if history.empty:
                 raise RuntimeError(f"{self.symbol} 히스토리 데이터가 없습니다.")
             history = prepare_ohlcv(history)
@@ -721,15 +750,11 @@ class SymbolLoadWorker(QThread):
 
             chart_history = self.chart_history
             if chart_history is None:
-                initial_chart_bars = _initial_chart_bar_limit(self.interval)
-                chart_history = history.tail(initial_chart_bars).copy().reset_index(drop=True)
+                chart_history = _slice_recent_ohlcv(history, self.interval, max_bars=CHART_HISTORY_BAR_LIMIT)
             else:
-                chart_history, _ = _refresh_cached_ohlcv(
-                    client,
-                    self.symbol,
-                    self.interval,
+                chart_history = _merge_ohlcv_frames(
                     chart_history,
-                    _history_fetch_start_time_ms(self.settings, self.interval),
+                    _slice_recent_ohlcv(history, self.interval, max_bars=CHART_HISTORY_BAR_LIMIT),
                     max_rows=CHART_HISTORY_BAR_LIMIT,
                 )
             chart_history = prepare_ohlcv(chart_history)
@@ -742,12 +767,23 @@ class SymbolLoadWorker(QThread):
                 and not history_updated
                 and _backtest_matches_history(self.existing_backtest, history)
             )
-            backtest = self.existing_backtest if use_existing_backtest else run_backtest(
-                history,
-                settings=self.settings.strategy,
-                fee_rate=self.settings.fee_rate,
-                backtest_start_time=backtest_start_time,
-            )
+            if use_existing_backtest:
+                backtest = self.existing_backtest
+            elif _history_can_resume_backtest(self.existing_backtest, history):
+                backtest = resume_backtest(
+                    history,
+                    previous_result=self.existing_backtest,
+                    settings=self.settings.strategy,
+                    fee_rate=self.settings.fee_rate,
+                    backtest_start_time=backtest_start_time,
+                )
+            else:
+                backtest = run_backtest(
+                    history,
+                    settings=self.settings.strategy,
+                    fee_rate=self.settings.fee_rate,
+                    backtest_start_time=backtest_start_time,
+                )
             if self.isInterruptionRequested():
                 return
             chart_indicators = _chart_indicators_from_backtest(backtest, chart_history)
@@ -760,6 +796,7 @@ class SymbolLoadWorker(QThread):
                     "chart_history": chart_history,
                     "backtest": backtest,
                     "chart_indicators": chart_indicators,
+                    "history_refreshed_at": refreshed_at,
                 }
             )
         except Exception:
@@ -849,6 +886,7 @@ class LiveBacktestWorker(QThread):
         history: pd.DataFrame,
         chart_history: pd.DataFrame,
         strategy_settings: StrategySettings,
+        existing_backtest: Optional[BacktestResult],
     ) -> None:
         super().__init__()
         self.settings = settings
@@ -856,15 +894,26 @@ class LiveBacktestWorker(QThread):
         self.history = prepare_ohlcv(history.copy())
         self.chart_history = prepare_ohlcv(chart_history.copy())
         self.strategy_settings = strategy_settings
+        self.existing_backtest = existing_backtest
 
     def run(self) -> None:
         try:
-            backtest = run_backtest(
-                self.history,
-                settings=self.strategy_settings,
-                fee_rate=self.settings.fee_rate,
-                backtest_start_time=pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms"),
-            )
+            backtest_start_time = pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms")
+            if _history_can_resume_backtest(self.existing_backtest, self.history):
+                backtest = resume_backtest(
+                    self.history,
+                    previous_result=self.existing_backtest,
+                    settings=self.strategy_settings,
+                    fee_rate=self.settings.fee_rate,
+                    backtest_start_time=backtest_start_time,
+                )
+            else:
+                backtest = run_backtest(
+                    self.history,
+                    settings=self.strategy_settings,
+                    fee_rate=self.settings.fee_rate,
+                    backtest_start_time=backtest_start_time,
+                )
             if self.isInterruptionRequested():
                 return
             chart_indicators = _chart_indicators_from_backtest(backtest, self.chart_history)
@@ -1063,14 +1112,15 @@ class AltReversalTraderWindow(QMainWindow):
         self.public_client = BinanceFuturesClient()
         self.candidates: List[CandidateSymbol] = []
         self.optimized_results: Dict[str, OptimizationResult] = {}
-        self.history_cache: Dict[str, pd.DataFrame] = {}
-        self.chart_history_cache: Dict[str, pd.DataFrame] = {}
+        self.history_cache: Dict[Tuple[str, str], pd.DataFrame] = {}
+        self.chart_history_cache: Dict[Tuple[str, str], pd.DataFrame] = {}
         self.backtest_cache: Dict[Tuple[str, str], BacktestResult] = {}
         self.chart_indicator_cache: Dict[Tuple[str, str], pd.DataFrame] = {}
+        self.history_refresh_times: Dict[Tuple[str, str], float] = {}
         self.price_precision_cache: Dict[str, int] = {}
         self.pending_candidates: List[CandidateSymbol] = []
         self.pending_optimized_results: Dict[str, OptimizationResult] = {}
-        self.pending_history_cache: Dict[str, pd.DataFrame] = {}
+        self.pending_history_cache: Dict[Tuple[str, str], pd.DataFrame] = {}
         self.preserve_lists_during_refresh = False
         self.open_positions: List[PositionSnapshot] = []
         self.current_position_snapshot: Optional[PositionSnapshot] = None
@@ -1100,6 +1150,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.chart_history_load_requested = False
         self.chart_range_bars_before = float("inf")
         self.pending_lightweight_range_shift = 0
+        self.symbol_load_started_at = 0.0
+        self.live_backtest_started_at = 0.0
         self._tracked_threads: set[QThread] = set()
         self.auto_close_enabled_symbols: set[str] = set()
         self.auto_close_monitor_histories: Dict[str, pd.DataFrame] = {}
@@ -1135,6 +1187,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.simple_order_buttons: List[QPushButton] = []
         self.position_close_buttons: List[QPushButton] = []
         self.position_action_widgets: List[QWidget] = []
+        self.position_metric_widgets: List[QWidget] = []
         self.price_label_timer = QTimer(self)
 
         self.setWindowTitle("Binance Alt Mean Reversion Trader")
@@ -1868,6 +1921,7 @@ class AltReversalTraderWindow(QMainWindow):
             self._stop_all_auto_close_monitors()
             self.history_cache.clear()
             self.chart_history_cache.clear()
+            self.history_refresh_times.clear()
             self.chart_history_exhausted.clear()
             self.current_chart_indicators = None
             self.price_precision_cache.clear()
@@ -1901,6 +1955,35 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _symbol_interval_key(self, symbol: str, interval: Optional[str] = None) -> Tuple[str, str]:
         return (symbol, interval or self.current_interval or self.settings.kline_interval)
+
+    def _get_history_frame(self, symbol: str, interval: Optional[str] = None) -> Optional[pd.DataFrame]:
+        return self.history_cache.get(self._symbol_interval_key(symbol, interval))
+
+    def _set_history_frame(self, symbol: str, frame: pd.DataFrame, interval: Optional[str] = None) -> None:
+        self.history_cache[self._symbol_interval_key(symbol, interval)] = frame
+
+    def _get_chart_history_frame(self, symbol: str, interval: Optional[str] = None) -> Optional[pd.DataFrame]:
+        return self.chart_history_cache.get(self._symbol_interval_key(symbol, interval))
+
+    def _set_chart_history_frame(self, symbol: str, frame: pd.DataFrame, interval: Optional[str] = None) -> None:
+        self.chart_history_cache[self._symbol_interval_key(symbol, interval)] = frame
+
+    def _get_pending_history_frame(self, symbol: str, interval: Optional[str] = None) -> Optional[pd.DataFrame]:
+        return self.pending_history_cache.get(self._symbol_interval_key(symbol, interval))
+
+    def _set_pending_history_frame(self, symbol: str, frame: pd.DataFrame, interval: Optional[str] = None) -> None:
+        self.pending_history_cache[self._symbol_interval_key(symbol, interval)] = frame
+
+    def _history_last_refresh_at(self, symbol: str, interval: Optional[str] = None) -> Optional[float]:
+        return self.history_refresh_times.get(self._symbol_interval_key(symbol, interval))
+
+    def _mark_history_refreshed(self, symbol: str, refreshed_at: float, interval: Optional[str] = None) -> None:
+        self.history_refresh_times[self._symbol_interval_key(symbol, interval)] = float(refreshed_at)
+
+    def _log_perf(self, label: str, started_at: float) -> None:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        if elapsed_ms >= PERFORMANCE_LOG_THRESHOLD_MS:
+            self.log(f"[perf] {label}: {elapsed_ms:.1f}ms")
 
     def _active_interval_for_symbol(self, symbol: str) -> str:
         optimization = self.optimized_results.get(symbol)
@@ -2038,10 +2121,7 @@ class AltReversalTraderWindow(QMainWindow):
         target_symbol = symbol or self.current_symbol
         if not target_symbol:
             return None
-        frame = self.chart_history_cache.get(target_symbol)
-        if not _frame_matches_interval(frame, self.current_interval or self.settings.kline_interval):
-            return None
-        return frame
+        return self._get_chart_history_frame(target_symbol, self.current_interval or self.settings.kline_interval)
 
     def _build_initial_chart_history(
         self,
@@ -2059,11 +2139,11 @@ class AltReversalTraderWindow(QMainWindow):
     def _sync_chart_indicator_cache(self, symbol: str) -> None:
         if self.current_backtest is None:
             return
-        chart_history = self.chart_history_cache.get(symbol)
+        chart_history = self._get_chart_history_frame(symbol, self.current_interval)
         if chart_history is None or chart_history.empty:
             return
         self.current_chart_indicators = _chart_indicators_from_backtest(self.current_backtest, chart_history)
-        self.chart_indicator_cache[self._symbol_interval_key(symbol)] = self.current_chart_indicators
+        self.chart_indicator_cache[self._symbol_interval_key(symbol, self.current_interval)] = self.current_chart_indicators
 
     def _maybe_request_more_chart_history(self, symbol: Optional[str] = None) -> None:
         target_symbol = symbol or self.current_symbol
@@ -2084,9 +2164,7 @@ class AltReversalTraderWindow(QMainWindow):
         if self.chart_history_exhausted.get(cache_key, False):
             return
         oldest_time = pd.Timestamp(chart_history["time"].iloc[0])
-        cached_history = self.history_cache.get(target_symbol)
-        if not _frame_matches_interval(cached_history, self.current_interval):
-            cached_history = None
+        cached_history = self._get_history_frame(target_symbol, self.current_interval)
         worker = ChartHistoryPageWorker(
             self.settings,
             target_symbol,
@@ -2121,7 +2199,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.chart_history_exhausted[cache_key] = bool(result.get("exhausted", False))
         if symbol != self.current_symbol or interval != self.current_interval:
             return
-        chart_history = self.chart_history_cache.get(symbol)
+        chart_history = self._get_chart_history_frame(symbol, interval)
         chunk = result.get("chunk")
         if chart_history is None or chunk is None:
             return
@@ -2133,7 +2211,7 @@ class AltReversalTraderWindow(QMainWindow):
             return
         merged_chart_history = _merge_ohlcv_frames(chunk_frame, chart_history, max_rows=CHART_HISTORY_BAR_LIMIT)
         self.pending_lightweight_range_shift = max(0, len(merged_chart_history) - len(chart_history))
-        self.chart_history_cache[symbol] = merged_chart_history
+        self._set_chart_history_frame(symbol, merged_chart_history, interval)
         self._sync_chart_indicator_cache(symbol)
         if self.current_backtest is not None and self.current_chart_indicators is not None:
             self.render_chart(symbol, self.current_backtest, reset_view=False, chart_indicators=self.current_chart_indicators)
@@ -2222,14 +2300,14 @@ class AltReversalTraderWindow(QMainWindow):
         ]
         keep_symbols.update(ordered_symbols)
         self.history_cache = {
-            symbol: frame
-            for symbol, frame in self.history_cache.items()
-            if symbol in keep_symbols
+            key: frame
+            for key, frame in self.history_cache.items()
+            if key[0] in keep_symbols
         }
         self.chart_history_cache = {
-            symbol: frame
-            for symbol, frame in self.chart_history_cache.items()
-            if symbol in keep_symbols
+            key: frame
+            for key, frame in self.chart_history_cache.items()
+            if key[0] in keep_symbols
         }
         self.backtest_cache = {
             key: value
@@ -2239,6 +2317,11 @@ class AltReversalTraderWindow(QMainWindow):
         self.chart_indicator_cache = {
             key: value
             for key, value in self.chart_indicator_cache.items()
+            if key[0] in keep_symbols
+        }
+        self.history_refresh_times = {
+            key: value
+            for key, value in self.history_refresh_times.items()
             if key[0] in keep_symbols
         }
         self.chart_history_exhausted = {
@@ -2304,7 +2387,7 @@ class AltReversalTraderWindow(QMainWindow):
         self._stop_auto_close_history_worker(symbol)
         history = self.auto_close_monitor_histories.get(symbol)
         if not _frame_matches_interval(history, interval):
-            history = self.history_cache.get(symbol)
+            history = self._get_history_frame(symbol, interval)
         if not _frame_matches_interval(history, interval):
             history = None
         worker = AutoCloseHistoryWorker(self.settings, symbol, interval, history)
@@ -2670,13 +2753,19 @@ class AltReversalTraderWindow(QMainWindow):
         if not bar or not self.current_symbol:
             return
         symbol = str(bar["symbol"])
-        history = self.history_cache.get(symbol)
-        chart_history = self.chart_history_cache.get(symbol)
+        history = self._get_history_frame(symbol, self.current_interval)
+        chart_history = self._get_chart_history_frame(symbol, self.current_interval)
         if history is None or chart_history is None:
             return
 
-        self.history_cache[symbol] = _merge_live_bar(history, bar)
-        self.chart_history_cache[symbol] = _merge_live_bar(chart_history, bar, max_rows=CHART_HISTORY_BAR_LIMIT)
+        self._set_history_frame(symbol, _merge_live_bar(history, bar), self.current_interval)
+        self._set_chart_history_frame(
+            symbol,
+            _merge_live_bar(chart_history, bar, max_rows=CHART_HISTORY_BAR_LIMIT),
+            self.current_interval,
+        )
+        if bool(bar.get("closed")):
+            self._mark_history_refreshed(symbol, time.time(), self.current_interval)
         self._apply_live_position_price(symbol, float(bar["close"]))
         if not bool(bar.get("closed")):
             if self.chart_mode == "Lightweight":
@@ -2709,8 +2798,8 @@ class AltReversalTraderWindow(QMainWindow):
         if self.live_backtest_worker and self.live_backtest_worker.isRunning():
             self.live_recalc_pending = True
             return
-        history = self.history_cache.get(symbol)
-        chart_history = self.chart_history_cache.get(symbol)
+        history = self._get_history_frame(symbol, self.current_interval)
+        chart_history = self._get_chart_history_frame(symbol, self.current_interval)
         if history is None or chart_history is None:
             return
         worker = LiveBacktestWorker(
@@ -2719,11 +2808,13 @@ class AltReversalTraderWindow(QMainWindow):
             history,
             chart_history,
             self._active_backtest_settings(symbol),
+            self.current_backtest,
         )
         worker.completed.connect(self._on_live_backtest_completed)
         worker.failed.connect(self._on_live_backtest_failed)
         self.live_backtest_worker = worker
         self._track_thread(worker, "live_backtest_worker")
+        self.live_backtest_started_at = time.perf_counter()
         worker.start()
 
     def _on_live_backtest_completed(self, payload: object) -> None:
@@ -2731,16 +2822,19 @@ class AltReversalTraderWindow(QMainWindow):
         symbol = str(result["symbol"])
         if symbol != self.current_symbol:
             return
-        self.history_cache[symbol] = result["history"]
-        self.chart_history_cache[symbol] = result["chart_history"]
+        self._set_history_frame(symbol, result["history"], self.current_interval)
+        self._set_chart_history_frame(symbol, result["chart_history"], self.current_interval)
         self.current_backtest = result["backtest"]
         self.current_chart_indicators = result["chart_indicators"]
-        cache_key = self._symbol_interval_key(symbol)
+        cache_key = self._symbol_interval_key(symbol, self.current_interval)
         self.backtest_cache[cache_key] = self.current_backtest
         self.chart_indicator_cache[cache_key] = self.current_chart_indicators
         self._prune_caches()
         self.render_chart(symbol, self.current_backtest, reset_view=False)
         self.update_summary(symbol, self.current_backtest, self.optimized_results.get(symbol))
+        if self.live_backtest_started_at > 0:
+            self._log_perf(f"{symbol} live backtest", self.live_backtest_started_at)
+            self.live_backtest_started_at = 0.0
         self._evaluate_backtest_auto_close(symbol, self.current_backtest)
         if self.live_recalc_pending:
             self.live_recalc_pending = False
@@ -2748,6 +2842,7 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _on_live_backtest_failed(self, message: str) -> None:
         self.live_recalc_pending = False
+        self.live_backtest_started_at = 0.0
         self.log(message)
 
     def _set_order_buttons_enabled(self, enabled: bool) -> None:
@@ -2787,9 +2882,9 @@ class AltReversalTraderWindow(QMainWindow):
         ):
             self._clear_entry_price_overlay()
             return
-        frame = self.chart_history_cache.get(position.symbol)
+        frame = self._get_chart_history_frame(position.symbol, self.current_interval)
         if frame is None or frame.empty:
-            frame = self.history_cache.get(position.symbol)
+            frame = self._get_history_frame(position.symbol, self.current_interval)
         if frame is None or frame.empty:
             self._clear_entry_price_overlay()
             return
@@ -2818,9 +2913,9 @@ class AltReversalTraderWindow(QMainWindow):
             self._set_lightweight_bar_close_overlay(None, None)
             return
 
-        frame = self.chart_history_cache.get(symbol)
+        frame = self._get_chart_history_frame(symbol, self.current_interval)
         if frame is None or frame.empty:
-            frame = self.history_cache.get(symbol)
+            frame = self._get_history_frame(symbol, self.current_interval)
         if frame is None or frame.empty:
             self.current_price_label.setText("현재가: -")
             self._set_bar_close_countdown_text(None)
@@ -2876,20 +2971,46 @@ class AltReversalTraderWindow(QMainWindow):
             return_pct,
         )
 
+    def _pnl_color(self, value: float) -> str:
+        if value > 0:
+            return "#17c964"
+        if value < 0:
+            return "#f31260"
+        return "#1f2937"
+
+    def _build_position_metric_widget(self, text: str, value: float) -> QLabel:
+        label = QLabel(text)
+        label.setStyleSheet(
+            f"font-weight: 700; color: {self._pnl_color(value)}; padding-left: 4px; padding-right: 4px;"
+        )
+        return label
+
+    def _position_status_html(self, position: PositionSnapshot) -> str:
+        side = "LONG" if position.amount > 0 else "SHORT"
+        upnl_value = float(position.unrealized_pnl)
+        return_pct = _position_return_pct(position)
+        upnl_color = self._pnl_color(upnl_value)
+        return_color = self._pnl_color(return_pct)
+        return (
+            f"<span style='color:#111827;'>포지션: {side} {abs(position.amount):.6f} @ {position.entry_price:.6f} | </span>"
+            f"<span style='font-weight:700; color:{upnl_color};'>UPnL {upnl_value:.2f}</span> | "
+            f"<span style='font-weight:700; color:{return_color};'>수익률 {return_pct:+.2f}%</span>"
+        )
+
     def _populate_position_row(self, row: int, position: PositionSnapshot) -> None:
         values, upnl_value, return_pct = self._position_display_values(position)
         for col, value in enumerate(values):
+            if col in (4, 5):
+                placeholder = QTableWidgetItem(value)
+                placeholder.setData(USER_ROLE, position.symbol)
+                self.positions_table.setItem(row, col, placeholder)
+                metric_value = upnl_value if col == 4 else return_pct
+                widget = self._build_position_metric_widget(value, metric_value)
+                self.positions_table.setCellWidget(row, col, widget)
+                self.position_metric_widgets.append(widget)
+                continue
             item = QTableWidgetItem(value)
             item.setData(USER_ROLE, position.symbol)
-            if col in (4, 5):
-                font = item.font()
-                font.setBold(True)
-                item.setFont(font)
-                color_value = upnl_value if col == 4 else return_pct
-                if color_value > 0:
-                    item.setForeground(QBrush(QColor("#17c964")))
-                elif color_value < 0:
-                    item.setForeground(QBrush(QColor("#f31260")))
             self.positions_table.setItem(row, col, item)
 
     def _refresh_position_status_label(self) -> None:
@@ -2946,9 +3067,22 @@ class AltReversalTraderWindow(QMainWindow):
                 self._populate_position_row(row, position)
             break
 
+    def _refresh_position_status_label(self) -> None:
+        if self.current_symbol:
+            position = self.current_position_snapshot
+            if position is None:
+                self.position_label.setText("포지션: 없음")
+            else:
+                self.position_label.setText(self._position_status_html(position))
+        else:
+            self.position_label.setText("포지션: 종목 미선택")
+
     def update_positions_table(self) -> None:
         if not hasattr(self, "positions_table"):
             return
+        for widget in self.position_metric_widgets:
+            widget.deleteLater()
+        self.position_metric_widgets.clear()
         for widget in self.position_action_widgets:
             widget.deleteLater()
         self.position_action_widgets.clear()
@@ -3069,6 +3203,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.optimized_results.clear()
             self.history_cache.clear()
             self.chart_history_cache.clear()
+            self.history_refresh_times.clear()
             self.backtest_cache.clear()
             self.chart_indicator_cache.clear()
             self.current_symbol = None
@@ -3132,10 +3267,11 @@ class AltReversalTraderWindow(QMainWindow):
         self.chart_indicator_cache[cache_key] = _chart_indicators_from_backtest(optimization.best_backtest)
         if self.preserve_lists_during_refresh:
             self.pending_optimized_results[candidate.symbol] = optimization
-            self.pending_history_cache[candidate.symbol] = history
+            self._set_pending_history_frame(candidate.symbol, history, optimization.best_interval or self.settings.kline_interval)
             return
         self.optimized_results[candidate.symbol] = optimization
-        self.history_cache[candidate.symbol] = history
+        self._set_history_frame(candidate.symbol, history, optimization.best_interval or self.settings.kline_interval)
+        self._mark_history_refreshed(candidate.symbol, time.time(), optimization.best_interval or self.settings.kline_interval)
         self._prune_caches()
         self._schedule_optimized_table_refresh()
         if candidate.symbol in self.auto_close_enabled_symbols:
@@ -3151,6 +3287,9 @@ class AltReversalTraderWindow(QMainWindow):
                 self.optimized_results = dict(self.pending_optimized_results)
                 self._flush_optimized_table()
             self.history_cache.update(self.pending_history_cache)
+            refreshed_at = time.time()
+            for cache_key in self.pending_history_cache:
+                self.history_refresh_times[cache_key] = refreshed_at
             self.pending_candidates = []
             self.pending_optimized_results = {}
             self.pending_history_cache = {}
@@ -3239,6 +3378,8 @@ class AltReversalTraderWindow(QMainWindow):
             self._request_symbol_load(item.data(USER_ROLE) or item.text())
 
     def load_symbol(self, symbol: str) -> None:
+        started_at = time.perf_counter()
+        self.symbol_load_started_at = started_at
         self._sync_settings()
         self._stop_live_stream()
         self._stop_live_backtest_worker()
@@ -3254,19 +3395,15 @@ class AltReversalTraderWindow(QMainWindow):
         target_interval = self._active_interval_for_symbol(symbol)
         cache_key = self._symbol_interval_key(symbol, target_interval)
         self.current_interval = target_interval
-        cached_history = self.history_cache.get(symbol)
-        if not _frame_matches_interval(cached_history, target_interval):
-            cached_history = None
-        cached_chart_history = self.chart_history_cache.get(symbol)
-        if not _frame_matches_interval(cached_chart_history, target_interval):
-            cached_chart_history = None
+        cached_history = self._get_history_frame(symbol, target_interval)
+        cached_chart_history = self._get_chart_history_frame(symbol, target_interval)
         cached_backtest = self.backtest_cache.get(cache_key)
         if cached_backtest is None and optimization is not None and optimization.best_interval == target_interval:
             cached_backtest = optimization.best_backtest
         if cached_chart_history is None:
             cached_chart_history = self._build_initial_chart_history(symbol, target_interval, cached_history, cached_backtest)
             if cached_chart_history is not None and not cached_chart_history.empty:
-                self.chart_history_cache[symbol] = cached_chart_history
+                self._set_chart_history_frame(symbol, cached_chart_history, target_interval)
         cached_chart_indicators = self.chart_indicator_cache.get(cache_key)
         if cached_backtest is not None and cached_chart_history is not None:
             cached_chart_indicators = _chart_indicators_from_backtest(cached_backtest, cached_chart_history)
@@ -3274,7 +3411,7 @@ class AltReversalTraderWindow(QMainWindow):
             cached_chart_indicators = _chart_indicators_from_backtest(cached_backtest, cached_chart_history)
         self.current_backtest = cached_backtest
         self.current_chart_indicators = cached_chart_indicators
-        worker_backtest = cached_backtest if _backtest_matches_history(cached_backtest, cached_history) else None
+        worker_backtest = cached_backtest
         self.load_request_id += 1
         self.load_request_reset_view[self.load_request_id] = cached_backtest is None
         self.chart_range_bars_before = float("inf")
@@ -3289,11 +3426,13 @@ class AltReversalTraderWindow(QMainWindow):
             cached_history,
             cached_chart_history,
             worker_backtest,
+            self._history_last_refresh_at(symbol, target_interval),
         )
         worker.loaded.connect(self._on_symbol_loaded)
         worker.failed.connect(self._on_symbol_load_failed)
         self.load_worker = worker
         self._track_thread(worker, "load_worker")
+        self._log_perf(f"{symbol} click setup", started_at)
         self.statusBar().showMessage(f"{symbol} 로드 중...", 3000)
         worker.start()
 
@@ -3306,14 +3445,21 @@ class AltReversalTraderWindow(QMainWindow):
             return
         reset_view = self.load_request_reset_view.pop(request_id, True)
         self.current_interval = str(result.get("interval", self.current_interval))
-        self.history_cache[symbol] = result["history"]
-        existing_chart_history = self.chart_history_cache.get(symbol)
+        self._set_history_frame(symbol, result["history"], self.current_interval)
+        refreshed_at = result.get("history_refreshed_at")
+        if refreshed_at is not None:
+            self._mark_history_refreshed(symbol, float(refreshed_at), self.current_interval)
+        existing_chart_history = self._get_chart_history_frame(symbol, self.current_interval)
         loaded_chart_history = result["chart_history"]
-        if _frame_matches_interval(existing_chart_history, self.current_interval):
+        if existing_chart_history is not None:
             loaded_chart_history = _merge_ohlcv_frames(existing_chart_history, loaded_chart_history, max_rows=CHART_HISTORY_BAR_LIMIT)
-        self.chart_history_cache[symbol] = loaded_chart_history
+        self._set_chart_history_frame(symbol, loaded_chart_history, self.current_interval)
         self.current_backtest = result["backtest"]
-        self.current_chart_indicators = _chart_indicators_from_backtest(self.current_backtest, loaded_chart_history)
+        loaded_chart_indicators = result.get("chart_indicators")
+        if existing_chart_history is None and isinstance(loaded_chart_indicators, pd.DataFrame):
+            self.current_chart_indicators = loaded_chart_indicators
+        else:
+            self.current_chart_indicators = _chart_indicators_from_backtest(self.current_backtest, loaded_chart_history)
         cache_key = self._symbol_interval_key(symbol, self.current_interval)
         self.backtest_cache[cache_key] = self.current_backtest
         self.chart_indicator_cache[cache_key] = self.current_chart_indicators
@@ -3321,6 +3467,9 @@ class AltReversalTraderWindow(QMainWindow):
         optimization = self.optimized_results.get(symbol)
         self.render_chart(symbol, self.current_backtest, reset_view=reset_view, chart_indicators=self.current_chart_indicators)
         self.update_summary(symbol, self.current_backtest, optimization)
+        if self.symbol_load_started_at > 0:
+            self._log_perf(f"{symbol} symbol load ready", self.symbol_load_started_at)
+            self.symbol_load_started_at = 0.0
         self._refresh_auto_close_monitors()
         self._evaluate_backtest_auto_close(symbol, self.current_backtest)
         self.refresh_account_info()
@@ -3328,6 +3477,7 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _on_symbol_load_failed(self, message: str) -> None:
         self.load_request_reset_view.pop(self.load_request_id, None)
+        self.symbol_load_started_at = 0.0
         self.show_error(message)
 
     def render_chart(
@@ -3340,7 +3490,7 @@ class AltReversalTraderWindow(QMainWindow):
         if chart_indicators is None and symbol == self.current_symbol and self.current_chart_indicators is not None:
             chart_indicators = self.current_chart_indicators
         if chart_indicators is None:
-            chart_history = self.chart_history_cache.get(symbol)
+            chart_history = self._get_chart_history_frame(symbol, self.current_interval)
             chart_indicators = _chart_indicators_from_backtest(result, chart_history)
         indicators = chart_indicators.sort_values("time").drop_duplicates(subset=["time"]).reset_index(drop=True)
         candle_df = indicators[["time", "open", "high", "low", "close", "volume"]].copy()

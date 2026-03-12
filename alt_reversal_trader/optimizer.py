@@ -22,6 +22,19 @@ class OptimizationResult:
 
 
 PARAMETER_SPEC_BY_KEY = {spec.key: spec for spec in PARAMETER_SPECS}
+OPTIMIZATION_RESULT_CACHE: Dict[Tuple[object, ...], OptimizationResult] = {}
+
+
+def _history_signature(df: pd.DataFrame) -> Tuple[object, ...]:
+    if df.empty or "time" not in df.columns:
+        return (None, 0)
+    last = df.iloc[-1]
+    values: List[object] = [pd.Timestamp(last["time"]), int(len(df))]
+    for column in ("open", "high", "low", "close", "volume"):
+        if column not in df.columns:
+            continue
+        values.append(float(last[column]))
+    return tuple(values)
 
 
 def optimize_symbol_process_entry(
@@ -257,6 +270,21 @@ def optimize_symbol(
     started = time.perf_counter()
     grid, trimmed = generate_parameter_grid(base_settings, optimize_flags, span_pct, steps, max_combinations)
     prepared_df = prepare_ohlcv(df)
+    cache_key = (
+        symbol,
+        result_interval or "",
+        _history_signature(prepared_df),
+        base_settings,
+        tuple(sorted(optimize_flags.items())),
+        float(span_pct),
+        int(steps),
+        int(max_combinations),
+        float(fee_rate),
+        pd.Timestamp(backtest_start_time) if backtest_start_time is not None else None,
+    )
+    cached_result = OPTIMIZATION_RESULT_CACHE.get(cache_key)
+    if cached_result is not None:
+        return replace(cached_result, duration_seconds=0.0)
     indicator_cache: Dict[tuple[object, ...], object] = {}
     best_metrics: StrategyMetrics | None = None
     best_settings: StrategySettings | None = None
@@ -308,7 +336,7 @@ def optimize_symbol(
         indicator_cache=indicator_cache,
     )
 
-    return OptimizationResult(
+    result = OptimizationResult(
         symbol=symbol,
         best_interval=result_interval or "",
         best_backtest=best_result,
@@ -316,6 +344,8 @@ def optimize_symbol(
         duration_seconds=time.perf_counter() - started,
         trimmed_grid=trimmed,
     )
+    OPTIMIZATION_RESULT_CACHE[cache_key] = result
+    return result
 
 
 def optimize_symbol_intervals(

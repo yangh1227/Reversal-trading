@@ -89,6 +89,28 @@ class StrategyMetrics:
 
 
 @dataclass(frozen=True)
+class BacktestCursor:
+    processed_bars: int
+    last_time: pd.Timestamp
+    equity: float
+    position_qty: float
+    avg_entry_price: float
+    entry_side: str
+    entry_time: pd.Timestamp
+    entry_price: float
+    zone_events: Tuple[str, ...]
+    gross_profit: float
+    gross_loss: float
+    trade_count: int
+    win_count: int
+    long_zone_used: Tuple[bool, bool, bool]
+    short_zone_used: Tuple[bool, bool, bool]
+    last_long_zone: int
+    last_short_zone: int
+    last_equity_value: float
+
+
+@dataclass(frozen=True)
 class BacktestResult:
     settings: StrategySettings
     metrics: StrategyMetrics
@@ -96,6 +118,8 @@ class BacktestResult:
     indicators: pd.DataFrame
     latest_state: Dict[str, object]
     equity_curve: pd.Series
+    cursor: Optional[BacktestCursor] = None
+    history_signature: Tuple[object, ...] = ()
 
 
 def compact_indicator_frame(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
@@ -103,6 +127,28 @@ def compact_indicator_frame(df: pd.DataFrame, columns: List[str]) -> pd.DataFram
     if not selected:
         return df.tail(1).copy()
     return df.loc[:, selected].copy()
+
+
+def _indicator_history_signature(df: pd.DataFrame) -> Tuple[object, ...]:
+    if df.empty or "time" not in df.columns:
+        return (None, 0)
+    last = df.iloc[-1]
+    values: List[object] = [pd.Timestamp(last["time"]), int(len(df))]
+    for column in ("open", "high", "low", "close", "volume"):
+        if column not in df.columns:
+            continue
+        value = last[column]
+        values.append(None if pd.isna(value) else float(value))
+    return tuple(values)
+
+
+def _strip_provisional_trade(trades: List[TradeRecord], cursor: Optional[BacktestCursor]) -> List[TradeRecord]:
+    if not trades or cursor is None:
+        return list(trades)
+    last_trade = trades[-1]
+    if last_trade.reason == "end_of_test" and pd.Timestamp(last_trade.exit_time) == pd.Timestamp(cursor.last_time):
+        return list(trades[:-1])
+    return list(trades)
 
 
 def _ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
@@ -564,7 +610,10 @@ def _run_backtest_core(
     starting_equity: float,
     backtest_start_time: Optional[pd.Timestamp | str],
     include_details: bool,
-) -> Tuple[StrategyMetrics, List[TradeRecord], pd.Series, pd.DataFrame, Dict[str, object]]:
+    resume_cursor: Optional[BacktestCursor] = None,
+    existing_trades: Optional[List[TradeRecord]] = None,
+    existing_equity_curve: Optional[pd.Series] = None,
+) -> Tuple[StrategyMetrics, List[TradeRecord], pd.Series, pd.DataFrame, Dict[str, object], Optional[BacktestCursor]]:
     latest = indicators.iloc[-1]
     active_indicators, result_indicators = _select_active_indicators(indicators, backtest_start_time)
 
@@ -579,25 +628,44 @@ def _run_backtest_core(
     final_bull_values = active_indicators["final_bull"].to_numpy(dtype=bool, copy=False)
     final_bear_values = active_indicators["final_bear"].to_numpy(dtype=bool, copy=False)
 
-    equity = float(starting_equity)
-    position_qty = 0.0
-    avg_entry_price = 0.0
-    entry_side = ""
-    entry_time = pd.Timestamp(result_indicators["time"].iloc[0])
-    entry_price = 0.0
-    zone_events: List[str] = []
-    trades: List[TradeRecord] = []
+    start_index = min(max(int(resume_cursor.processed_bars), 0), active_count) if resume_cursor is not None else 0
+    if resume_cursor is None:
+        equity = float(starting_equity)
+        position_qty = 0.0
+        avg_entry_price = 0.0
+        entry_side = ""
+        entry_time = pd.Timestamp(result_indicators["time"].iloc[0])
+        entry_price = 0.0
+        zone_events: List[str] = []
+        trades: List[TradeRecord] = []
+        gross_profit = 0.0
+        gross_loss = 0.0
+        trade_count = 0
+        win_count = 0
+        long_zone_used = [False, False, False]
+        short_zone_used = [False, False, False]
+        last_long_zone = 0
+        last_short_zone = 0
+    else:
+        equity = float(resume_cursor.equity)
+        position_qty = float(resume_cursor.position_qty)
+        avg_entry_price = float(resume_cursor.avg_entry_price)
+        entry_side = str(resume_cursor.entry_side)
+        entry_time = pd.Timestamp(resume_cursor.entry_time)
+        entry_price = float(resume_cursor.entry_price)
+        zone_events = list(resume_cursor.zone_events)
+        trades = list(existing_trades or [])
+        gross_profit = float(resume_cursor.gross_profit)
+        gross_loss = float(resume_cursor.gross_loss)
+        trade_count = int(resume_cursor.trade_count)
+        win_count = int(resume_cursor.win_count)
+        long_zone_used = list(resume_cursor.long_zone_used)
+        short_zone_used = list(resume_cursor.short_zone_used)
+        last_long_zone = int(resume_cursor.last_long_zone)
+        last_short_zone = int(resume_cursor.last_short_zone)
     equity_curve_values = np.empty(active_count, dtype=float) if active_count else np.empty(0, dtype=float)
-
-    gross_profit = 0.0
-    gross_loss = 0.0
-    trade_count = 0
-    win_count = 0
-
-    long_zone_used = [False, False, False]
-    short_zone_used = [False, False, False]
-    last_long_zone = 0
-    last_short_zone = 0
+    if start_index > 0 and existing_equity_curve is not None and len(existing_equity_curve) >= start_index:
+        equity_curve_values[:start_index] = existing_equity_curve.iloc[:start_index].to_numpy(dtype=float, copy=False)
     def reset_zones() -> None:
         nonlocal last_long_zone, last_short_zone
         long_zone_used[:] = [False, False, False]
@@ -681,7 +749,7 @@ def _run_backtest_core(
         entry_price = 0.0
         reset_zones()
 
-    for index in range(active_count):
+    for index in range(start_index, active_count):
         current_price = close_values[index]
         current_time = pd.Timestamp(time_values[index])
 
@@ -724,6 +792,34 @@ def _run_backtest_core(
         unrealized = position_qty * (current_price - avg_entry_price) if abs(position_qty) > 1e-12 else 0.0
         equity_curve_values[index] = equity + unrealized
 
+    cursor: Optional[BacktestCursor] = None
+    if active_count:
+        last_equity_value = (
+            float(resume_cursor.last_equity_value)
+            if resume_cursor is not None and start_index >= active_count
+            else float(equity_curve_values[active_count - 1])
+        )
+        cursor = BacktestCursor(
+            processed_bars=active_count,
+            last_time=pd.Timestamp(time_values[active_count - 1]),
+            equity=float(equity),
+            position_qty=float(position_qty),
+            avg_entry_price=float(avg_entry_price),
+            entry_side=str(entry_side),
+            entry_time=pd.Timestamp(entry_time),
+            entry_price=float(entry_price),
+            zone_events=tuple(zone_events),
+            gross_profit=float(gross_profit),
+            gross_loss=float(gross_loss),
+            trade_count=int(trade_count),
+            win_count=int(win_count),
+            long_zone_used=tuple(bool(flag) for flag in long_zone_used),
+            short_zone_used=tuple(bool(flag) for flag in short_zone_used),
+            last_long_zone=int(last_long_zone),
+            last_short_zone=int(last_short_zone),
+            last_equity_value=last_equity_value,
+        )
+
     if abs(position_qty) > 1e-12 and active_count:
         close_position(close_values[-1], pd.Timestamp(time_values[-1]), "end_of_test")
         equity_curve_values[-1] = equity
@@ -761,7 +857,7 @@ def _run_backtest_core(
     )
     latest_state = _build_latest_state(latest) if include_details else {}
     indicator_frame = compact_indicator_frame(result_indicators, RESULT_INDICATOR_COLUMNS) if include_details else result_indicators.tail(1)
-    return metrics, trades, curve, indicator_frame, latest_state
+    return metrics, trades, curve, indicator_frame, latest_state, cursor
 
 
 def run_backtest_metrics(
@@ -773,7 +869,7 @@ def run_backtest_metrics(
     indicator_cache: Optional[Dict[Tuple[object, ...], object]] = None,
 ) -> StrategyMetrics:
     indicators = compute_indicators(df, settings, cache=indicator_cache)
-    metrics, _, _, _, _ = _run_backtest_core(
+    metrics, _, _, _, _, _ = _run_backtest_core(
         indicators,
         settings=settings,
         fee_rate=fee_rate,
@@ -793,7 +889,7 @@ def run_backtest(
     indicator_cache: Optional[Dict[Tuple[object, ...], object]] = None,
 ) -> BacktestResult:
     indicators = compute_indicators(df, settings, cache=indicator_cache)
-    metrics, trades, curve, result_indicators, latest_state = _run_backtest_core(
+    metrics, trades, curve, result_indicators, latest_state, cursor = _run_backtest_core(
         indicators,
         settings=settings,
         fee_rate=fee_rate,
@@ -808,4 +904,81 @@ def run_backtest(
         indicators=result_indicators,
         latest_state=latest_state,
         equity_curve=curve,
+        cursor=cursor,
+        history_signature=_indicator_history_signature(result_indicators),
+    )
+
+
+def resume_backtest(
+    df: pd.DataFrame,
+    previous_result: Optional[BacktestResult],
+    settings: StrategySettings,
+    fee_rate: float = 0.0004,
+    starting_equity: float = 1_000.0,
+    backtest_start_time: Optional[pd.Timestamp | str] = None,
+    indicator_cache: Optional[Dict[Tuple[object, ...], object]] = None,
+) -> BacktestResult:
+    if previous_result is None or previous_result.cursor is None or previous_result.settings != settings:
+        return run_backtest(
+            df,
+            settings=settings,
+            fee_rate=fee_rate,
+            starting_equity=starting_equity,
+            backtest_start_time=backtest_start_time,
+            indicator_cache=indicator_cache,
+        )
+
+    indicators = compute_indicators(df, settings, cache=indicator_cache)
+    active_indicators, _ = _select_active_indicators(indicators, backtest_start_time)
+    previous_indicators = previous_result.indicators.sort_values("time").drop_duplicates(subset=["time"]).reset_index(drop=True)
+    if previous_indicators.empty or len(active_indicators) <= len(previous_indicators):
+        return run_backtest(
+            df,
+            settings=settings,
+            fee_rate=fee_rate,
+            starting_equity=starting_equity,
+            backtest_start_time=backtest_start_time,
+            indicator_cache=indicator_cache,
+        )
+
+    prefix = active_indicators.iloc[: len(previous_indicators)].reset_index(drop=True)
+    compare_columns = [
+        column
+        for column in ("time", "open", "high", "low", "close", "volume", "final_bull", "final_bear", "trend_to_long", "trend_to_short")
+        if column in previous_indicators.columns and column in prefix.columns
+    ]
+    if not previous_indicators.loc[:, compare_columns].equals(prefix.loc[:, compare_columns]):
+        return run_backtest(
+            df,
+            settings=settings,
+            fee_rate=fee_rate,
+            starting_equity=starting_equity,
+            backtest_start_time=backtest_start_time,
+            indicator_cache=indicator_cache,
+        )
+
+    existing_curve = previous_result.equity_curve.copy()
+    if not existing_curve.empty:
+        existing_curve = existing_curve.iloc[: len(previous_indicators)].copy()
+        existing_curve.iloc[-1] = previous_result.cursor.last_equity_value
+    metrics, trades, curve, result_indicators, latest_state, cursor = _run_backtest_core(
+        indicators,
+        settings=settings,
+        fee_rate=fee_rate,
+        starting_equity=starting_equity,
+        backtest_start_time=backtest_start_time,
+        include_details=True,
+        resume_cursor=previous_result.cursor,
+        existing_trades=_strip_provisional_trade(previous_result.trades, previous_result.cursor),
+        existing_equity_curve=existing_curve,
+    )
+    return BacktestResult(
+        settings=settings,
+        metrics=metrics,
+        trades=trades,
+        indicators=result_indicators,
+        latest_state=latest_state,
+        equity_curve=curve,
+        cursor=cursor,
+        history_signature=_indicator_history_signature(result_indicators),
     )
