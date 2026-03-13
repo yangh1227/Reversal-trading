@@ -46,6 +46,7 @@ from .qt_compat import (
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
+    QGraphicsOpacityEffect,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -62,6 +63,7 @@ from .qt_compat import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QPropertyAnimation,
     QThread,
     QTimer,
     QUrl,
@@ -1544,6 +1546,9 @@ class AltReversalTraderWindow(QMainWindow):
         self.plotly_chart_path = Path("alt_reversal_trader_plotly_chart.html").resolve()
         self.plotly_js_path = self.plotly_chart_path.with_name("plotly.min.js")
         self.chart_mode = ""
+        self.chart_transition_overlay: Optional[QWidget] = None
+        self.chart_transition_effect: Optional[QGraphicsOpacityEffect] = None
+        self.chart_transition_animation: Optional[QPropertyAnimation] = None
         self.chart = None
         self.chart_view = None
         self.equity_subchart = None
@@ -1664,6 +1669,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.chart_host = QWidget()
         self.chart_host_layout = QVBoxLayout(self.chart_host)
         self.chart_host_layout.setContentsMargins(0, 0, 0, 0)
+        self._init_chart_transition_overlay()
         right_layout.addWidget(self.chart_host, 8)
         right_layout.addWidget(balance_panel)
 
@@ -2039,6 +2045,65 @@ class AltReversalTraderWindow(QMainWindow):
     def _init_chart(self) -> None:
         self._rebuild_chart_engine(force=True)
 
+    def _init_chart_transition_overlay(self) -> None:
+        if not hasattr(self, "chart_host"):
+            return
+        overlay = QWidget(self.chart_host)
+        overlay.hide()
+        overlay.setStyleSheet("background-color: rgba(8, 11, 16, 185); border-radius: 6px;")
+        effect = QGraphicsOpacityEffect(overlay)
+        effect.setOpacity(0.0)
+        overlay.setGraphicsEffect(effect)
+        animation = QPropertyAnimation(effect, b"opacity", self)
+        animation.setDuration(120)
+        animation.finished.connect(self._on_chart_transition_animation_finished)
+        self.chart_transition_overlay = overlay
+        self.chart_transition_effect = effect
+        self.chart_transition_animation = animation
+        self._sync_chart_transition_overlay()
+
+    def _sync_chart_transition_overlay(self) -> None:
+        overlay = self.chart_transition_overlay
+        if overlay is None or not hasattr(self, "chart_host"):
+            return
+        overlay.setGeometry(self.chart_host.rect())
+        overlay.raise_()
+
+    def _on_chart_transition_animation_finished(self) -> None:
+        overlay = self.chart_transition_overlay
+        effect = self.chart_transition_effect
+        if overlay is None or effect is None:
+            return
+        if effect.opacity() <= 0.01:
+            overlay.hide()
+
+    def _show_chart_transition_overlay(self) -> None:
+        overlay = self.chart_transition_overlay
+        effect = self.chart_transition_effect
+        animation = self.chart_transition_animation
+        if overlay is None or effect is None or animation is None:
+            return
+        self._sync_chart_transition_overlay()
+        animation.stop()
+        overlay.show()
+        overlay.raise_()
+        animation.setDuration(120)
+        animation.setStartValue(float(effect.opacity()))
+        animation.setEndValue(1.0)
+        animation.start()
+
+    def _hide_chart_transition_overlay(self) -> None:
+        overlay = self.chart_transition_overlay
+        effect = self.chart_transition_effect
+        animation = self.chart_transition_animation
+        if overlay is None or effect is None or animation is None or not overlay.isVisible():
+            return
+        animation.stop()
+        animation.setDuration(90)
+        animation.setStartValue(float(effect.opacity()))
+        animation.setEndValue(0.0)
+        animation.start()
+
     def _clear_chart_host(self) -> None:
         while self.chart_host_layout.count():
             item = self.chart_host_layout.takeAt(0)
@@ -2070,6 +2135,7 @@ class AltReversalTraderWindow(QMainWindow):
         else:
             self._init_plotly_chart()
         self.chart_mode = engine
+        self._sync_chart_transition_overlay()
         if self.current_symbol and self.current_backtest:
             self.render_chart(self.current_symbol, self.current_backtest)
 
@@ -4506,6 +4572,7 @@ class AltReversalTraderWindow(QMainWindow):
         started_at = time.perf_counter()
         self.symbol_load_started_at = started_at
         self._sync_settings()
+        self._show_chart_transition_overlay()
         self._stop_live_stream()
         self._stop_live_backtest_worker()
         self._stop_load_worker()
@@ -4629,6 +4696,7 @@ class AltReversalTraderWindow(QMainWindow):
             self._update_entry_price_overlay()
             self._refresh_live_labels()
             self._refresh_live_preview_markers(symbol)
+            QTimer.singleShot(70, self._hide_chart_transition_overlay)
         self._log_perf(f"{symbol} worker apply", apply_started_at)
         if self.symbol_load_started_at > 0:
             self._log_perf(f"{symbol} symbol load ready", self.symbol_load_started_at)
@@ -4646,6 +4714,7 @@ class AltReversalTraderWindow(QMainWindow):
     def _on_symbol_load_failed(self, message: str) -> None:
         self.load_request_reset_view.pop(self.load_request_id, None)
         self.symbol_load_started_at = 0.0
+        self._hide_chart_transition_overlay()
         self.show_error(message)
 
     def render_chart(
@@ -4685,6 +4754,7 @@ class AltReversalTraderWindow(QMainWindow):
         self._update_entry_price_overlay()
         self._refresh_live_labels()
         self._refresh_live_preview_markers(symbol)
+        QTimer.singleShot(70, self._hide_chart_transition_overlay)
 
     def _render_plotly_chart(
         self,
@@ -4745,6 +4815,7 @@ class AltReversalTraderWindow(QMainWindow):
             )
         else:
             QTimer.singleShot(140, lambda s=symbol: self._restore_lightweight_range(s))
+        QTimer.singleShot(90, self._hide_chart_transition_overlay)
 
     def _sync_lightweight_range(self, symbol: str, start_time: pd.Timestamp, end_time: pd.Timestamp) -> None:
         if symbol != self.current_symbol or self.chart is None or self.equity_subchart is None:
@@ -5490,6 +5561,10 @@ class AltReversalTraderWindow(QMainWindow):
 
     def show_error(self, message: str) -> None:
         QMessageBox.critical(self, "Error", message)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        self._sync_chart_transition_overlay()
+        super().resizeEvent(event)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         try:

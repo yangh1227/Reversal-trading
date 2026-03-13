@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 try:
-    from PyQt5.QtCore import QEvent, Qt, QThread, QTimer, QUrl, pyqtSignal as Signal
+    from PyQt5.QtCore import QEvent, QPropertyAnimation, Qt, QThread, QTimer, QUrl, pyqtSignal as Signal
     from PyQt5.QtGui import QBrush, QColor
     from PyQt5.QtWebEngineWidgets import QWebEngineSettings, QWebEngineView
     from PyQt5.QtWidgets import (
@@ -12,6 +12,7 @@ try:
         QDoubleSpinBox as _QDoubleSpinBox,
         QFormLayout,
         QGridLayout,
+        QGraphicsOpacityEffect,
         QGroupBox,
         QHBoxLayout,
         QHeaderView,
@@ -52,7 +53,7 @@ try:
     KEY_DOWN = Qt.Key_Down
 
 except ImportError:
-    from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, QUrl, pyqtSignal as Signal
+    from PyQt6.QtCore import QEvent, QPropertyAnimation, Qt, QThread, QTimer, QUrl, pyqtSignal as Signal
     from PyQt6.QtGui import QBrush, QColor
     from PyQt6.QtWebEngineCore import QWebEngineSettings
     from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -64,6 +65,7 @@ except ImportError:
         QDoubleSpinBox as _QDoubleSpinBox,
         QFormLayout,
         QGridLayout,
+        QGraphicsOpacityEffect,
         QGroupBox,
         QHBoxLayout,
         QHeaderView,
@@ -143,6 +145,7 @@ __all__ = [
     "QComboBox",
     "QDoubleSpinBox",
     "QFormLayout",
+    "QGraphicsOpacityEffect",
     "QGridLayout",
     "QGroupBox",
     "QHBoxLayout",
@@ -153,6 +156,7 @@ __all__ = [
     "QMessageBox",
     "QPlainTextEdit",
     "QProgressBar",
+    "QPropertyAnimation",
     "QPushButton",
     "QRadioButton",
     "QScrollArea",
