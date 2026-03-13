@@ -2926,6 +2926,16 @@ class AltReversalTraderWindow(QMainWindow):
         start_time = max(start_floor, latest_time - pd.Timedelta(hours=DEFAULT_CHART_LOOKBACK_HOURS))
         return start_time, end_time
 
+    def _default_lightweight_logical_range(self, candle_df: pd.DataFrame) -> tuple[float, float]:
+        interval_ms = _interval_to_ms(self.current_interval or self.settings.kline_interval)
+        visible_bars = max(1, int((DEFAULT_CHART_LOOKBACK_HOURS * 3_600_000) // interval_ms))
+        if candle_df.empty:
+            return 0.0, float(DEFAULT_CHART_RIGHT_PAD_BARS)
+        bar_count = len(candle_df)
+        start_value = float(max(0, bar_count - visible_bars))
+        end_value = float(max(0, bar_count - 1) + DEFAULT_CHART_RIGHT_PAD_BARS)
+        return start_value, end_value
+
     def _chart_cache_key(self, symbol: Optional[str] = None, interval: Optional[str] = None) -> Tuple[str, str]:
         return (symbol or self.current_symbol or "", interval or self.current_interval or self.settings.kline_interval)
 
@@ -4871,23 +4881,33 @@ class AltReversalTraderWindow(QMainWindow):
         self.ema_fast_line.set(indicators[["time", "ema_fast"]].rename(columns={"ema_fast": "EMA Fast"}))
         self.ema_slow_line.set(indicators[["time", "ema_slow"]].rename(columns={"ema_slow": "EMA Slow"}))
         self.equity_line.set(equity_df)
-        range_start, range_end = self._default_chart_time_range(candle_df)
+        range_from, range_to = self._default_lightweight_logical_range(candle_df)
         self._render_lightweight_markers(markers)
         if reset_view:
             QTimer.singleShot(
                 140,
-                lambda s=symbol, st=range_start, et=range_end: self._sync_lightweight_range(s, st, et),
+                lambda s=symbol, rf=range_from, rt=range_to: self._sync_lightweight_range(s, rf, rt),
             )
         else:
             QTimer.singleShot(140, lambda s=symbol: self._restore_lightweight_range(s))
         QTimer.singleShot(90, self._hide_chart_transition_overlay)
 
-    def _sync_lightweight_range(self, symbol: str, start_time: pd.Timestamp, end_time: pd.Timestamp) -> None:
+    def _sync_lightweight_range(self, symbol: str, range_from: float, range_to: float) -> None:
         if symbol != self.current_symbol or self.chart is None or self.equity_subchart is None:
             return
         try:
-            self.chart.set_visible_range(start_time, end_time)
-            self.equity_subchart.set_visible_range(start_time, end_time)
+            self.chart.run_script(
+                f"""
+                {self.equity_subchart.id}.chart.timeScale().setVisibleLogicalRange({{
+                    from: {float(range_from)},
+                    to: {float(range_to)}
+                }});
+                {self.chart.id}.chart.timeScale().setVisibleLogicalRange({{
+                    from: {float(range_from)},
+                    to: {float(range_to)}
+                }});
+                """
+            )
         except Exception:
             self.chart.fit()
             self.equity_subchart.fit()
