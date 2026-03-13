@@ -239,6 +239,8 @@ class SeriesCommon(Pane):
         series = self._series_datetime_format(series, exclude_lowercase=self.name)
         if self.name in series.index:
             series.rename({self.name: 'value'}, inplace=True)
+        if self._last_bar is not None and series['time'] < self._last_bar['time']:
+            return
         if self._last_bar is not None and series['time'] != self._last_bar['time']:
             self.data.loc[self.data.index[-1]] = self._last_bar
             self.data = pd.concat([self.data, series.to_frame().T], ignore_index=True)
@@ -586,6 +588,8 @@ class Candlestick(SeriesCommon):
         :param series: labels: date/time, open, high, low, close, volume (if using volume).
         """
         series = self._series_datetime_format(series) if not _from_tick else series
+        if self._last_bar is not None and series['time'] < self._last_bar['time']:
+            return
         if series['time'] != self._last_bar['time']:
             self.candle_data.loc[self.candle_data.index[-1]] = self._last_bar
             self.candle_data = pd.concat([self.candle_data, series.to_frame().T], ignore_index=True)

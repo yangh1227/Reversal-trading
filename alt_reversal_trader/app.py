@@ -397,6 +397,12 @@ def _history_frame_signature(frame: Optional[pd.DataFrame]) -> Tuple[object, ...
     return tuple(values)
 
 
+def _frame_last_time(frame: Optional[pd.DataFrame]) -> Optional[pd.Timestamp]:
+    if frame is None or frame.empty or "time" not in frame.columns:
+        return None
+    return pd.Timestamp(frame["time"].iloc[-1])
+
+
 def _history_can_resume_backtest(backtest: Optional[BacktestResult], history: Optional[pd.DataFrame]) -> bool:
     if backtest is None or history is None or history.empty or backtest.indicators.empty or backtest.cursor is None:
         return False
@@ -2532,6 +2538,21 @@ class AltReversalTraderWindow(QMainWindow):
     def _eligible_auto_trade_results(self) -> List[OptimizationResult]:
         return list(self._ordered_optimized_results())
 
+    def _latest_auto_trade_backtest(self, result: OptimizationResult) -> BacktestResult:
+        interval = result.best_interval or self.settings.kline_interval
+        target_settings = result.best_backtest.settings
+        if (
+            self.current_symbol == result.symbol
+            and self.current_interval == interval
+            and self.current_backtest is not None
+            and self.current_backtest.settings == target_settings
+        ):
+            return self.current_backtest
+        cached_backtest = self.backtest_cache.get(self._symbol_interval_key(result.symbol, interval))
+        if cached_backtest is not None and cached_backtest.settings == target_settings:
+            return cached_backtest
+        return result.best_backtest
+
     def _pick_auto_trade_candidate(self, candidates: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
         if not candidates:
             return None
@@ -2586,7 +2607,8 @@ class AltReversalTraderWindow(QMainWindow):
             return
         candidates: List[Dict[str, object]] = []
         for result in eligible_results:
-            signal = _auto_trade_signal_from_backtest(result.best_backtest)
+            latest_backtest = self._latest_auto_trade_backtest(result)
+            signal = _auto_trade_signal_from_backtest(latest_backtest)
             if signal is None:
                 continue
             ticker = ticker_map.get(result.symbol)
@@ -2604,7 +2626,7 @@ class AltReversalTraderWindow(QMainWindow):
                     "interval": result.best_interval or self.settings.kline_interval,
                     "side": "BUY" if side == "long" else "SELL",
                     "score": float(result.score),
-                    "return_pct": float(result.best_backtest.metrics.total_return_pct),
+                    "return_pct": float(latest_backtest.metrics.total_return_pct),
                     "fraction": float(signal["fraction"]),
                     "signal_price": signal_price,
                     "current_price": current_price,
@@ -3853,8 +3875,17 @@ class AltReversalTraderWindow(QMainWindow):
         previous_chart_indicators = self.current_chart_indicators
         history = result["history"]
         chart_history = result["chart_history"]
-        self._set_history_frame(symbol, history, self.current_interval)
-        self._set_chart_history_frame(symbol, chart_history, self.current_interval)
+        existing_history = self._get_history_frame(symbol, self.current_interval)
+        existing_chart_history = self._get_chart_history_frame(symbol, self.current_interval)
+        merged_history = _merge_ohlcv_frames(history, existing_history)
+        merged_chart_history = _merge_ohlcv_frames(chart_history, existing_chart_history, max_rows=CHART_HISTORY_BAR_LIMIT)
+        has_newer_live_bar = False
+        worker_chart_last_time = _frame_last_time(chart_history)
+        merged_chart_last_time = _frame_last_time(merged_chart_history)
+        if worker_chart_last_time is not None and merged_chart_last_time is not None:
+            has_newer_live_bar = merged_chart_last_time > worker_chart_last_time
+        self._set_history_frame(symbol, merged_history, self.current_interval)
+        self._set_chart_history_frame(symbol, merged_chart_history, self.current_interval)
         self.current_backtest = result["backtest"]
         self.current_chart_indicators = result["chart_indicators"]
         self.current_lightweight_fast_exit_markers = []
@@ -3870,9 +3901,16 @@ class AltReversalTraderWindow(QMainWindow):
             self.current_backtest,
             self.current_chart_indicators,
             chart_history,
+            skip_candle_update=has_newer_live_bar,
         )
         if not applied_incrementally:
-            self.render_chart(symbol, self.current_backtest, reset_view=False, chart_indicators=self.current_chart_indicators)
+            if has_newer_live_bar:
+                self._render_lightweight_markers(self._trade_markers(self.current_backtest.trades, worker_chart_last_time))
+                self._update_entry_price_overlay()
+                self._refresh_live_labels()
+                self._refresh_live_preview_markers(symbol)
+            else:
+                self.render_chart(symbol, self.current_backtest, reset_view=False, chart_indicators=self.current_chart_indicators)
         self._log_perf(f"{symbol} live chart apply", apply_started_at)
         self.update_summary(symbol, self.current_backtest, self._optimization_result(symbol, self.current_interval))
         if self.live_backtest_started_at > 0:
@@ -4863,6 +4901,7 @@ class AltReversalTraderWindow(QMainWindow):
         new_backtest: BacktestResult,
         new_indicators: Optional[pd.DataFrame],
         chart_history: pd.DataFrame,
+        skip_candle_update: bool = False,
     ) -> bool:
         if (
             symbol != self.current_symbol
@@ -4888,8 +4927,9 @@ class AltReversalTraderWindow(QMainWindow):
         if not appended_bar and not same_range:
             return False
         try:
-            latest_bar = chart_history[["time", "open", "high", "low", "close", "volume"]].iloc[-1].copy()
-            self.chart.update(latest_bar)
+            if not skip_candle_update:
+                latest_bar = chart_history[["time", "open", "high", "low", "close", "volume"]].iloc[-1].copy()
+                self.chart.update(latest_bar)
             latest_indicator = new_frame.iloc[-1]
             latest_time = pd.Timestamp(latest_indicator["time"])
             self._update_lightweight_line_point(self.supertrend_line, "Supertrend", latest_time, latest_indicator.get("supertrend"))
