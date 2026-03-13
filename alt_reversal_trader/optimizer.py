@@ -408,32 +408,27 @@ def optimize_symbol_intervals(
     backtest_start_time: pd.Timestamp | str | None = None,
     should_stop: Optional[Callable[[], bool]] = None,
 ) -> Tuple[OptimizationResult, pd.DataFrame]:
+    started = time.perf_counter()
+    interval_results = optimize_symbol_interval_results(
+        symbol=symbol,
+        histories_by_interval=histories_by_interval,
+        base_settings=base_settings,
+        optimize_flags=optimize_flags,
+        interval_candidates=interval_candidates,
+        span_pct=span_pct,
+        steps=steps,
+        max_combinations=max_combinations,
+        fee_rate=fee_rate,
+        rank_mode=rank_mode,
+        backtest_start_time=backtest_start_time,
+        should_stop=should_stop,
+    )
     best_result: Optional[OptimizationResult] = None
     best_history: Optional[pd.DataFrame] = None
     total_combinations = 0
     trimmed_any = False
-    started = time.perf_counter()
 
-    for interval in interval_candidates:
-        if should_stop and should_stop():
-            break
-        history = histories_by_interval.get(interval)
-        if history is None or history.empty:
-            continue
-        current = optimize_symbol(
-            symbol=symbol,
-            df=history,
-            base_settings=base_settings,
-            optimize_flags=optimize_flags,
-            span_pct=span_pct,
-            steps=steps,
-            max_combinations=max_combinations,
-            fee_rate=fee_rate,
-            rank_mode=rank_mode,
-            backtest_start_time=backtest_start_time,
-            should_stop=should_stop,
-            result_interval=interval,
-        )
+    for current, history in interval_results:
         total_combinations += current.combinations_tested
         trimmed_any = trimmed_any or current.trimmed_grid
         if best_result is None:
@@ -463,3 +458,51 @@ def optimize_symbol_intervals(
         ),
         best_history,
     )
+
+
+def optimize_symbol_interval_results(
+    symbol: str,
+    histories_by_interval: Dict[str, pd.DataFrame],
+    base_settings: StrategySettings,
+    optimize_flags: Dict[str, bool],
+    interval_candidates: List[str],
+    span_pct: float,
+    steps: int,
+    max_combinations: int,
+    fee_rate: float,
+    rank_mode: str = "score",
+    backtest_start_time: pd.Timestamp | str | None = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> List[Tuple[OptimizationResult, pd.DataFrame]]:
+    interval_results: List[Tuple[OptimizationResult, pd.DataFrame]] = []
+
+    for interval in interval_candidates:
+        if should_stop and should_stop():
+            break
+        history = histories_by_interval.get(interval)
+        if history is None or history.empty:
+            continue
+        current = optimize_symbol(
+            symbol=symbol,
+            df=history,
+            base_settings=base_settings,
+            optimize_flags=optimize_flags,
+            span_pct=span_pct,
+            steps=steps,
+            max_combinations=max_combinations,
+            fee_rate=fee_rate,
+            rank_mode=rank_mode,
+            backtest_start_time=backtest_start_time,
+            should_stop=should_stop,
+            result_interval=interval,
+        )
+        interval_results.append((current, history))
+
+    if not interval_results:
+        raise RuntimeError(f"optimization cancelled for {symbol}" if should_stop and should_stop() else f"no optimization result for {symbol}")
+
+    interval_results.sort(
+        key=lambda item: optimization_sort_key(item[0].best_backtest.metrics, rank_mode),
+        reverse=True,
+    )
+    return interval_results

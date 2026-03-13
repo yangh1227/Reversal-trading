@@ -27,7 +27,7 @@ from .binance_futures import (
 )
 from .config import APP_INTERVAL_OPTIONS, CHART_ENGINE_OPTIONS, PARAMETER_SPECS, AppSettings, StrategySettings
 from .crash_logger import log_runtime_event
-from .optimizer import OptimizationResult, optimization_sort_key, optimize_symbol_intervals
+from .optimizer import OptimizationResult, optimization_sort_key, optimize_symbol_interval_results
 from .qt_compat import (
     HORIZONTAL,
     NO_EDIT_TRIGGERS,
@@ -69,6 +69,7 @@ from .strategy import (
     CHART_INDICATOR_COLUMNS,
     BacktestResult,
     compact_indicator_frame,
+    evaluate_latest_state,
     estimate_warmup_bars,
     prepare_ohlcv,
     resume_backtest,
@@ -659,7 +660,7 @@ class OptimizeWorker(QThread):
             if not histories:
                 self.progress.emit(f"{candidate.symbol}: 히스토리 없음")
                 continue
-            optimization, best_history = optimize_symbol_intervals(
+            interval_results = optimize_symbol_interval_results(
                 symbol=candidate.symbol,
                 histories_by_interval=histories,
                 base_settings=self.settings.strategy,
@@ -675,11 +676,14 @@ class OptimizeWorker(QThread):
             )
             if self.isInterruptionRequested():
                 return
-            self.result_ready.emit({"candidate": candidate, "optimization": optimization, "history": best_history})
-            self.progress.emit(
-                f"{candidate.symbol} [{optimization.best_interval}]: {optimization.combinations_tested}개 조합 완료, "
-                f"총점 {optimization.score:.1f} | 수익률 {optimization.best_backtest.metrics.total_return_pct:.2f}%"
-            )
+            for optimization, history in interval_results:
+                if self.isInterruptionRequested():
+                    return
+                self.result_ready.emit({"candidate": candidate, "optimization": optimization, "history": history})
+                self.progress.emit(
+                    f"{candidate.symbol} [{optimization.best_interval}]: {optimization.combinations_tested}개 조합 완료, "
+                    f"총점 {optimization.score:.1f} | 수익률 {optimization.best_backtest.metrics.total_return_pct:.2f}%"
+                )
 
     def _run_parallel(self, process_count: int) -> None:
         client = BinanceFuturesClient()
@@ -690,7 +694,7 @@ class OptimizeWorker(QThread):
             interval="1m" if "2m" in interval_candidates else self.settings.kline_interval,
         )
         pending_candidates = deque(self.candidates)
-        active_jobs: List[tuple[CandidateSymbol, pd.DataFrame, object]] = []
+        active_jobs: List[tuple[CandidateSymbol, object]] = []
         submitted = 0
         completed = 0
         pool = mp.get_context("spawn").Pool(processes=process_count, maxtasksperchild=8)
@@ -722,11 +726,11 @@ class OptimizeWorker(QThread):
                 self.progress.emit(f"{candidate.symbol}: 히스토리 없음")
                 return False
             job = pool.apply_async(
-                optimize_symbol_intervals,
-                kwds={
-                    "symbol": candidate.symbol,
-                    "histories_by_interval": histories,
-                    "base_settings": self.settings.strategy,
+                    optimize_symbol_interval_results,
+                    kwds={
+                        "symbol": candidate.symbol,
+                        "histories_by_interval": histories,
+                        "base_settings": self.settings.strategy,
                     "optimize_flags": self.settings.optimize_flags,
                     "interval_candidates": interval_candidates,
                     "span_pct": self.settings.optimization_span_pct,
@@ -734,11 +738,10 @@ class OptimizeWorker(QThread):
                     "max_combinations": self.settings.max_grid_combinations,
                     "fee_rate": self.settings.fee_rate,
                     "rank_mode": self.settings.optimization_rank_mode,
-                    "backtest_start_time": backtest_start_time,
-                },
-            )
-            default_history = histories.get(interval_candidates[0], next(iter(histories.values())))
-            active_jobs.append((candidate, default_history, job))
+                        "backtest_start_time": backtest_start_time,
+                    },
+                )
+            active_jobs.append((candidate, job))
             self.progress.emit(f"{candidate.symbol}: 프로세스 최적화 시작 ({len(active_jobs)}/{process_count})")
             return True
 
@@ -755,21 +758,22 @@ class OptimizeWorker(QThread):
                 if self.isInterruptionRequested():
                     terminate_pool()
                     return
-                remaining_jobs: List[tuple[CandidateSymbol, pd.DataFrame, object]] = []
+                remaining_jobs: List[tuple[CandidateSymbol, object]] = []
                 completed_any = False
-                for candidate, df, job in active_jobs:
+                for candidate, job in active_jobs:
                     if not job.ready():
-                        remaining_jobs.append((candidate, df, job))
+                        remaining_jobs.append((candidate, job))
                         continue
-                    optimization, best_history = job.get()
+                    interval_results = job.get()
                     completed_any = True
                     completed += 1
-                    self.result_ready.emit({"candidate": candidate, "optimization": optimization, "history": best_history})
-                    self.progress.emit(
-                        f"[{completed}/{len(self.candidates)}] {candidate.symbol} [{optimization.best_interval}]: "
-                        f"{optimization.combinations_tested}개 조합 완료, "
-                        f"총점 {optimization.score:.1f} | 수익률 {optimization.best_backtest.metrics.total_return_pct:.2f}%"
-                    )
+                    for optimization, history in interval_results:
+                        self.result_ready.emit({"candidate": candidate, "optimization": optimization, "history": history})
+                        self.progress.emit(
+                            f"[{completed}/{len(self.candidates)}] {candidate.symbol} [{optimization.best_interval}]: "
+                            f"{optimization.combinations_tested}개 조합 완료, "
+                            f"총점 {optimization.score:.1f} | 수익률 {optimization.best_backtest.metrics.total_return_pct:.2f}%"
+                        )
                 active_jobs = remaining_jobs
 
                 while len(active_jobs) < process_count and pending_candidates:
@@ -1291,7 +1295,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.settings = AppSettings.load()
         self.public_client = BinanceFuturesClient()
         self.candidates: List[CandidateSymbol] = []
-        self.optimized_results: Dict[str, OptimizationResult] = {}
+        self.optimized_results: Dict[Tuple[str, str], OptimizationResult] = {}
         self.history_cache: Dict[Tuple[str, str], pd.DataFrame] = {}
         self.chart_history_cache: Dict[Tuple[str, str], pd.DataFrame] = {}
         self.backtest_cache: Dict[Tuple[str, str], BacktestResult] = {}
@@ -1299,7 +1303,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.history_refresh_times: Dict[Tuple[str, str], float] = {}
         self.price_precision_cache: Dict[str, int] = {}
         self.pending_candidates: List[CandidateSymbol] = []
-        self.pending_optimized_results: Dict[str, OptimizationResult] = {}
+        self.pending_optimized_results: Dict[Tuple[str, str], OptimizationResult] = {}
         self.pending_history_cache: Dict[Tuple[str, str], pd.DataFrame] = {}
         self.preserve_lists_during_refresh = False
         self.open_positions: List[PositionSnapshot] = []
@@ -2219,6 +2223,23 @@ class AltReversalTraderWindow(QMainWindow):
     def _symbol_interval_key(self, symbol: str, interval: Optional[str] = None) -> Tuple[str, str]:
         return (symbol, interval or self.current_interval or self.settings.kline_interval)
 
+    def _optimization_results_for_symbol(self, symbol: str) -> List[OptimizationResult]:
+        return [
+            result
+            for (result_symbol, _interval), result in self.optimized_results.items()
+            if result_symbol == symbol
+        ]
+
+    def _optimization_result(self, symbol: str, interval: Optional[str] = None) -> Optional[OptimizationResult]:
+        normalized_interval = str(interval or "").strip()
+        if normalized_interval in APP_INTERVAL_OPTIONS:
+            return self.optimized_results.get((symbol, normalized_interval))
+        candidates = self._optimization_results_for_symbol(symbol)
+        if not candidates:
+            return None
+        rank_mode = self.settings.optimization_rank_mode
+        return max(candidates, key=lambda result: optimization_sort_key(result.best_backtest.metrics, rank_mode))
+
     def _get_history_frame(self, symbol: str, interval: Optional[str] = None) -> Optional[pd.DataFrame]:
         return self.history_cache.get(self._symbol_interval_key(symbol, interval))
 
@@ -2280,7 +2301,7 @@ class AltReversalTraderWindow(QMainWindow):
         for symbol in sorted(open_symbols):
             if self.settings.position_intervals.get(symbol) in APP_INTERVAL_OPTIONS:
                 continue
-            optimization = self.optimized_results.get(symbol)
+            optimization = self._optimization_result(symbol)
             interval = (optimization.best_interval or self.settings.kline_interval) if optimization else self.settings.kline_interval
             if interval not in APP_INTERVAL_OPTIONS:
                 continue
@@ -2293,7 +2314,7 @@ class AltReversalTraderWindow(QMainWindow):
         remembered = self.settings.position_intervals.get(symbol)
         if remembered in APP_INTERVAL_OPTIONS and self._find_open_position(symbol) is not None:
             return remembered
-        optimization = self.optimized_results.get(symbol)
+        optimization = self._optimization_result(symbol)
         return (optimization.best_interval or self.settings.kline_interval) if optimization else self.settings.kline_interval
 
     def _position_symbol_text(self, symbol: str) -> str:
@@ -2728,7 +2749,7 @@ class AltReversalTraderWindow(QMainWindow):
         )
 
     def _active_backtest_settings(self, symbol: str) -> StrategySettings:
-        optimization = self.optimized_results.get(symbol)
+        optimization = self._optimization_result(symbol, self._active_interval_for_symbol(symbol))
         return optimization.best_backtest.settings if optimization else self.settings.strategy
 
     def _track_thread(self, worker: QThread, attr_name: str) -> None:
@@ -2762,12 +2783,7 @@ class AltReversalTraderWindow(QMainWindow):
             result.symbol
             for result in sorted(
                 self.optimized_results.values(),
-                key=lambda item: (
-                    item.score,
-                    item.best_backtest.metrics.total_return_pct,
-                    item.best_backtest.metrics.win_rate_pct,
-                    -item.best_backtest.metrics.max_drawdown_pct,
-                ),
+                key=lambda item: optimization_sort_key(item.best_backtest.metrics, self.settings.optimization_rank_mode),
                 reverse=True,
             )[:HISTORY_CACHE_SYMBOL_LIMIT]
         ]
@@ -3339,7 +3355,7 @@ class AltReversalTraderWindow(QMainWindow):
         if not applied_incrementally:
             self.render_chart(symbol, self.current_backtest, reset_view=False, chart_indicators=self.current_chart_indicators)
         self._log_perf(f"{symbol} live chart apply", apply_started_at)
-        self.update_summary(symbol, self.current_backtest, self.optimized_results.get(symbol))
+        self.update_summary(symbol, self.current_backtest, self._optimization_result(symbol, self.current_interval))
         if self.live_backtest_started_at > 0:
             self._log_perf(f"{symbol} live backtest", self.live_backtest_started_at)
             self.live_backtest_started_at = 0.0
@@ -3663,9 +3679,10 @@ class AltReversalTraderWindow(QMainWindow):
         self.optimized_table.setRowCount(len(ordered))
         for row, result in enumerate(ordered):
             metrics = result.best_backtest.metrics
+            result_interval = result.best_interval or self.settings.kline_interval
             values = [
                 result.symbol,
-                result.best_interval or self.settings.kline_interval,
+                result_interval,
                 f"{result.score:.1f}",
                 f"{metrics.total_return_pct:.2f}",
                 f"{metrics.max_drawdown_pct:.2f}",
@@ -3676,7 +3693,7 @@ class AltReversalTraderWindow(QMainWindow):
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                item.setData(USER_ROLE, result.symbol)
+                item.setData(USER_ROLE, (result.symbol, result_interval))
                 self.optimized_table.setItem(row, col, item)
         self.optimized_table.setUpdatesEnabled(True)
 
@@ -3784,10 +3801,10 @@ class AltReversalTraderWindow(QMainWindow):
         self.backtest_cache[cache_key] = optimization.best_backtest
         self.chart_indicator_cache[cache_key] = _chart_indicators_from_backtest(optimization.best_backtest)
         if self.preserve_lists_during_refresh:
-            self.pending_optimized_results[candidate.symbol] = optimization
+            self.pending_optimized_results[cache_key] = optimization
             self._set_pending_history_frame(candidate.symbol, history, optimization.best_interval or self.settings.kline_interval)
             return
-        self.optimized_results[candidate.symbol] = optimization
+        self.optimized_results[cache_key] = optimization
         self._set_history_frame(candidate.symbol, history, optimization.best_interval or self.settings.kline_interval)
         self._mark_history_refreshed(candidate.symbol, time.time(), optimization.best_interval or self.settings.kline_interval)
         self._prune_caches()
@@ -3813,7 +3830,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.pending_history_cache = {}
             self.preserve_lists_during_refresh = False
         self._prune_caches()
-        self.log(f"최적화 완료: {len(self.optimized_results)}개")
+        self.log(f"최적화 완료: {len(self.optimized_results)}개 케이스")
         if not preserved_refresh:
             self._flush_optimized_table()
         if not preserved_refresh and self.optimized_table.rowCount() > 0:
@@ -3846,10 +3863,10 @@ class AltReversalTraderWindow(QMainWindow):
         symbol_item = self.candidate_table.item(row, 0)
         return [symbol_item.text()] if symbol_item else []
 
-    def _request_symbol_load(self, symbol: str) -> None:
+    def _request_symbol_load(self, symbol: str, interval: Optional[str] = None) -> None:
         if not symbol:
             return
-        target_interval = self._active_interval_for_symbol(symbol)
+        target_interval = interval if interval in APP_INTERVAL_OPTIONS else self._active_interval_for_symbol(symbol)
         if (
             symbol == self.current_symbol
             and target_interval == self.current_interval
@@ -3862,39 +3879,62 @@ class AltReversalTraderWindow(QMainWindow):
                 chart_indicators=self.current_chart_indicators,
             )
             return
-        self.load_symbol(symbol)
+        self.load_symbol(symbol, target_interval)
+
+    def _item_symbol_interval(self, item: Optional[QTableWidgetItem]) -> Tuple[Optional[str], Optional[str]]:
+        if item is None:
+            return None, None
+        payload = item.data(USER_ROLE)
+        if isinstance(payload, (tuple, list)) and len(payload) >= 2:
+            symbol = str(payload[0] or "").strip()
+            interval = str(payload[1] or "").strip()
+            return (symbol or None, interval if interval in APP_INTERVAL_OPTIONS else None)
+        symbol = str(payload or item.text() or "").strip()
+        return (symbol or None, None)
 
     def on_candidate_selection_changed(self) -> None:
         selected = self.candidate_table.selectedItems()
         if selected:
-            self._request_symbol_load(selected[0].data(USER_ROLE) or selected[0].text())
+            symbol, interval = self._item_symbol_interval(selected[0])
+            if symbol:
+                self._request_symbol_load(symbol, interval)
 
     def on_candidate_cell_clicked(self, row: int, _column: int) -> None:
         item = self.candidate_table.item(row, 0)
         if item:
-            self._request_symbol_load(item.data(USER_ROLE) or item.text())
+            symbol, interval = self._item_symbol_interval(item)
+            if symbol:
+                self._request_symbol_load(symbol, interval)
 
     def on_optimized_selection_changed(self) -> None:
         selected = self.optimized_table.selectedItems()
         if selected:
-            self._request_symbol_load(selected[0].data(USER_ROLE) or selected[0].text())
+            symbol, interval = self._item_symbol_interval(selected[0])
+            if symbol:
+                self._request_symbol_load(symbol, interval)
 
     def on_optimized_cell_clicked(self, row: int, _column: int) -> None:
         item = self.optimized_table.item(row, 0)
         if item:
-            self._request_symbol_load(item.data(USER_ROLE) or item.text())
+            symbol, interval = self._item_symbol_interval(item)
+            if symbol:
+                self._request_symbol_load(symbol, interval)
 
     def on_positions_selection_changed(self) -> None:
         selected = self.positions_table.selectedItems()
         if selected:
-            self._request_symbol_load(selected[0].data(USER_ROLE) or selected[0].text())
+            symbol, interval = self._item_symbol_interval(selected[0])
+            if symbol:
+                self._request_symbol_load(symbol, interval)
 
     def on_positions_cell_clicked(self, row: int, _column: int) -> None:
         item = self.positions_table.item(row, 0)
         if item:
-            self._request_symbol_load(item.data(USER_ROLE) or item.text())
+            symbol, interval = self._item_symbol_interval(item)
+            if symbol:
+                self._request_symbol_load(symbol, interval)
 
-    def load_symbol(self, symbol: str) -> None:
+    def load_symbol(self, symbol: str, target_interval: Optional[str] = None) -> None:
         started_at = time.perf_counter()
         self.symbol_load_started_at = started_at
         self._sync_settings()
@@ -3906,8 +3946,8 @@ class AltReversalTraderWindow(QMainWindow):
         self._remember_recent_symbol(symbol)
         self.current_position_snapshot = self._find_open_position(symbol)
         self._refresh_position_status_label()
-        optimization = self.optimized_results.get(symbol)
-        target_interval = self._active_interval_for_symbol(symbol)
+        target_interval = target_interval if target_interval in APP_INTERVAL_OPTIONS else self._active_interval_for_symbol(symbol)
+        optimization = self._optimization_result(symbol, target_interval)
         cache_key = self._symbol_interval_key(symbol, target_interval)
         self.current_interval = target_interval
         cached_history = self._get_history_frame(symbol, target_interval)
@@ -4265,7 +4305,7 @@ class AltReversalTraderWindow(QMainWindow):
         if symbol != self.current_symbol or request_id != self.load_request_id:
             return
         if update_summary and self.current_backtest is not None:
-            self.update_summary(symbol, self.current_backtest, self.optimized_results.get(symbol))
+            self.update_summary(symbol, self.current_backtest, self._optimization_result(symbol, self.current_interval))
         if refresh_monitors:
             self._refresh_auto_close_monitors()
         if evaluate_auto_close and self.current_backtest is not None:

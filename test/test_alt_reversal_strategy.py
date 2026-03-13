@@ -10,6 +10,7 @@ from alt_reversal_trader.binance_futures import BinanceFuturesClient, resample_o
 from alt_reversal_trader.optimizer import (
     generate_parameter_grid,
     optimization_sort_key,
+    optimize_symbol_interval_results,
     optimize_symbol_intervals,
     score_optimization_metrics,
 )
@@ -186,6 +187,32 @@ def test_optimize_symbol_intervals_returns_best_interval() -> None:
     assert result.best_interval in {"1m", "2m"}
     assert 0.0 <= result.score <= 100.0
     assert not history.empty
+
+
+def test_optimize_symbol_interval_results_returns_each_interval_case() -> None:
+    df = make_sample_ohlcv(720)
+    histories = {
+        "1m": df,
+        "2m": resample_ohlcv(df, "2m"),
+    }
+    flags = DEFAULT_OPTIMIZE_FLAGS.copy()
+    flags["atr_period"] = True
+    interval_results = optimize_symbol_interval_results(
+        symbol="TESTUSDT",
+        histories_by_interval=histories,
+        base_settings=StrategySettings(),
+        optimize_flags=flags,
+        interval_candidates=["1m", "2m"],
+        span_pct=10.0,
+        steps=3,
+        max_combinations=50,
+        fee_rate=0.0005,
+        backtest_start_time=df["time"].iloc[200],
+    )
+    assert [result.best_interval for result, _history in interval_results] == ["1m", "2m"] or [
+        result.best_interval for result, _history in interval_results
+    ] == ["2m", "1m"]
+    assert {result.best_interval for result, _history in interval_results} == {"1m", "2m"}
 
 
 def test_optimization_score_weights_return_most() -> None:
