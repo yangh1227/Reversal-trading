@@ -7,7 +7,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from alt_reversal_trader.config import DEFAULT_OPTIMIZE_FLAGS, StrategySettings
 from alt_reversal_trader.binance_futures import BinanceFuturesClient, resample_ohlcv
-from alt_reversal_trader.optimizer import generate_parameter_grid, optimize_symbol_intervals, score_optimization_metrics
+from alt_reversal_trader.optimizer import (
+    generate_parameter_grid,
+    optimization_sort_key,
+    optimize_symbol_intervals,
+    score_optimization_metrics,
+)
 from alt_reversal_trader.strategy import StrategyMetrics
 from alt_reversal_trader.strategy import resume_backtest, run_backtest, run_backtest_metrics
 
@@ -201,6 +206,50 @@ def test_optimization_score_weights_return_most() -> None:
         profit_factor=1.8,
     )
     assert score_optimization_metrics(higher_return) > score_optimization_metrics(lower_return)
+
+
+def test_optimization_score_rewards_more_confirmed_trades_and_profit_factor() -> None:
+    fewer_trades = StrategyMetrics(
+        total_return_pct=20.0,
+        net_profit=200.0,
+        max_drawdown_pct=12.0,
+        trade_count=10,
+        win_rate_pct=58.0,
+        profit_factor=1.4,
+    )
+    more_trades_better_pf = StrategyMetrics(
+        total_return_pct=20.0,
+        net_profit=200.0,
+        max_drawdown_pct=12.0,
+        trade_count=40,
+        win_rate_pct=58.0,
+        profit_factor=2.1,
+    )
+    assert score_optimization_metrics(more_trades_better_pf) > score_optimization_metrics(fewer_trades)
+
+
+def test_optimization_sort_key_can_prefer_return_mode() -> None:
+    higher_score_lower_return = StrategyMetrics(
+        total_return_pct=18.0,
+        net_profit=180.0,
+        max_drawdown_pct=6.0,
+        trade_count=36,
+        win_rate_pct=68.0,
+        profit_factor=2.3,
+    )
+    higher_return_lower_score = StrategyMetrics(
+        total_return_pct=26.0,
+        net_profit=260.0,
+        max_drawdown_pct=15.0,
+        trade_count=12,
+        win_rate_pct=48.0,
+        profit_factor=1.2,
+    )
+    assert score_optimization_metrics(higher_score_lower_return) > score_optimization_metrics(higher_return_lower_score)
+    assert optimization_sort_key(higher_return_lower_score, "return") > optimization_sort_key(
+        higher_score_lower_return,
+        "return",
+    )
 
 
 def test_get_open_positions_recomputes_unrealized_pnl() -> None:

@@ -30,12 +30,52 @@ def _clamp_score(value: float, minimum: float = 0.0, maximum: float = 100.0) -> 
     return max(float(minimum), min(float(maximum), float(value)))
 
 
+def _winrate_trade_component(metrics: StrategyMetrics) -> float:
+    trade_count = max(float(metrics.trade_count), 1.0)
+    return _clamp_score(float(metrics.win_rate_pct) * math.log(trade_count) * 0.2)
+
+
+def _profit_factor_component(metrics: StrategyMetrics) -> float:
+    profit_factor = float(metrics.profit_factor)
+    if not math.isfinite(profit_factor):
+        return 100.0 if profit_factor > 0 else 0.0
+    return _clamp_score(50.0 + (50.0 * math.tanh((profit_factor - 1.0) / 1.25)))
+
+
 def score_optimization_metrics(metrics: StrategyMetrics) -> float:
     return_component = 50.0 + (50.0 * math.tanh(float(metrics.total_return_pct) / 35.0))
-    win_component = _clamp_score(float(metrics.win_rate_pct))
+    win_component = _winrate_trade_component(metrics)
     mdd_component = _clamp_score(100.0 - (float(metrics.max_drawdown_pct) * 2.5))
-    total_score = (return_component * 0.4) + (win_component * 0.4) + (mdd_component * 0.2)
+    profit_factor_component = _profit_factor_component(metrics)
+    total_score = (
+        (return_component * 0.45)
+        + (win_component * 0.20)
+        + (profit_factor_component * 0.20)
+        + (mdd_component * 0.15)
+    )
     return round(_clamp_score(total_score), 2)
+
+
+def optimization_sort_key(metrics: StrategyMetrics, rank_mode: str) -> Tuple[float, ...]:
+    score = score_optimization_metrics(metrics)
+    if rank_mode == "return":
+        return (
+            float(metrics.total_return_pct),
+            score,
+            float(metrics.win_rate_pct),
+            float(metrics.profit_factor),
+            -float(metrics.max_drawdown_pct),
+            float(metrics.trade_count),
+        )
+    return (
+        score,
+        float(metrics.total_return_pct),
+        _winrate_trade_component(metrics),
+        _profit_factor_component(metrics),
+        -float(metrics.max_drawdown_pct),
+        float(metrics.trade_count),
+        float(metrics.profit_factor),
+    )
 
 
 def _history_signature(df: pd.DataFrame) -> Tuple[object, ...]:
@@ -59,6 +99,7 @@ def optimize_symbol_process_entry(
     steps: int,
     max_combinations: int,
     fee_rate: float,
+    rank_mode: str = "score",
     backtest_start_time: pd.Timestamp | str | None = None,
     result_interval: Optional[str] = None,
 ) -> OptimizationResult:
@@ -71,6 +112,7 @@ def optimize_symbol_process_entry(
         steps=steps,
         max_combinations=max_combinations,
         fee_rate=fee_rate,
+        rank_mode=rank_mode,
         backtest_start_time=backtest_start_time,
         result_interval=result_interval,
     )
@@ -276,6 +318,7 @@ def optimize_symbol(
     steps: int,
     max_combinations: int,
     fee_rate: float,
+    rank_mode: str = "score",
     backtest_start_time: pd.Timestamp | str | None = None,
     should_stop: Optional[Callable[[], bool]] = None,
     result_interval: Optional[str] = None,
@@ -293,6 +336,7 @@ def optimize_symbol(
         int(steps),
         int(max_combinations),
         float(fee_rate),
+        str(rank_mode),
         pd.Timestamp(backtest_start_time) if backtest_start_time is not None else None,
     )
     cached_result = OPTIMIZATION_RESULT_CACHE.get(cache_key)
@@ -320,24 +364,8 @@ def optimize_symbol(
             continue
 
         best = best_metrics
-        current_score = score_optimization_metrics(current)
-        best_score = score_optimization_metrics(best)
-        current_key = (
-            current_score,
-            current.total_return_pct,
-            current.win_rate_pct,
-            -current.max_drawdown_pct,
-            current.trade_count,
-            current.profit_factor,
-        )
-        best_key = (
-            best_score,
-            best.total_return_pct,
-            best.win_rate_pct,
-            -best.max_drawdown_pct,
-            best.trade_count,
-            best.profit_factor,
-        )
+        current_key = optimization_sort_key(current, rank_mode)
+        best_key = optimization_sort_key(best, rank_mode)
         if current_key > best_key:
             best_settings = settings
             best_metrics = current
@@ -376,6 +404,7 @@ def optimize_symbol_intervals(
     steps: int,
     max_combinations: int,
     fee_rate: float,
+    rank_mode: str = "score",
     backtest_start_time: pd.Timestamp | str | None = None,
     should_stop: Optional[Callable[[], bool]] = None,
 ) -> Tuple[OptimizationResult, pd.DataFrame]:
@@ -400,6 +429,7 @@ def optimize_symbol_intervals(
             steps=steps,
             max_combinations=max_combinations,
             fee_rate=fee_rate,
+            rank_mode=rank_mode,
             backtest_start_time=backtest_start_time,
             should_stop=should_stop,
             result_interval=interval,
@@ -412,22 +442,8 @@ def optimize_symbol_intervals(
             continue
         current_metrics = current.best_backtest.metrics
         best_metrics = best_result.best_backtest.metrics
-        current_key = (
-            current.score,
-            current_metrics.total_return_pct,
-            current_metrics.win_rate_pct,
-            -current_metrics.max_drawdown_pct,
-            current_metrics.trade_count,
-            current_metrics.profit_factor,
-        )
-        best_key = (
-            best_result.score,
-            best_metrics.total_return_pct,
-            best_metrics.win_rate_pct,
-            -best_metrics.max_drawdown_pct,
-            best_metrics.trade_count,
-            best_metrics.profit_factor,
-        )
+        current_key = optimization_sort_key(current_metrics, rank_mode)
+        best_key = optimization_sort_key(best_metrics, rank_mode)
         if current_key > best_key:
             best_result = current
             best_history = history

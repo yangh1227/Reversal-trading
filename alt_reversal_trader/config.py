@@ -10,6 +10,7 @@ import json
 APP_CONFIG_PATH = Path("alt_reversal_trader_config.json")
 APP_INTERVAL_OPTIONS = ("1m", "2m", "3m", "5m", "15m")
 CHART_ENGINE_OPTIONS = ("Lightweight",)
+OPTIMIZATION_RANK_MODE_OPTIONS = ("score", "return")
 DEFAULT_OPTIMIZATION_PROFILE_SCALE = 20.0
 QIP_SENSITIVITY_OPTIONS = (
     "1-Ultra Fine Max",
@@ -94,7 +95,9 @@ class AppSettings:
     atr_4h_min_pct: float = 10.0
     optimization_span_pct: float = 20.0
     optimization_steps: int = 5
+    optimization_rank_mode: str = "score"
     optimization_min_score: float = 0.0
+    optimization_min_return_pct: float = 0.0
     max_grid_combinations: int = 729
     scan_workers: int = 4
     optimize_processes: int = field(default_factory=default_optimize_process_count)
@@ -109,7 +112,10 @@ class AppSettings:
             self.order_mode = "compound"
         self.simple_order_amount = max(1.0, float(self.simple_order_amount))
         self.atr_4h_min_pct = max(0.0, float(self.atr_4h_min_pct))
+        if self.optimization_rank_mode not in OPTIMIZATION_RANK_MODE_OPTIONS:
+            self.optimization_rank_mode = OPTIMIZATION_RANK_MODE_OPTIONS[0]
         self.optimization_min_score = max(0.0, float(self.optimization_min_score))
+        self.optimization_min_return_pct = float(self.optimization_min_return_pct)
         self.scan_workers = max(1, int(self.scan_workers))
         self.optimize_processes = max(1, int(self.optimize_processes))
         if not self.optimize_flags:
@@ -141,7 +147,9 @@ class AppSettings:
             "atr_4h_min_pct": self.atr_4h_min_pct,
             "optimization_span_pct": self.optimization_span_pct,
             "optimization_steps": self.optimization_steps,
+            "optimization_rank_mode": self.optimization_rank_mode,
             "optimization_min_score": self.optimization_min_score,
+            "optimization_min_return_pct": self.optimization_min_return_pct,
             "max_grid_combinations": self.max_grid_combinations,
             "scan_workers": self.scan_workers,
             "optimize_processes": self.optimize_processes,

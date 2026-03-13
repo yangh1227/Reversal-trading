@@ -27,7 +27,7 @@ from .binance_futures import (
 )
 from .config import APP_INTERVAL_OPTIONS, CHART_ENGINE_OPTIONS, PARAMETER_SPECS, AppSettings, StrategySettings
 from .crash_logger import log_runtime_event
-from .optimizer import OptimizationResult, optimize_symbol_intervals
+from .optimizer import OptimizationResult, optimization_sort_key, optimize_symbol_intervals
 from .qt_compat import (
     HORIZONTAL,
     NO_EDIT_TRIGGERS,
@@ -669,6 +669,7 @@ class OptimizeWorker(QThread):
                 steps=self.settings.optimization_steps,
                 max_combinations=self.settings.max_grid_combinations,
                 fee_rate=self.settings.fee_rate,
+                rank_mode=self.settings.optimization_rank_mode,
                 backtest_start_time=backtest_start_time,
                 should_stop=self.isInterruptionRequested,
             )
@@ -732,6 +733,7 @@ class OptimizeWorker(QThread):
                     "steps": self.settings.optimization_steps,
                     "max_combinations": self.settings.max_grid_combinations,
                     "fee_rate": self.settings.fee_rate,
+                    "rank_mode": self.settings.optimization_rank_mode,
                     "backtest_start_time": backtest_start_time,
                 },
             )
@@ -1573,6 +1575,21 @@ class AltReversalTraderWindow(QMainWindow):
         atr_enabled = bool(self.atr_4h_filter_check.isChecked())
         self.atr_4h_spin.setEnabled(atr_enabled)
 
+    def _optimization_rank_mode(self) -> str:
+        if not hasattr(self, "opt_rank_mode_combo"):
+            return self.settings.optimization_rank_mode
+        return str(self.opt_rank_mode_combo.currentData() or self.settings.optimization_rank_mode)
+
+    def _refresh_optimization_rank_controls(self) -> None:
+        rank_mode = self._optimization_rank_mode()
+        score_mode = rank_mode == "score"
+        if hasattr(self, "opt_min_score_spin"):
+            self.opt_min_score_spin.setEnabled(score_mode)
+        if hasattr(self, "opt_min_return_spin"):
+            self.opt_min_return_spin.setEnabled(not score_mode)
+        if hasattr(self, "optimized_table"):
+            self.update_optimized_table()
+
     def _build_api_group(self) -> QGroupBox:
         group = QGroupBox("Binance API")
         layout = QFormLayout(group)
@@ -1645,10 +1662,17 @@ class AltReversalTraderWindow(QMainWindow):
         self.opt_span_spin.setSingleStep(1.0)
         self.opt_steps_spin = QSpinBox()
         self.opt_steps_spin.setRange(1, 9)
+        self.opt_rank_mode_combo = QComboBox()
+        self.opt_rank_mode_combo.addItem("점수제", "score")
+        self.opt_rank_mode_combo.addItem("수익률제", "return")
         self.opt_min_score_spin = QDoubleSpinBox()
         self.opt_min_score_spin.setRange(0.0, 100.0)
         self.opt_min_score_spin.setDecimals(1)
         self.opt_min_score_spin.setSingleStep(1.0)
+        self.opt_min_return_spin = QDoubleSpinBox()
+        self.opt_min_return_spin.setRange(-500.0, 10_000.0)
+        self.opt_min_return_spin.setDecimals(1)
+        self.opt_min_return_spin.setSingleStep(1.0)
         self.max_combo_spin = QSpinBox()
         self.max_combo_spin.setRange(10, 20_000)
         self.opt_process_spin = QSpinBox()
@@ -1658,7 +1682,9 @@ class AltReversalTraderWindow(QMainWindow):
         self.fee_spin.setRange(0.0, 5.0)
         self.fee_spin.setDecimals(4)
         self.fee_spin.setSingleStep(0.01)
+        self.opt_rank_mode_combo.currentIndexChanged.connect(lambda _index: self._refresh_optimization_rank_controls())
         self.opt_min_score_spin.valueChanged.connect(lambda _value: self.update_optimized_table())
+        self.opt_min_return_spin.valueChanged.connect(lambda _value: self.update_optimized_table())
         def _set_row_label(editor, label: str) -> None:
             field_label = layout.labelForField(editor)
             if field_label is not None:
@@ -1666,18 +1692,22 @@ class AltReversalTraderWindow(QMainWindow):
         self.optimize_timeframe_check.setText("1m / 2m 최적화")
         layout.addRow("범위 ±%", self.opt_span_spin)
         layout.addRow("격자 단계수", self.opt_steps_spin)
+        layout.addRow("정렬 기준", self.opt_rank_mode_combo)
         layout.addRow("최소 총점", self.opt_min_score_spin)
+        layout.addRow("최소 수익률%", self.opt_min_return_spin)
         layout.addRow("최대 조합수", self.max_combo_spin)
         layout.addRow("최적화 프로세스", self.opt_process_spin)
         layout.addRow("타임프레임", self.optimize_timeframe_check)
         layout.addRow("수수료 %", self.fee_spin)
         _set_row_label(self.opt_span_spin, "범위 스케일 (20=기본)")
         _set_row_label(self.opt_steps_spin, "항목별 샘플 상한")
-        _set_row_label(self.opt_min_score_spin, "최소 총점 (0=모두)")
+        _set_row_label(self.opt_min_score_spin, "최소 총점 (점수제)")
+        _set_row_label(self.opt_min_return_spin, "최소 수익률% (수익률제)")
         _set_row_label(self.max_combo_spin, "최대 조합수")
         _set_row_label(self.opt_process_spin, "최적화 프로세스")
         _set_row_label(self.optimize_timeframe_check, "타임프레임")
         _set_row_label(self.fee_spin, "수수료 %")
+        self._refresh_optimization_rank_controls()
         return group
 
     def _build_parameter_tabs(self) -> QGroupBox:
@@ -2074,7 +2104,11 @@ class AltReversalTraderWindow(QMainWindow):
         self.scan_workers_spin.setValue(settings.scan_workers)
         self.opt_span_spin.setValue(settings.optimization_span_pct)
         self.opt_steps_spin.setValue(settings.optimization_steps)
+        rank_mode_index = self.opt_rank_mode_combo.findData(settings.optimization_rank_mode)
+        if rank_mode_index >= 0:
+            self.opt_rank_mode_combo.setCurrentIndex(rank_mode_index)
         self.opt_min_score_spin.setValue(settings.optimization_min_score)
+        self.opt_min_return_spin.setValue(settings.optimization_min_return_pct)
         self.max_combo_spin.setValue(settings.max_grid_combinations)
         self.opt_process_spin.setValue(settings.optimize_processes)
         self.optimize_timeframe_check.setChecked(settings.optimize_timeframe)
@@ -2086,6 +2120,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.compound_order_radio.setChecked(True)
         self._refresh_order_mode_ui()
         self._refresh_filter_controls()
+        self._refresh_optimization_rank_controls()
 
     def collect_settings(self) -> AppSettings:
         strategy_payload: Dict[str, object] = {}
@@ -2121,7 +2156,9 @@ class AltReversalTraderWindow(QMainWindow):
             atr_4h_min_pct=float(self.atr_4h_spin.value()),
             optimization_span_pct=float(self.opt_span_spin.value()),
             optimization_steps=int(self.opt_steps_spin.value()),
+            optimization_rank_mode=self._optimization_rank_mode(),
             optimization_min_score=float(self.opt_min_score_spin.value()),
+            optimization_min_return_pct=float(self.opt_min_return_spin.value()),
             max_grid_combinations=int(self.max_combo_spin.value()),
             scan_workers=int(self.scan_workers_spin.value()),
             optimize_processes=int(self.opt_process_spin.value()),
@@ -3604,18 +3641,20 @@ class AltReversalTraderWindow(QMainWindow):
         self.candidate_table.setUpdatesEnabled(True)
 
     def _ordered_optimized_results(self) -> List[OptimizationResult]:
+        rank_mode = self._optimization_rank_mode()
         minimum_score = float(self.opt_min_score_spin.value()) if hasattr(self, "opt_min_score_spin") else 0.0
+        minimum_return = float(self.opt_min_return_spin.value()) if hasattr(self, "opt_min_return_spin") else 0.0
         ordered = sorted(
             self.optimized_results.values(),
-            key=lambda result: (
-                result.score,
-                result.best_backtest.metrics.total_return_pct,
-                result.best_backtest.metrics.win_rate_pct,
-                -result.best_backtest.metrics.max_drawdown_pct,
-                result.best_backtest.metrics.profit_factor,
-            ),
+            key=lambda result: optimization_sort_key(result.best_backtest.metrics, rank_mode),
             reverse=True,
         )
+        if rank_mode == "return":
+            return [
+                result
+                for result in ordered
+                if float(result.best_backtest.metrics.total_return_pct) >= minimum_return
+            ]
         return [result for result in ordered if result.score >= minimum_score]
 
     def update_optimized_table(self) -> None:
