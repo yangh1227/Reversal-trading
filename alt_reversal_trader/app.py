@@ -2207,7 +2207,7 @@ class AltReversalTraderWindow(QMainWindow):
         )
         self.supertrend_line = self.chart.create_line(
             "Supertrend",
-            color="rgba(255, 225, 120, 0.95)",
+            color="#00D8FF",
             width=2,
             price_line=False,
             price_label=False,
@@ -5104,7 +5104,7 @@ class AltReversalTraderWindow(QMainWindow):
                 secondary_y=True,
             )
         for column, name, color, width in (
-            ("supertrend", "Supertrend", "#ffcc00", 2),
+            ("supertrend", "Supertrend", "#00D8FF", 2),
             ("zone2_line", "Zone 2", "#ff9100", 1),
             ("zone3_line", "Zone 3", "#ff1744", 1),
             ("ema_fast", "EMA Fast", "#00e5ff", 1),
