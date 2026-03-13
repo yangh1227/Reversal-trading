@@ -87,7 +87,7 @@ from .strategy import (
 CHART_HISTORY_BAR_LIMIT = 8_000
 BACKTEST_WARMUP_BAR_FLOOR = 1_500
 DEFAULT_CHART_LOOKBACK_HOURS = 3
-DEFAULT_CHART_RIGHT_PAD_BARS = 4
+DEFAULT_CHART_RIGHT_PAD_BARS = 8
 INITIAL_CHART_WARMUP_BARS = 300
 INITIAL_CHART_BAR_FLOOR = 360
 CHART_LAZY_LOAD_CHUNK_BARS = 300
@@ -2172,7 +2172,12 @@ class AltReversalTraderWindow(QMainWindow):
         }})""")
         self.chart.volume_config(up_color="rgba(216, 243, 220, 0.30)", down_color="rgba(255, 93, 115, 0.28)")
         self.chart.crosshair(mode="normal")
-        self.chart.time_scale(time_visible=True, seconds_visible=False, min_bar_spacing=0.01, right_offset=0)
+        self.chart.time_scale(
+            time_visible=True,
+            seconds_visible=False,
+            min_bar_spacing=0.01,
+            right_offset=DEFAULT_CHART_RIGHT_PAD_BARS,
+        )
         self.equity_subchart = self.chart.create_subchart(
             position="bottom",
             width=1.0,
@@ -2182,7 +2187,12 @@ class AltReversalTraderWindow(QMainWindow):
         )
         self.equity_subchart.layout(background_color="#121922", text_color="#eceff4", font_size=11, font_family="Consolas")
         self.equity_subchart.legend(True)
-        self.equity_subchart.time_scale(time_visible=True, seconds_visible=False, min_bar_spacing=0.01, right_offset=0)
+        self.equity_subchart.time_scale(
+            time_visible=True,
+            seconds_visible=False,
+            min_bar_spacing=0.01,
+            right_offset=DEFAULT_CHART_RIGHT_PAD_BARS,
+        )
         self.equity_line = self.equity_subchart.create_line(
             "Equity",
             color="rgba(108, 245, 160, 0.9)",
@@ -4061,7 +4071,7 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _pnl_color(self, value: float) -> str:
         if value > 0:
-            return "#17c964"
+            return "#1f8f47"
         if value < 0:
             return "#f31260"
         return "#1f2937"
