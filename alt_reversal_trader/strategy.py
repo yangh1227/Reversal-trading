@@ -7,6 +7,12 @@ import math
 
 import numpy as np
 import pandas as pd
+try:
+    from numba import njit
+    NUMBA_AVAILABLE = True
+except Exception:  # pragma: no cover - optional accelerator
+    njit = None
+    NUMBA_AVAILABLE = False
 
 from .config import StrategySettings
 
@@ -62,6 +68,7 @@ SENSITIVITY_MULTIPLIERS = {
 }
 
 PREPARED_OHLCV_ATTR = "_alt_prepared_ohlcv"
+POSITION_EPSILON = 1e-12
 
 
 @dataclass(frozen=True)
@@ -1094,6 +1101,290 @@ def _build_latest_state(latest: pd.Series) -> Dict[str, object]:
     }
 
 
+if NUMBA_AVAILABLE:
+
+    @njit(cache=True)
+    def _run_backtest_metrics_numba(
+        close_values,
+        lev_zone_values,
+        is_long_trend_values,
+        is_short_trend_values,
+        trend_to_long_values,
+        trend_to_short_values,
+        final_bull_values,
+        final_bear_values,
+        fee_rate,
+        starting_equity,
+        entry_size_pct,
+        beast_mode,
+    ):
+        active_count = len(close_values)
+        equity = float(starting_equity)
+        position_qty = 0.0
+        avg_entry_price = 0.0
+        gross_profit = 0.0
+        gross_loss = 0.0
+        trade_count = 0
+        win_count = 0
+        last_long_zone = 0
+        last_short_zone = 0
+        long_zone_used_1 = False
+        long_zone_used_2 = False
+        long_zone_used_3 = False
+        short_zone_used_1 = False
+        short_zone_used_2 = False
+        short_zone_used_3 = False
+        equity_curve_values = np.empty(active_count, dtype=np.float64)
+
+        for index in range(active_count):
+            current_price = float(close_values[index])
+
+            if abs(position_qty) < POSITION_EPSILON:
+                long_zone_used_1 = False
+                long_zone_used_2 = False
+                long_zone_used_3 = False
+                short_zone_used_1 = False
+                short_zone_used_2 = False
+                short_zone_used_3 = False
+                last_long_zone = 0
+                last_short_zone = 0
+
+            if trend_to_short_values[index] and position_qty > 0.0:
+                pnl = position_qty * (current_price - avg_entry_price)
+                fee = abs(position_qty) * current_price * fee_rate
+                net_pnl = pnl - fee
+                equity += net_pnl
+                trade_count += 1
+                if net_pnl > 0.0:
+                    gross_profit += net_pnl
+                    win_count += 1
+                else:
+                    gross_loss += abs(net_pnl)
+                position_qty = 0.0
+                avg_entry_price = 0.0
+                long_zone_used_1 = False
+                long_zone_used_2 = False
+                long_zone_used_3 = False
+                short_zone_used_1 = False
+                short_zone_used_2 = False
+                short_zone_used_3 = False
+                last_long_zone = 0
+                last_short_zone = 0
+
+            if trend_to_long_values[index] and position_qty < 0.0:
+                pnl = position_qty * (current_price - avg_entry_price)
+                fee = abs(position_qty) * current_price * fee_rate
+                net_pnl = pnl - fee
+                equity += net_pnl
+                trade_count += 1
+                if net_pnl > 0.0:
+                    gross_profit += net_pnl
+                    win_count += 1
+                else:
+                    gross_loss += abs(net_pnl)
+                position_qty = 0.0
+                avg_entry_price = 0.0
+                long_zone_used_1 = False
+                long_zone_used_2 = False
+                long_zone_used_3 = False
+                short_zone_used_1 = False
+                short_zone_used_2 = False
+                short_zone_used_3 = False
+                last_long_zone = 0
+                last_short_zone = 0
+
+            if final_bear_values[index] and position_qty > 0.0:
+                pnl = position_qty * (current_price - avg_entry_price)
+                fee = abs(position_qty) * current_price * fee_rate
+                net_pnl = pnl - fee
+                equity += net_pnl
+                trade_count += 1
+                if net_pnl > 0.0:
+                    gross_profit += net_pnl
+                    win_count += 1
+                else:
+                    gross_loss += abs(net_pnl)
+                position_qty = 0.0
+                avg_entry_price = 0.0
+                long_zone_used_1 = False
+                long_zone_used_2 = False
+                long_zone_used_3 = False
+                short_zone_used_1 = False
+                short_zone_used_2 = False
+                short_zone_used_3 = False
+                last_long_zone = 0
+                last_short_zone = 0
+
+            if final_bull_values[index] and position_qty < 0.0:
+                pnl = position_qty * (current_price - avg_entry_price)
+                fee = abs(position_qty) * current_price * fee_rate
+                net_pnl = pnl - fee
+                equity += net_pnl
+                trade_count += 1
+                if net_pnl > 0.0:
+                    gross_profit += net_pnl
+                    win_count += 1
+                else:
+                    gross_loss += abs(net_pnl)
+                position_qty = 0.0
+                avg_entry_price = 0.0
+                long_zone_used_1 = False
+                long_zone_used_2 = False
+                long_zone_used_3 = False
+                short_zone_used_1 = False
+                short_zone_used_2 = False
+                short_zone_used_3 = False
+                last_long_zone = 0
+                last_short_zone = 0
+
+            if abs(position_qty) < POSITION_EPSILON:
+                long_zone_used_1 = False
+                long_zone_used_2 = False
+                long_zone_used_3 = False
+                short_zone_used_1 = False
+                short_zone_used_2 = False
+                short_zone_used_3 = False
+                last_long_zone = 0
+                last_short_zone = 0
+
+            lev_zone = int(lev_zone_values[index])
+            can_long_z1 = (
+                (not beast_mode)
+                and is_long_trend_values[index]
+                and final_bull_values[index]
+                and lev_zone == 1
+                and (not long_zone_used_1)
+                and last_long_zone == 0
+            )
+            can_long_z2 = (
+                is_long_trend_values[index]
+                and final_bull_values[index]
+                and lev_zone == 2
+                and (not long_zone_used_2)
+                and (last_long_zone == 0 or last_long_zone == 1)
+            )
+            can_long_z3 = (
+                is_long_trend_values[index]
+                and final_bull_values[index]
+                and lev_zone == 3
+                and (not long_zone_used_3)
+                and (last_long_zone == 0 or last_long_zone == 2)
+            )
+            can_short_z1 = (
+                (not beast_mode)
+                and is_short_trend_values[index]
+                and final_bear_values[index]
+                and lev_zone == 1
+                and (not short_zone_used_1)
+                and last_short_zone == 0
+            )
+            can_short_z2 = (
+                is_short_trend_values[index]
+                and final_bear_values[index]
+                and lev_zone == 2
+                and (not short_zone_used_2)
+                and (last_short_zone == 0 or last_short_zone == 1)
+            )
+            can_short_z3 = (
+                is_short_trend_values[index]
+                and final_bear_values[index]
+                and lev_zone == 3
+                and (not short_zone_used_3)
+                and (last_short_zone == 0 or last_short_zone == 2)
+            )
+
+            if can_long_z1 or can_long_z2 or can_long_z3:
+                zone = 1 if can_long_z1 else (2 if can_long_z2 else 3)
+                allocation_pct = entry_size_pct
+                if beast_mode and zone == 2:
+                    allocation_pct = 0.5
+                elif beast_mode and zone == 3:
+                    allocation_pct = 1.0 if last_long_zone == 0 else 0.5
+                qty = (equity * allocation_pct) / max(current_price, 1e-9)
+                equity -= qty * current_price * fee_rate
+                if abs(position_qty) < POSITION_EPSILON:
+                    position_qty = qty
+                    avg_entry_price = current_price
+                else:
+                    total_qty = abs(position_qty) + qty
+                    avg_entry_price = ((avg_entry_price * abs(position_qty)) + (current_price * qty)) / max(total_qty, 1e-12)
+                    position_qty += qty
+                if zone == 1:
+                    long_zone_used_1 = True
+                elif zone == 2:
+                    long_zone_used_2 = True
+                else:
+                    long_zone_used_3 = True
+                last_long_zone = zone
+
+            if can_short_z1 or can_short_z2 or can_short_z3:
+                zone = 1 if can_short_z1 else (2 if can_short_z2 else 3)
+                allocation_pct = entry_size_pct
+                if beast_mode and zone == 2:
+                    allocation_pct = 0.5
+                elif beast_mode and zone == 3:
+                    allocation_pct = 1.0 if last_short_zone == 0 else 0.5
+                qty = (equity * allocation_pct) / max(current_price, 1e-9)
+                equity -= qty * current_price * fee_rate
+                if abs(position_qty) < POSITION_EPSILON:
+                    position_qty = -qty
+                    avg_entry_price = current_price
+                else:
+                    total_qty = abs(position_qty) + qty
+                    avg_entry_price = ((avg_entry_price * abs(position_qty)) + (current_price * qty)) / max(total_qty, 1e-12)
+                    position_qty -= qty
+                if zone == 1:
+                    short_zone_used_1 = True
+                elif zone == 2:
+                    short_zone_used_2 = True
+                else:
+                    short_zone_used_3 = True
+                last_short_zone = zone
+
+            unrealized = position_qty * (current_price - avg_entry_price) if abs(position_qty) > POSITION_EPSILON else 0.0
+            equity_curve_values[index] = equity + unrealized
+
+        if active_count > 0 and abs(position_qty) > POSITION_EPSILON:
+            current_price = float(close_values[active_count - 1])
+            pnl = position_qty * (current_price - avg_entry_price)
+            fee = abs(position_qty) * current_price * fee_rate
+            net_pnl = pnl - fee
+            equity += net_pnl
+            trade_count += 1
+            if net_pnl > 0.0:
+                gross_profit += net_pnl
+                win_count += 1
+            else:
+                gross_loss += abs(net_pnl)
+            position_qty = 0.0
+            avg_entry_price = 0.0
+            equity_curve_values[active_count - 1] = equity
+
+        max_drawdown_pct = 0.0
+        if active_count > 0:
+            peak = equity_curve_values[0]
+            for index in range(active_count):
+                value = equity_curve_values[index]
+                if value > peak:
+                    peak = value
+                if peak != 0.0:
+                    drawdown_pct = abs((value - peak) / peak * 100.0)
+                    if drawdown_pct > max_drawdown_pct:
+                        max_drawdown_pct = drawdown_pct
+
+        win_rate = (win_count / trade_count * 100.0) if trade_count else 0.0
+        if gross_loss > 0.0:
+            profit_factor = gross_profit / gross_loss
+        elif gross_profit > 0.0:
+            profit_factor = 999.0
+        else:
+            profit_factor = 0.0
+
+        net_profit = equity - starting_equity
+        total_return_pct = (net_profit / starting_equity) * 100.0
+        return total_return_pct, net_profit, max_drawdown_pct, trade_count, win_rate, profit_factor
+
+
 def _run_backtest_core(
     indicators: pd.DataFrame,
     settings: StrategySettings,
@@ -1374,6 +1665,59 @@ def _run_backtest_core(
     return metrics, trades, curve, indicator_frame, latest_state, cursor
 
 
+def _run_backtest_metrics_fast(
+    indicators: pd.DataFrame,
+    settings: StrategySettings,
+    fee_rate: float,
+    starting_equity: float,
+    backtest_start_time: Optional[pd.Timestamp | str],
+) -> StrategyMetrics:
+    if not NUMBA_AVAILABLE:
+        metrics, _, _, _, _, _ = _run_backtest_core(
+            indicators,
+            settings=settings,
+            fee_rate=fee_rate,
+            starting_equity=starting_equity,
+            backtest_start_time=backtest_start_time,
+            include_details=False,
+        )
+        return metrics
+
+    active_indicators, _result_indicators = _select_active_indicators(indicators, backtest_start_time)
+    if active_indicators.empty:
+        return StrategyMetrics(
+            total_return_pct=0.0,
+            net_profit=0.0,
+            max_drawdown_pct=0.0,
+            trade_count=0,
+            win_rate_pct=0.0,
+            profit_factor=0.0,
+        )
+
+    total_return_pct, net_profit, max_drawdown_pct, trade_count, win_rate_pct, profit_factor = _run_backtest_metrics_numba(
+        active_indicators["close"].to_numpy(dtype=np.float64, copy=False),
+        active_indicators["lev_zone"].fillna(0.0).to_numpy(dtype=np.int64, copy=False),
+        active_indicators["is_long_trend"].to_numpy(dtype=np.bool_, copy=False),
+        active_indicators["is_short_trend"].to_numpy(dtype=np.bool_, copy=False),
+        active_indicators["trend_to_long"].to_numpy(dtype=np.bool_, copy=False),
+        active_indicators["trend_to_short"].to_numpy(dtype=np.bool_, copy=False),
+        active_indicators["final_bull"].to_numpy(dtype=np.bool_, copy=False),
+        active_indicators["final_bear"].to_numpy(dtype=np.bool_, copy=False),
+        float(fee_rate),
+        float(starting_equity),
+        float(settings.entry_size_pct) / 100.0,
+        bool(settings.beast_mode),
+    )
+    return StrategyMetrics(
+        total_return_pct=float(total_return_pct),
+        net_profit=float(net_profit),
+        max_drawdown_pct=float(max_drawdown_pct),
+        trade_count=int(trade_count),
+        win_rate_pct=float(win_rate_pct),
+        profit_factor=float(profit_factor),
+    )
+
+
 def run_backtest_metrics(
     df: pd.DataFrame,
     settings: StrategySettings,
@@ -1383,15 +1727,13 @@ def run_backtest_metrics(
     indicator_cache: Optional[Dict[Tuple[object, ...], object]] = None,
 ) -> StrategyMetrics:
     indicators = compute_indicators(df, settings, cache=indicator_cache)
-    metrics, _, _, _, _, _ = _run_backtest_core(
+    return _run_backtest_metrics_fast(
         indicators,
         settings=settings,
         fee_rate=fee_rate,
         starting_equity=starting_equity,
         backtest_start_time=backtest_start_time,
-        include_details=False,
     )
-    return metrics
 
 
 def run_backtest(
