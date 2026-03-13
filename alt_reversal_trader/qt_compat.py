@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 try:
-    from PyQt5.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal as Signal
+    from PyQt5.QtCore import QEvent, Qt, QThread, QTimer, QUrl, pyqtSignal as Signal
     from PyQt5.QtGui import QBrush, QColor
     from PyQt5.QtWebEngineWidgets import QWebEngineSettings, QWebEngineView
     from PyQt5.QtWidgets import (
@@ -47,9 +47,12 @@ try:
     SINGLE_SELECTION = QAbstractItemView.SingleSelection
     NO_EDIT_TRIGGERS = QAbstractItemView.NoEditTriggers
     WEB_ATTR_FILE_URLS = QWebEngineSettings.LocalContentCanAccessFileUrls
+    EVENT_KEY_PRESS = QEvent.KeyPress
+    KEY_UP = Qt.Key_Up
+    KEY_DOWN = Qt.Key_Down
 
 except ImportError:
-    from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal as Signal
+    from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, QUrl, pyqtSignal as Signal
     from PyQt6.QtGui import QBrush, QColor
     from PyQt6.QtWebEngineCore import QWebEngineSettings
     from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -96,6 +99,9 @@ except ImportError:
     SINGLE_SELECTION = QAbstractItemView.SelectionMode.SingleSelection
     NO_EDIT_TRIGGERS = QAbstractItemView.EditTrigger.NoEditTriggers
     WEB_ATTR_FILE_URLS = QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls
+    EVENT_KEY_PRESS = QEvent.Type.KeyPress
+    KEY_UP = Qt.Key.Key_Up
+    KEY_DOWN = Qt.Key.Key_Down
 
 
 class QSpinBox(_QSpinBox):
@@ -115,13 +121,18 @@ class QComboBox(_QComboBox):
 
 __all__ = [
     "ALIGN_LEFT",
+    "EVENT_KEY_PRESS",
     "HORIZONTAL",
+    "KEY_DOWN",
+    "KEY_UP",
     "PASSWORD_ECHO",
     "QT_API",
     "NO_EDIT_TRIGGERS",
     "SELECT_ROWS",
     "SINGLE_SELECTION",
     "Signal",
+    "Qt",
+    "QEvent",
     "USER_ROLE",
     "VERTICAL",
     "WEB_ATTR_FILE_URLS",

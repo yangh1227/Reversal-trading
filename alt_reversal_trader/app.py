@@ -30,7 +30,10 @@ from .config import APP_INTERVAL_OPTIONS, CHART_ENGINE_OPTIONS, PARAMETER_SPECS,
 from .crash_logger import log_runtime_event
 from .optimizer import OptimizationResult, optimization_sort_key, optimize_symbol_interval_results
 from .qt_compat import (
+    EVENT_KEY_PRESS,
     HORIZONTAL,
+    KEY_DOWN,
+    KEY_UP,
     NO_EDIT_TRIGGERS,
     PASSWORD_ECHO,
     SELECT_ROWS,
@@ -1928,6 +1931,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.candidate_table.setSelectionMode(SINGLE_SELECTION)
         self.candidate_table.setEditTriggers(NO_EDIT_TRIGGERS)
         self.candidate_table.horizontalHeader().setStretchLastSection(True)
+        self.candidate_table.installEventFilter(self)
         self.candidate_table.itemSelectionChanged.connect(self.on_candidate_selection_changed)
         self.candidate_table.cellClicked.connect(self.on_candidate_cell_clicked)
         layout.addWidget(self.candidate_table)
@@ -1942,6 +1946,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.optimized_table.setSelectionMode(SINGLE_SELECTION)
         self.optimized_table.setEditTriggers(NO_EDIT_TRIGGERS)
         self.optimized_table.horizontalHeader().setStretchLastSection(True)
+        self.optimized_table.installEventFilter(self)
         self.optimized_table.itemSelectionChanged.connect(self.on_optimized_selection_changed)
         self.optimized_table.cellClicked.connect(self.on_optimized_cell_clicked)
         layout.addWidget(self.optimized_table)
@@ -2419,16 +2424,8 @@ class AltReversalTraderWindow(QMainWindow):
     def _is_auto_close_active_for_symbol(self, symbol: str) -> bool:
         return symbol in self._auto_close_managed_symbols()
 
-    def _auto_trade_minimum_score(self) -> float:
-        return float(self.opt_min_score_spin.value()) if hasattr(self, "opt_min_score_spin") else 0.0
-
     def _eligible_auto_trade_results(self) -> List[OptimizationResult]:
-        minimum_score = self._auto_trade_minimum_score()
-        return [
-            result
-            for result in self.optimized_results.values()
-            if float(result.score) >= minimum_score
-        ]
+        return list(self._ordered_optimized_results())
 
     def _pick_auto_trade_candidate(self, candidates: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
         if not candidates:
@@ -4313,23 +4310,45 @@ class AltReversalTraderWindow(QMainWindow):
         symbol_item = self.candidate_table.item(row, 0)
         return [symbol_item.text()] if symbol_item else []
 
+    def _table_current_row(self, table: QTableWidget) -> int:
+        selected = table.selectedItems()
+        if selected:
+            return selected[0].row()
+        current_row = table.currentRow()
+        return current_row if current_row >= 0 else -1
+
+    def _move_symbol_table_selection(self, table: QTableWidget, direction: int) -> bool:
+        row_count = table.rowCount()
+        if row_count <= 0:
+            return False
+        current_row = self._table_current_row(table)
+        if current_row < 0:
+            next_row = 0 if direction >= 0 else row_count - 1
+        else:
+            next_row = max(0, min(row_count - 1, current_row + direction))
+        if next_row == current_row and current_row >= 0:
+            return True
+        table.selectRow(next_row)
+        table.setCurrentCell(next_row, 0)
+        return True
+
     def _request_symbol_load(self, symbol: str, interval: Optional[str] = None) -> None:
         if not symbol:
             return
         target_interval = interval if interval in APP_INTERVAL_OPTIONS else self._active_interval_for_symbol(symbol)
-        if (
-            symbol == self.current_symbol
-            and target_interval == self.current_interval
-            and self.current_backtest is not None
-        ):
-            self.render_chart(
-                symbol,
-                self.current_backtest,
-                reset_view=True,
-                chart_indicators=self.current_chart_indicators,
-            )
+        if symbol == self.current_symbol and target_interval == self.current_interval:
             return
         self.load_symbol(symbol, target_interval)
+
+    def eventFilter(self, source: object, event: object) -> bool:
+        if source in (getattr(self, "candidate_table", None), getattr(self, "optimized_table", None)):
+            if hasattr(event, "type") and event.type() == EVENT_KEY_PRESS:
+                key = event.key()
+                if key == KEY_UP:
+                    return self._move_symbol_table_selection(source, -1)
+                if key == KEY_DOWN:
+                    return self._move_symbol_table_selection(source, 1)
+        return super().eventFilter(source, event)
 
     def _item_symbol_interval(self, item: Optional[QTableWidgetItem]) -> Tuple[Optional[str], Optional[str]]:
         if item is None:
