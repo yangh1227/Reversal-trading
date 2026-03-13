@@ -69,7 +69,6 @@ from .strategy import (
     CHART_INDICATOR_COLUMNS,
     BacktestResult,
     compact_indicator_frame,
-    evaluate_latest_state,
     estimate_warmup_bars,
     prepare_ohlcv,
     resume_backtest,
@@ -387,29 +386,38 @@ def _is_provisional_exit_trade(trade, latest_time: Optional[pd.Timestamp]) -> bo
     return trade.reason == "end_of_test" and pd.Timestamp(trade.exit_time) == latest_time
 
 
-def _extract_auto_close_state(latest: pd.Series) -> Dict[str, bool]:
-    return {
-        "trend_to_long": bool(latest.get("trend_to_long", False)),
-        "trend_to_short": bool(latest.get("trend_to_short", False)),
-        "final_bull": bool(latest.get("final_bull", False)),
-        "final_bear": bool(latest.get("final_bear", False)),
-    }
-
-
-def _auto_close_reason(position: Optional[PositionSnapshot], latest_state: Dict[str, object]) -> Optional[str]:
-    if position is None:
+def _latest_backtest_exit_event(backtest: Optional[BacktestResult]) -> Optional[Dict[str, object]]:
+    if backtest is None or backtest.indicators.empty or not backtest.trades or "time" not in backtest.indicators.columns:
         return None
-    if position.amount > 0:
-        if bool(latest_state.get("trend_to_short")):
-            return "trend_to_short"
-        if bool(latest_state.get("final_bear")):
-            return "opposite_signal"
-        return None
-    if bool(latest_state.get("trend_to_long")):
-        return "trend_to_long"
-    if bool(latest_state.get("final_bull")):
-        return "opposite_signal"
+    latest_time = pd.Timestamp(backtest.indicators["time"].iloc[-1])
+    for trade in reversed(backtest.trades):
+        exit_time = pd.Timestamp(trade.exit_time)
+        if exit_time < latest_time:
+            break
+        if exit_time != latest_time or _is_provisional_exit_trade(trade, latest_time):
+            continue
+        return {
+            "side": str(trade.side).lower(),
+            "reason": str(trade.reason),
+            "bar_time": latest_time,
+        }
     return None
+
+
+def _auto_close_reason(position: Optional[PositionSnapshot], exit_event: Optional[Dict[str, object]]) -> Optional[str]:
+    if position is None or not exit_event:
+        return None
+    trade_side = str(exit_event.get("side", "")).lower()
+    if trade_side not in {"long", "short"}:
+        return None
+    if trade_side == "long" and position.amount <= 0:
+        return None
+    if trade_side == "short" and position.amount >= 0:
+        return None
+    reason = str(exit_event.get("reason", "")).strip()
+    if not reason or reason == "end_of_test":
+        return None
+    return reason
 
 
 def _auto_close_reason_text(reason: str) -> str:
@@ -419,6 +427,21 @@ def _auto_close_reason_text(reason: str) -> str:
         "opposite_signal": "반대 신호",
     }
     return labels.get(reason, reason)
+
+
+def _preview_exit_reason(position_qty: float, latest_state: Dict[str, object]) -> Optional[str]:
+    if position_qty > 0:
+        if bool(latest_state.get("trend_to_short")):
+            return "trend_to_short"
+        if bool(latest_state.get("final_bear")):
+            return "opposite_signal"
+        return None
+    if position_qty < 0:
+        if bool(latest_state.get("trend_to_long")):
+            return "trend_to_long"
+        if bool(latest_state.get("final_bull")):
+            return "opposite_signal"
+    return None
 
 
 def _position_return_pct(position: PositionSnapshot) -> float:
@@ -1105,34 +1128,61 @@ class AutoCloseSignalWorker(QThread):
 
     def __init__(
         self,
+        settings: AppSettings,
         symbol: str,
+        interval: str,
         history: pd.DataFrame,
         strategy_settings: StrategySettings,
+        existing_backtest: Optional[BacktestResult],
     ) -> None:
         super().__init__()
+        self.settings = settings
         self.symbol = symbol
+        self.interval = interval
         self.history = prepare_ohlcv(history.copy())
         self.strategy_settings = strategy_settings
+        self.existing_backtest = existing_backtest
 
     def run(self) -> None:
         try:
-            latest_state, _ = evaluate_latest_state(self.history, self.strategy_settings)
-            if not latest_state:
-                raise RuntimeError(f"{self.symbol} auto-close latest state is empty.")
+            backtest_start_time = pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms")
+            use_existing_backtest = (
+                self.existing_backtest is not None
+                and self.existing_backtest.settings == self.strategy_settings
+                and _backtest_matches_history(self.existing_backtest, self.history)
+            )
+            if use_existing_backtest:
+                backtest = self.existing_backtest
+            elif (
+                self.existing_backtest is not None
+                and self.existing_backtest.settings == self.strategy_settings
+                and _history_can_resume_backtest(self.existing_backtest, self.history)
+            ):
+                backtest = resume_backtest(
+                    self.history,
+                    previous_result=self.existing_backtest,
+                    settings=self.strategy_settings,
+                    fee_rate=self.settings.fee_rate,
+                    backtest_start_time=backtest_start_time,
+                )
+            else:
+                backtest = run_backtest(
+                    self.history,
+                    settings=self.strategy_settings,
+                    fee_rate=self.settings.fee_rate,
+                    backtest_start_time=backtest_start_time,
+                )
             latest_time = pd.Timestamp(self.history["time"].iloc[-1])
             if self.isInterruptionRequested():
                 return
             self.completed.emit(
                 {
+                    "interval": self.interval,
                     "symbol": self.symbol,
                     "history": self.history,
                     "bar_time": latest_time,
-                    "latest_state": {
-                        "trend_to_long": bool(latest_state.get("trend_to_long", False)),
-                        "trend_to_short": bool(latest_state.get("trend_to_short", False)),
-                        "final_bull": bool(latest_state.get("final_bull", False)),
-                        "final_bear": bool(latest_state.get("final_bear", False)),
-                    },
+                    "backtest": backtest,
+                    "exit_event": _latest_backtest_exit_event(backtest),
                 }
             )
         except Exception:
@@ -1282,6 +1332,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.live_backtest_started_at = 0.0
         self.chart_render_signature: Tuple[object, ...] = (None, 0)
         self.current_lightweight_markers: List[Dict[str, object]] = []
+        self.current_lightweight_rendered_markers: List[Dict[str, object]] = []
+        self.current_lightweight_preview_marker: Optional[Dict[str, object]] = None
         self._tracked_threads: set[QThread] = set()
         self.auto_close_enabled_symbols: set[str] = set()
         self.auto_close_monitor_histories: Dict[str, pd.DataFrame] = {}
@@ -1317,6 +1369,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.ema_slow_line = None
         self.chart_render_signature = (None, 0)
         self.current_lightweight_markers = []
+        self.current_lightweight_rendered_markers = []
+        self.current_lightweight_preview_marker = None
         self.simple_order_buttons: List[QPushButton] = []
         self.position_close_buttons: List[QPushButton] = []
         self.position_action_widgets: List[QWidget] = []
@@ -1561,6 +1615,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.interval_combo.addItems(APP_INTERVAL_OPTIONS)
         self.chart_engine_combo = QComboBox()
         self.chart_engine_combo.addItems(CHART_ENGINE_OPTIONS)
+        self.chart_engine_combo.setEnabled(False)
         self.history_days_spin = QSpinBox()
         self.history_days_spin.setRange(1, 30)
         self.scan_workers_spin = QSpinBox()
@@ -1996,8 +2051,9 @@ class AltReversalTraderWindow(QMainWindow):
         self.log(f"{engine_label} 렌더 프로세스 종료. 로그: {path}")
 
     def on_chart_engine_changed(self, _engine: str) -> None:
-        self.settings.chart_engine = self.chart_engine_combo.currentText()
-        self._rebuild_chart_engine()
+        self.settings.chart_engine = "Lightweight"
+        if self.chart_engine_combo.currentText() != "Lightweight":
+            self.chart_engine_combo.setCurrentText("Lightweight")
 
     def _apply_loaded_settings(self) -> None:
         settings = self.settings
@@ -2013,7 +2069,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.atr_4h_filter_check.setChecked(settings.use_atr_4h_filter)
         self.atr_4h_spin.setValue(settings.atr_4h_min_pct)
         self.interval_combo.setCurrentText(settings.kline_interval)
-        self.chart_engine_combo.setCurrentText(settings.chart_engine)
+        self.chart_engine_combo.setCurrentText("Lightweight")
         self.history_days_spin.setValue(settings.history_days)
         self.scan_workers_spin.setValue(settings.scan_workers)
         self.opt_span_spin.setValue(settings.optimization_span_pct)
@@ -2048,7 +2104,7 @@ class AltReversalTraderWindow(QMainWindow):
         return AppSettings(
             api_key=self.api_key_edit.text().strip(),
             api_secret=self.api_secret_edit.text().strip(),
-            chart_engine=self.chart_engine_combo.currentText(),
+            chart_engine="Lightweight",
             leverage=int(self.leverage_spin.value()),
             order_mode="simple" if self.simple_order_radio.isChecked() else "compound",
             simple_order_amount=float(self.simple_order_amount_spin.value()),
@@ -2398,6 +2454,82 @@ class AltReversalTraderWindow(QMainWindow):
             marker.get("text"),
         )
 
+    def _compose_lightweight_markers(self, confirmed_markers: Optional[List[Dict[str, object]]] = None) -> List[Dict[str, object]]:
+        markers = list(self.current_lightweight_markers if confirmed_markers is None else confirmed_markers)
+        preview = self.current_lightweight_preview_marker
+        if preview is None:
+            return markers
+        preview_key = (pd.Timestamp(preview["time"]), preview.get("position"), preview.get("shape"))
+        for marker in markers:
+            marker_key = (pd.Timestamp(marker["time"]), marker.get("position"), marker.get("shape"))
+            if marker_key == preview_key:
+                return markers
+        markers.append(preview)
+        return markers
+
+    def _render_lightweight_markers(self, confirmed_markers: Optional[List[Dict[str, object]]] = None) -> None:
+        if self.chart_mode != "Lightweight" or self.chart is None:
+            return
+        if confirmed_markers is not None:
+            self.current_lightweight_markers = list(confirmed_markers)
+        rendered_markers = self._compose_lightweight_markers()
+        rendered_signature = [self._marker_signature(marker) for marker in rendered_markers]
+        current_signature = [self._marker_signature(marker) for marker in self.current_lightweight_rendered_markers]
+        if rendered_signature == current_signature:
+            return
+        self.chart.clear_markers()
+        if rendered_markers:
+            self.chart.marker_list(rendered_markers)
+        self.current_lightweight_rendered_markers = list(rendered_markers)
+
+    def _build_live_preview_exit_marker(self, symbol: str) -> Optional[Dict[str, object]]:
+        if (
+            symbol != self.current_symbol
+            or self.chart_mode != "Lightweight"
+            or self.current_backtest is None
+            or self.current_backtest.cursor is None
+        ):
+            return None
+        position_qty = float(self.current_backtest.cursor.position_qty)
+        if position_qty == 0.0:
+            return None
+        history = self._get_history_frame(symbol, self.current_interval)
+        if history is None or history.empty:
+            return None
+        latest_state, _ = evaluate_latest_state(
+            history,
+            self.current_backtest.settings,
+            cursor=self.current_backtest.cursor.indicator_cursor,
+        )
+        reason = _preview_exit_reason(position_qty, latest_state)
+        if reason is None:
+            return None
+        latest_time = pd.Timestamp(history["time"].iloc[-1])
+        side = "long" if position_qty > 0 else "short"
+        return {
+            "time": latest_time,
+            "position": "above" if side == "long" else "below",
+            "shape": "circle",
+            "color": "#ff9f1a",
+            "text": f"청산예상 {_auto_close_reason_text(reason)}",
+        }
+
+    def _refresh_live_preview_exit_marker(self, symbol: Optional[str]) -> None:
+        if self.chart_mode != "Lightweight":
+            return
+        target_symbol = str(symbol or "")
+        preview_marker = self._build_live_preview_exit_marker(target_symbol) if target_symbol else None
+        preview_signature = self._marker_signature(preview_marker) if preview_marker is not None else None
+        current_signature = (
+            self._marker_signature(self.current_lightweight_preview_marker)
+            if self.current_lightweight_preview_marker is not None
+            else None
+        )
+        if preview_signature == current_signature:
+            return
+        self.current_lightweight_preview_marker = preview_marker
+        self._render_lightweight_markers()
+
     def _build_chart_render_payload(
         self,
         symbol: str,
@@ -2730,7 +2862,15 @@ class AltReversalTraderWindow(QMainWindow):
             self.auto_close_signal_pending.add(symbol)
             return
         self.auto_close_signal_pending.discard(symbol)
-        worker = AutoCloseSignalWorker(symbol, history, self._active_backtest_settings(symbol))
+        cache_key = self._symbol_interval_key(symbol, desired_interval)
+        worker = AutoCloseSignalWorker(
+            self.settings,
+            symbol,
+            desired_interval,
+            history,
+            self._active_backtest_settings(symbol),
+            self.backtest_cache.get(cache_key),
+        )
         worker.completed.connect(self._on_auto_close_signal_completed)
         worker.failed.connect(lambda message, symbol=symbol: self._on_auto_close_signal_failed(symbol, message))
         self.auto_close_signal_workers[symbol] = worker
@@ -2824,10 +2964,16 @@ class AltReversalTraderWindow(QMainWindow):
         symbol = str(result["symbol"])
         if symbol not in self.auto_close_enabled_symbols or symbol == self.current_symbol:
             return
-        bar_time = result.get("bar_time")
-        if isinstance(bar_time, pd.Timestamp):
-            bar_time = pd.Timestamp(bar_time)
-        self._maybe_trigger_auto_close(symbol, result["latest_state"], bar_time)
+        interval = str(result.get("interval") or self._active_interval_for_symbol(symbol))
+        history = result.get("history")
+        if isinstance(history, pd.DataFrame) and not history.empty:
+            normalized_history = prepare_ohlcv(history.copy())
+            self.auto_close_monitor_histories[symbol] = normalized_history
+            self.history_cache[self._symbol_interval_key(symbol, interval)] = normalized_history
+        backtest = result.get("backtest")
+        if isinstance(backtest, BacktestResult):
+            self.backtest_cache[self._symbol_interval_key(symbol, interval)] = backtest
+        self._maybe_trigger_auto_close(symbol, result.get("exit_event"))
         if symbol in self.auto_close_signal_pending:
             self.auto_close_signal_pending.discard(symbol)
             self._schedule_auto_close_signal(symbol)
@@ -2842,14 +2988,12 @@ class AltReversalTraderWindow(QMainWindow):
             return
         if backtest.indicators.empty:
             return
-        bar_time = pd.Timestamp(backtest.indicators["time"].iloc[-1]) if "time" in backtest.indicators.columns else None
-        self._maybe_trigger_auto_close(symbol, backtest.latest_state, bar_time)
+        self._maybe_trigger_auto_close(symbol, _latest_backtest_exit_event(backtest))
 
     def _maybe_trigger_auto_close(
         self,
         symbol: str,
-        latest_state: Dict[str, object],
-        bar_time: Optional[pd.Timestamp],
+        exit_event: Optional[Dict[str, object]],
     ) -> None:
         if symbol not in self.auto_close_enabled_symbols:
             return
@@ -2858,9 +3002,10 @@ class AltReversalTraderWindow(QMainWindow):
             self._clear_auto_close_symbol(symbol)
             self.update_positions_table()
             return
-        reason = _auto_close_reason(position, latest_state)
+        reason = _auto_close_reason(position, exit_event)
         if reason is None:
             return
+        bar_time = exit_event.get("bar_time") if exit_event else None
         if symbol in self.auto_close_order_pending:
             return
         normalized_bar_time = pd.Timestamp(bar_time) if bar_time is not None else None
@@ -3099,6 +3244,7 @@ class AltReversalTraderWindow(QMainWindow):
         except Exception:
             pass
         self._refresh_live_labels()
+        self._refresh_live_preview_exit_marker(symbol)
 
     def _schedule_live_backtest(self, symbol: str) -> None:
         if symbol != self.current_symbol:
@@ -3830,8 +3976,11 @@ class AltReversalTraderWindow(QMainWindow):
         else:
             self.chart_render_signature = render_signature
             self.current_lightweight_markers = list(markers) if self.chart_mode == "Lightweight" else []
+            self.current_lightweight_rendered_markers = list(markers) if self.chart_mode == "Lightweight" else []
+            self.current_lightweight_preview_marker = None
             self._update_entry_price_overlay()
             self._refresh_live_labels()
+            self._refresh_live_preview_exit_marker(symbol)
         self._log_perf(f"{symbol} worker apply", apply_started_at)
         if self.symbol_load_started_at > 0:
             self._log_perf(f"{symbol} symbol load ready", self.symbol_load_started_at)
@@ -3859,6 +4008,7 @@ class AltReversalTraderWindow(QMainWindow):
         chart_indicators: Optional[pd.DataFrame] = None,
     ) -> None:
         candle_df, indicators, equity_df, markers = self._build_chart_render_payload(symbol, result, chart_indicators)
+        self.current_lightweight_preview_marker = None
         if self.chart_mode == "Lightweight":
             self._render_lightweight_chart(symbol, candle_df, indicators, equity_df, markers, reset_view=reset_view)
             self.current_lightweight_markers = list(markers)
@@ -3885,6 +4035,7 @@ class AltReversalTraderWindow(QMainWindow):
         )
         self._update_entry_price_overlay()
         self._refresh_live_labels()
+        self._refresh_live_preview_exit_marker(symbol)
 
     def _render_plotly_chart(
         self,
@@ -3930,7 +4081,6 @@ class AltReversalTraderWindow(QMainWindow):
             self._stash_lightweight_range()
         self.chart.set(candle_df)
         self._apply_lightweight_precision(symbol, candle_df)
-        self.chart.clear_markers()
         self.supertrend_line.set(indicators[["time", "supertrend"]].rename(columns={"supertrend": "Supertrend"}))
         self.zone2_line.set(indicators[["time", "zone2_line"]].rename(columns={"zone2_line": "Zone 2"}))
         self.zone3_line.set(indicators[["time", "zone3_line"]].rename(columns={"zone3_line": "Zone 3"}))
@@ -3938,8 +4088,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.ema_slow_line.set(indicators[["time", "ema_slow"]].rename(columns={"ema_slow": "EMA Slow"}))
         self.equity_line.set(equity_df)
         range_start, range_end = self._default_chart_time_range(candle_df)
-        if markers:
-            self.chart.marker_list(markers)
+        self._render_lightweight_markers(markers)
         if reset_view:
             QTimer.singleShot(
                 140,
@@ -4038,24 +4187,12 @@ class AltReversalTraderWindow(QMainWindow):
                 return False
             self.equity_line.update(equity_df.iloc[-1].copy())
             new_markers = self._trade_markers(new_backtest.trades, pd.Timestamp(chart_history["time"].iloc[-1]))
-            if self._marker_prefix_matches(self.current_lightweight_markers, new_markers):
-                for marker in new_markers[len(self.current_lightweight_markers) :]:
-                    self.chart.marker(
-                        time=pd.Timestamp(marker["time"]),
-                        position=str(marker["position"]),
-                        shape=str(marker["shape"]),
-                        color=str(marker["color"]),
-                        text=str(marker["text"]),
-                    )
-            else:
-                self.chart.clear_markers()
-                if new_markers:
-                    self.chart.marker_list(new_markers)
-            self.current_lightweight_markers = list(new_markers)
+            self._render_lightweight_markers(new_markers)
             candle_df = new_frame[["time", "open", "high", "low", "close", "volume"]].copy()
             self.chart_render_signature = self._chart_render_signature_for_payload(candle_df, new_frame, equity_df, new_markers)
             self._update_entry_price_overlay()
             self._refresh_live_labels()
+            self._refresh_live_preview_exit_marker(symbol)
             return True
         except Exception:
             return False

@@ -9,7 +9,7 @@ import json
 
 APP_CONFIG_PATH = Path("alt_reversal_trader_config.json")
 APP_INTERVAL_OPTIONS = ("1m", "2m", "3m", "5m", "15m")
-CHART_ENGINE_OPTIONS = ("Plotly", "Lightweight")
+CHART_ENGINE_OPTIONS = ("Lightweight",)
 DEFAULT_OPTIMIZATION_PROFILE_SCALE = 20.0
 QIP_SENSITIVITY_OPTIONS = (
     "1-Ultra Fine Max",
@@ -77,7 +77,7 @@ class StrategySettings:
 class AppSettings:
     api_key: str = ""
     api_secret: str = ""
-    chart_engine: str = "Plotly"
+    chart_engine: str = "Lightweight"
     leverage: int = 3
     order_mode: str = "compound"
     simple_order_amount: float = 50.0
@@ -104,8 +104,7 @@ class AppSettings:
     position_intervals: Dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.chart_engine not in CHART_ENGINE_OPTIONS:
-            self.chart_engine = CHART_ENGINE_OPTIONS[0]
+        self.chart_engine = CHART_ENGINE_OPTIONS[0]
         if self.order_mode not in {"compound", "simple"}:
             self.order_mode = "compound"
         self.simple_order_amount = max(1.0, float(self.simple_order_amount))
