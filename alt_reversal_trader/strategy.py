@@ -107,6 +107,10 @@ class BacktestCursor:
     short_zone_used: Tuple[bool, bool, bool]
     last_long_zone: int
     last_short_zone: int
+    last_entry_signal_time: Optional[pd.Timestamp]
+    last_entry_signal_price: float
+    last_entry_signal_side: str
+    last_entry_signal_zone: int
     last_equity_value: float
     indicator_cursor: Optional["IndicatorCursor"] = None
 
@@ -1134,6 +1138,10 @@ def _run_backtest_core(
         short_zone_used = [False, False, False]
         last_long_zone = 0
         last_short_zone = 0
+        last_entry_signal_time: Optional[pd.Timestamp] = None
+        last_entry_signal_price = 0.0
+        last_entry_signal_side = ""
+        last_entry_signal_zone = 0
     else:
         equity = float(resume_cursor.equity)
         position_qty = float(resume_cursor.position_qty)
@@ -1151,6 +1159,14 @@ def _run_backtest_core(
         short_zone_used = list(resume_cursor.short_zone_used)
         last_long_zone = int(resume_cursor.last_long_zone)
         last_short_zone = int(resume_cursor.last_short_zone)
+        last_entry_signal_time = (
+            pd.Timestamp(resume_cursor.last_entry_signal_time)
+            if resume_cursor.last_entry_signal_time is not None
+            else None
+        )
+        last_entry_signal_price = float(resume_cursor.last_entry_signal_price)
+        last_entry_signal_side = str(resume_cursor.last_entry_signal_side)
+        last_entry_signal_zone = int(resume_cursor.last_entry_signal_zone)
     equity_curve_values = np.empty(active_count, dtype=float) if active_count else np.empty(0, dtype=float)
     if start_index > 0 and existing_equity_curve is not None and len(existing_equity_curve) >= start_index:
         equity_curve_values[:start_index] = existing_equity_curve.iloc[:start_index].to_numpy(dtype=float, copy=False)
@@ -1163,6 +1179,7 @@ def _run_backtest_core(
 
     def add_position(side: str, price: float, time_value: pd.Timestamp, zone: int) -> None:
         nonlocal equity, position_qty, avg_entry_price, entry_side, entry_time, entry_price, last_long_zone, last_short_zone
+        nonlocal last_entry_signal_time, last_entry_signal_price, last_entry_signal_side, last_entry_signal_zone
         allocation_pct = settings.entry_size_pct / 100.0
         if settings.beast_mode and zone in (2, 3):
             if zone == 2:
@@ -1197,6 +1214,10 @@ def _run_backtest_core(
         else:
             short_zone_used[zone - 1] = True
             last_short_zone = zone
+        last_entry_signal_time = pd.Timestamp(time_value)
+        last_entry_signal_price = float(price)
+        last_entry_signal_side = str(side)
+        last_entry_signal_zone = int(zone)
 
     def close_position(price: float, time_value: pd.Timestamp, reason: str) -> None:
         nonlocal equity, position_qty, avg_entry_price, entry_side, entry_time, entry_price
@@ -1305,6 +1326,10 @@ def _run_backtest_core(
             short_zone_used=tuple(bool(flag) for flag in short_zone_used),
             last_long_zone=int(last_long_zone),
             last_short_zone=int(last_short_zone),
+            last_entry_signal_time=last_entry_signal_time,
+            last_entry_signal_price=float(last_entry_signal_price),
+            last_entry_signal_side=str(last_entry_signal_side),
+            last_entry_signal_zone=int(last_entry_signal_zone),
             last_equity_value=last_equity_value,
             indicator_cursor=indicator_cursor,
         )
