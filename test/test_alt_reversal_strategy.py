@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from alt_reversal_trader.config import DEFAULT_OPTIMIZE_FLAGS, StrategySettings
 from alt_reversal_trader.binance_futures import BinanceFuturesClient, resample_ohlcv
+from alt_reversal_trader.live_chart_utils import history_with_live_preview, seed_two_minute_aggregate
 from alt_reversal_trader.optimizer import (
     generate_parameter_grid,
     optimization_sort_key,
@@ -294,3 +295,67 @@ def test_get_open_positions_recomputes_unrealized_pnl() -> None:
     positions = client.get_open_positions()
     assert len(positions) == 1
     assert abs(positions[0].unrealized_pnl - 10.0) < 1e-9
+
+
+def test_history_with_live_preview_appends_without_mutating_source() -> None:
+    confirmed = make_sample_ohlcv(3)
+    preview_bar = {
+        "symbol": "TESTUSDT",
+        "interval": "1m",
+        "time": confirmed["time"].iloc[-1] + pd.Timedelta(minutes=1),
+        "open": 111.0,
+        "high": 112.0,
+        "low": 110.0,
+        "close": 111.5,
+        "volume": 77.0,
+        "quote_volume": 8585.5,
+    }
+    displayed = history_with_live_preview(confirmed, preview_bar)
+    assert displayed is not None
+    assert len(displayed) == len(confirmed) + 1
+    assert displayed["time"].iloc[-1] == preview_bar["time"]
+    assert float(displayed["quote_volume"].iloc[-1]) == preview_bar["quote_volume"]
+    assert len(confirmed) == 3
+
+
+def test_history_with_live_preview_replaces_same_timestamp() -> None:
+    confirmed = make_sample_ohlcv(3)
+    preview_bar = {
+        "symbol": "TESTUSDT",
+        "interval": "1m",
+        "time": confirmed["time"].iloc[-1],
+        "open": 201.0,
+        "high": 203.0,
+        "low": 200.0,
+        "close": 202.0,
+        "volume": 91.0,
+    }
+    displayed = history_with_live_preview(confirmed, preview_bar)
+    assert displayed is not None
+    assert len(displayed) == len(confirmed)
+    assert float(displayed["close"].iloc[-1]) == 202.0
+    assert float(confirmed["close"].iloc[-1]) != 202.0
+
+
+def test_seed_two_minute_aggregate_uses_only_first_minute_seed() -> None:
+    first_minute = pd.DataFrame(
+        {
+            "time": pd.to_datetime(["2026-01-01 00:00:00", "2026-01-01 00:02:00"]),
+            "open": [100.0, 101.0],
+            "high": [101.0, 102.0],
+            "low": [99.0, 100.0],
+            "close": [100.5, 101.5],
+            "volume": [10.0, 20.0],
+            "quote_volume": [1000.0, 2100.0],
+        }
+    )
+    seed = seed_two_minute_aggregate(first_minute, "TESTUSDT", "2m")
+    assert seed is not None
+    assert seed["time"] == pd.Timestamp("2026-01-01 00:02:00")
+    assert float(seed["base_volume"]) == 20.0
+    assert float(seed["base_quote_volume"]) == 2100.0
+
+    second_minute = first_minute.copy()
+    second_minute.loc[1, "time"] = pd.Timestamp("2026-01-01 00:03:00")
+    no_seed = seed_two_minute_aggregate(second_minute, "TESTUSDT", "2m")
+    assert no_seed is None

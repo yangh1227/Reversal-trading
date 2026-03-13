@@ -28,6 +28,12 @@ from .binance_futures import (
 )
 from .config import APP_INTERVAL_OPTIONS, CHART_ENGINE_OPTIONS, PARAMETER_SPECS, AppSettings, StrategySettings
 from .crash_logger import log_runtime_event
+from .live_chart_utils import (
+    history_with_live_preview as _history_with_live_preview,
+    merge_live_bar as _merge_live_bar,
+    preview_bar_matches_context as _preview_bar_matches_context,
+    seed_two_minute_aggregate as _seed_two_minute_aggregate,
+)
 from .optimizer import OptimizationResult, optimization_sort_key, optimize_symbol_interval_results
 from .qt_compat import (
     EVENT_KEY_PRESS,
@@ -129,49 +135,6 @@ def _history_fetch_start_time_ms(settings: AppSettings, interval: Optional[str] 
 
 def _ws_kline_timestamp(time_ms: int) -> pd.Timestamp:
     return pd.to_datetime(int(time_ms), unit="ms", utc=True).tz_convert(None)
-
-
-def _merge_live_bar(df: pd.DataFrame, bar: Dict[str, object], max_rows: Optional[int] = None) -> pd.DataFrame:
-    columns = ["time", "open", "high", "low", "close", "volume"]
-    if (df is not None and "quote_volume" in df.columns) or "quote_volume" in bar:
-        columns.append("quote_volume")
-    frame = df.copy() if df is not None and not df.empty else pd.DataFrame(columns=columns)
-    row_time = pd.Timestamp(bar["time"])
-    row_values = [
-        row_time,
-        float(bar["open"]),
-        float(bar["high"]),
-        float(bar["low"]),
-        float(bar["close"]),
-        float(bar["volume"]),
-    ]
-    if "quote_volume" in columns:
-        row_values.append(float(bar.get("quote_volume", float(bar["close"]) * float(bar["volume"]))))
-    if frame.empty:
-        frame = pd.DataFrame([row_values], columns=columns)
-    else:
-        last_time = pd.Timestamp(frame["time"].iloc[-1])
-        if last_time == row_time:
-            for key, value in zip(columns[1:], row_values[1:]):
-                frame.at[frame.index[-1], key] = value
-        elif last_time < row_time:
-            frame.loc[len(frame)] = row_values
-        else:
-            matches = frame["time"] == row_time
-            if matches.any():
-                idx = frame.index[matches][-1]
-                for key, value in zip(columns[1:], row_values[1:]):
-                    frame.at[idx, key] = value
-            else:
-                frame = (
-                    pd.concat([frame, pd.DataFrame([row_values], columns=columns)], ignore_index=True)
-                    .drop_duplicates(subset=["time"], keep="last")
-                    .sort_values("time")
-                    .reset_index(drop=True)
-                )
-    if max_rows is not None and len(frame) > max_rows:
-        frame = frame.iloc[-max_rows:].reset_index(drop=True)
-    return frame
 
 
 def _merge_ohlcv_frames(
@@ -641,7 +604,7 @@ class KlineStreamWorker(QThread):
     kline = Signal(object)
     status = Signal(str)
 
-    def __init__(self, symbol: str, interval: str) -> None:
+    def __init__(self, symbol: str, interval: str, seed_history: Optional[pd.DataFrame] = None) -> None:
         super().__init__()
         self.symbol = symbol.upper()
         self.interval = interval
@@ -649,6 +612,19 @@ class KlineStreamWorker(QThread):
         self._stopped = False
         self._socket = None
         self._aggregate_bar: Optional[Dict[str, object]] = None
+        self._seed_history = prepare_ohlcv(seed_history.copy()) if seed_history is not None and not seed_history.empty else None
+
+    def _initialize_aggregate_seed(self) -> None:
+        if self.interval != "2m":
+            return
+        recent_history = self._seed_history
+        if recent_history is None:
+            try:
+                recent_history = BinanceFuturesClient().historical_ohlcv_recent(self.symbol, self.stream_interval, bars=2)
+            except Exception:
+                recent_history = None
+        self._aggregate_bar = _seed_two_minute_aggregate(recent_history, self.symbol, self.interval)
+        self._seed_history = None
 
     def stop(self) -> None:
         self._stopped = True
@@ -662,6 +638,7 @@ class KlineStreamWorker(QThread):
         stream_url = f"wss://fstream.binance.com/ws/{self.symbol.lower()}@kline_{self.stream_interval}"
         while not self._stopped:
             try:
+                self._initialize_aggregate_seed()
                 self.status.emit(f"실시간 스트림 연결: {self.symbol} {self.interval}")
                 self._socket = websocket.create_connection(stream_url, timeout=10)
                 self._socket.settimeout(1.0)
@@ -723,10 +700,20 @@ class KlineStreamWorker(QThread):
                 "close": float(bar["close"]),
                 "volume": float(bar["volume"]),
                 "base_volume": float(bar["volume"]),
+                "quote_volume": float(bar.get("quote_volume", 0.0) or 0.0),
+                "base_quote_volume": float(bar.get("quote_volume", 0.0) or 0.0),
                 "closed": False,
             }
-            return [{key: value for key, value in self._aggregate_bar.items() if key != "base_volume"}]
+            return [
+                {
+                    key: value
+                    for key, value in self._aggregate_bar.items()
+                    if key not in {"base_volume", "base_quote_volume"}
+                }
+            ]
 
+        if self._aggregate_bar is None or pd.Timestamp(self._aggregate_bar["time"]) != bucket_time:
+            self._initialize_aggregate_seed()
         if self._aggregate_bar is None or pd.Timestamp(self._aggregate_bar["time"]) != bucket_time:
             provisional = dict(bar)
             provisional["time"] = bucket_time
@@ -737,8 +724,16 @@ class KlineStreamWorker(QThread):
         self._aggregate_bar["low"] = min(float(self._aggregate_bar["low"]), float(bar["low"]))
         self._aggregate_bar["close"] = float(bar["close"])
         self._aggregate_bar["volume"] = float(self._aggregate_bar["base_volume"]) + float(bar["volume"])
+        self._aggregate_bar["quote_volume"] = (
+            float(self._aggregate_bar.get("base_quote_volume", 0.0))
+            + float(bar.get("quote_volume", 0.0) or 0.0)
+        )
         self._aggregate_bar["closed"] = bool(bar.get("closed", False))
-        completed = {key: value for key, value in self._aggregate_bar.items() if key != "base_volume"}
+        completed = {
+            key: value
+            for key, value in self._aggregate_bar.items()
+            if key not in {"base_volume", "base_quote_volume"}
+        }
         if completed["closed"]:
             self._aggregate_bar = None
         return [completed]
@@ -1514,6 +1509,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.position_price_workers: Dict[str, KlineStreamWorker] = {}
         self.account_balance_snapshot: Optional[BalanceSnapshot] = None
         self.live_pending_bar: Optional[Dict[str, object]] = None
+        self.current_live_preview_bar: Optional[Dict[str, object]] = None
         self.recent_symbol_cache_keys: deque[str] = deque(maxlen=RECENT_SYMBOL_CACHE_LIMIT)
         self.chart_history_exhausted: Dict[Tuple[str, str], bool] = {}
         self.chart_history_load_pending = False
@@ -2679,6 +2675,43 @@ class AltReversalTraderWindow(QMainWindow):
     def _set_chart_history_frame(self, symbol: str, frame: pd.DataFrame, interval: Optional[str] = None) -> None:
         self.chart_history_cache[self._symbol_interval_key(symbol, interval)] = frame
 
+    def _clear_current_live_preview(self) -> None:
+        self.current_live_preview_bar = None
+
+    def _current_live_preview_for(
+        self,
+        symbol: Optional[str] = None,
+        interval: Optional[str] = None,
+    ) -> Optional[Dict[str, object]]:
+        target_symbol = symbol or self.current_symbol
+        target_interval = interval or self.current_interval or self.settings.kline_interval
+        if not _preview_bar_matches_context(self.current_live_preview_bar, target_symbol, target_interval):
+            return None
+        return dict(self.current_live_preview_bar)
+
+    def _display_history_frame(
+        self,
+        symbol: str,
+        interval: Optional[str] = None,
+        *,
+        chart: bool = False,
+    ) -> Optional[pd.DataFrame]:
+        target_interval = interval or self.current_interval or self.settings.kline_interval
+        base_frame = (
+            self._get_chart_history_frame(symbol, target_interval)
+            if chart
+            else self._get_history_frame(symbol, target_interval)
+        )
+        preview_bar = self._current_live_preview_for(symbol, target_interval)
+        max_rows = CHART_HISTORY_BAR_LIMIT if chart else None
+        return _history_with_live_preview(base_frame, preview_bar, max_rows=max_rows)
+
+    def _reapply_live_preview_bar(self, symbol: str) -> None:
+        preview_bar = self._current_live_preview_for(symbol, self.current_interval)
+        if preview_bar is None:
+            return
+        self._apply_live_lightweight_bar(symbol, preview_bar)
+
     def _get_pending_history_frame(self, symbol: str, interval: Optional[str] = None) -> Optional[pd.DataFrame]:
         return self.pending_history_cache.get(self._symbol_interval_key(symbol, interval))
 
@@ -3053,7 +3086,7 @@ class AltReversalTraderWindow(QMainWindow):
         ):
             return []
         position_qty = float(self.current_backtest.cursor.position_qty)
-        history = self._get_history_frame(symbol, self.current_interval)
+        history = self._display_history_frame(symbol, self.current_interval)
         if history is None or history.empty:
             return []
         latest_state, _ = evaluate_latest_state(
@@ -3457,7 +3490,11 @@ class AltReversalTraderWindow(QMainWindow):
         if existing is not None and self.auto_close_monitor_intervals.get(symbol) == interval:
             return
         self._stop_auto_close_stream_worker(symbol)
-        worker = KlineStreamWorker(symbol, interval)
+        worker = KlineStreamWorker(
+            symbol,
+            interval,
+            seed_history=self._recent_stream_seed_history(symbol, interval),
+        )
         worker.kline.connect(self._on_auto_close_kline)
         self.auto_close_stream_workers[symbol] = worker
         self._track_mapped_thread(worker, self.auto_close_stream_workers, symbol)
@@ -3762,11 +3799,16 @@ class AltReversalTraderWindow(QMainWindow):
         worker = self.live_stream_worker
         self.live_stream_worker = None
         self.live_pending_bar = None
+        self._clear_current_live_preview()
+        self.current_lightweight_preview_markers = []
+        self.current_lightweight_fast_exit_markers = []
         if self.live_update_timer.isActive():
             self.live_update_timer.stop()
         if worker is not None:
             worker.stop()
             worker.wait(1500)
+        if self.chart_mode == "Lightweight" and self.chart is not None:
+            self._render_lightweight_markers()
 
     def _stop_position_price_worker(self, symbol: str) -> None:
         worker = self.position_price_workers.pop(symbol, None)
@@ -3792,6 +3834,14 @@ class AltReversalTraderWindow(QMainWindow):
             self._track_mapped_thread(worker, self.position_price_workers, symbol)
             worker.start()
 
+    def _recent_stream_seed_history(self, symbol: str, interval: str) -> Optional[pd.DataFrame]:
+        if interval != "2m":
+            return None
+        try:
+            return self.public_client.historical_ohlcv_recent(symbol, "1m", bars=2)
+        except Exception:
+            return None
+
     def _on_position_price_kline(self, payload: object) -> None:
         bar = dict(payload)
         symbol = str(bar.get("symbol", ""))
@@ -3801,7 +3851,12 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _start_live_stream(self, symbol: str) -> None:
         self._stop_live_stream()
-        worker = KlineStreamWorker(symbol, self.current_interval or self.settings.kline_interval)
+        interval = self.current_interval or self.settings.kline_interval
+        worker = KlineStreamWorker(
+            symbol,
+            interval,
+            seed_history=self._recent_stream_seed_history(symbol, interval),
+        )
         worker.kline.connect(self._queue_live_update)
         worker.status.connect(self._on_live_stream_status)
         self.live_stream_worker = worker
@@ -3835,7 +3890,13 @@ class AltReversalTraderWindow(QMainWindow):
         chart_history = self._get_chart_history_frame(symbol, self.current_interval)
         if history is None or chart_history is None:
             return
-
+        self._apply_live_position_price(symbol, float(bar["close"]))
+        if not bool(bar.get("closed")):
+            self.current_live_preview_bar = dict(bar)
+            if self.chart_mode == "Lightweight":
+                self._apply_live_lightweight_bar(symbol, bar)
+            return
+        self._clear_current_live_preview()
         self._set_history_frame(symbol, _merge_live_bar(history, bar), self.current_interval)
         chart_rows = min(
             max(len(chart_history), _initial_chart_bar_limit(self.current_interval)),
@@ -3846,13 +3907,7 @@ class AltReversalTraderWindow(QMainWindow):
             _merge_live_bar(chart_history, bar, max_rows=chart_rows),
             self.current_interval,
         )
-        if bool(bar.get("closed")):
-            self._mark_history_refreshed(symbol, time.time(), self.current_interval)
-        self._apply_live_position_price(symbol, float(bar["close"]))
-        if not bool(bar.get("closed")):
-            if self.chart_mode == "Lightweight":
-                self._apply_live_lightweight_bar(symbol, bar)
-            return
+        self._mark_history_refreshed(symbol, time.time(), self.current_interval)
         self._evaluate_closed_bar_auto_close(symbol, self._get_history_frame(symbol, self.current_interval))
         self._schedule_live_backtest(symbol)
 
@@ -3920,6 +3975,10 @@ class AltReversalTraderWindow(QMainWindow):
         merged_chart_last_time = _frame_last_time(merged_chart_history)
         if worker_chart_last_time is not None and merged_chart_last_time is not None:
             has_newer_live_bar = merged_chart_last_time > worker_chart_last_time
+        preview_bar = self._current_live_preview_for(symbol, self.current_interval)
+        preview_time = pd.Timestamp(preview_bar["time"]) if preview_bar is not None else None
+        if preview_time is not None and (worker_chart_last_time is None or preview_time > worker_chart_last_time):
+            has_newer_live_bar = True
         self._set_history_frame(symbol, merged_history, self.current_interval)
         self._set_chart_history_frame(symbol, merged_chart_history, self.current_interval)
         self.current_backtest = result["backtest"]
@@ -3940,13 +3999,9 @@ class AltReversalTraderWindow(QMainWindow):
             skip_candle_update=has_newer_live_bar,
         )
         if not applied_incrementally:
-            if has_newer_live_bar:
-                self._render_lightweight_markers(self._trade_markers(self.current_backtest.trades, worker_chart_last_time))
-                self._update_entry_price_overlay()
-                self._refresh_live_labels()
-                self._refresh_live_preview_markers(symbol)
-            else:
-                self.render_chart(symbol, self.current_backtest, reset_view=False, chart_indicators=self.current_chart_indicators)
+            self.render_chart(symbol, self.current_backtest, reset_view=False, chart_indicators=self.current_chart_indicators)
+        if has_newer_live_bar:
+            self._reapply_live_preview_bar(symbol)
         self._log_perf(f"{symbol} live chart apply", apply_started_at)
         self.update_summary(symbol, self.current_backtest, self._optimization_result(symbol, self.current_interval))
         if self.live_backtest_started_at > 0:
@@ -4004,9 +4059,9 @@ class AltReversalTraderWindow(QMainWindow):
         ):
             self._clear_entry_price_overlay()
             return
-        frame = self._get_chart_history_frame(position.symbol, self.current_interval)
+        frame = self._display_history_frame(position.symbol, self.current_interval, chart=True)
         if frame is None or frame.empty:
-            frame = self._get_history_frame(position.symbol, self.current_interval)
+            frame = self._display_history_frame(position.symbol, self.current_interval)
         if frame is None or frame.empty:
             self._clear_entry_price_overlay()
             return
@@ -4037,9 +4092,9 @@ class AltReversalTraderWindow(QMainWindow):
             return
 
         self._set_chart_interval_text(self.current_interval or self.settings.kline_interval)
-        frame = self._get_chart_history_frame(symbol, self.current_interval)
+        frame = self._display_history_frame(symbol, self.current_interval, chart=True)
         if frame is None or frame.empty:
-            frame = self._get_history_frame(symbol, self.current_interval)
+            frame = self._display_history_frame(symbol, self.current_interval)
         if frame is None or frame.empty:
             self.current_price_label.setText("현재가: -")
             self._set_bar_close_countdown_text(None)
@@ -4973,6 +5028,22 @@ class AltReversalTraderWindow(QMainWindow):
         same_range = len(new_times) == len(previous_times) and new_times.equals(previous_times)
         if not appended_bar and not same_range:
             return False
+        tracked_columns = [
+            column
+            for column in ("time", "open", "high", "low", "close", "supertrend", "zone2_line", "zone3_line", "ema_fast", "ema_slow")
+            if column in previous_frame.columns and column in new_frame.columns
+        ]
+        if tracked_columns:
+            previous_compare = previous_frame.loc[:, tracked_columns].reset_index(drop=True)
+            if appended_bar:
+                next_compare = new_frame.iloc[: len(previous_frame)].loc[:, tracked_columns].reset_index(drop=True)
+                if not previous_compare.equals(next_compare):
+                    return False
+            elif len(previous_frame) > 1:
+                previous_prefix = previous_compare.iloc[:-1].reset_index(drop=True)
+                next_prefix = new_frame.iloc[:-1].loc[:, tracked_columns].reset_index(drop=True)
+                if not previous_prefix.equals(next_prefix):
+                    return False
         try:
             if not skip_candle_update:
                 latest_bar = _chart_candle_frame(chart_history).iloc[-1].copy()
