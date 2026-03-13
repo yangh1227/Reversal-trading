@@ -7,7 +7,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from alt_reversal_trader.config import DEFAULT_OPTIMIZE_FLAGS, StrategySettings
 from alt_reversal_trader.binance_futures import BinanceFuturesClient, resample_ohlcv
-from alt_reversal_trader.optimizer import generate_parameter_grid, optimize_symbol_intervals
+from alt_reversal_trader.optimizer import generate_parameter_grid, optimize_symbol_intervals, score_optimization_metrics
+from alt_reversal_trader.strategy import StrategyMetrics
 from alt_reversal_trader.strategy import resume_backtest, run_backtest, run_backtest_metrics
 
 
@@ -178,7 +179,28 @@ def test_optimize_symbol_intervals_returns_best_interval() -> None:
         backtest_start_time=df["time"].iloc[200],
     )
     assert result.best_interval in {"1m", "2m"}
+    assert 0.0 <= result.score <= 100.0
     assert not history.empty
+
+
+def test_optimization_score_weights_return_most() -> None:
+    higher_return = StrategyMetrics(
+        total_return_pct=32.0,
+        net_profit=320.0,
+        max_drawdown_pct=12.0,
+        trade_count=20,
+        win_rate_pct=58.0,
+        profit_factor=1.7,
+    )
+    lower_return = StrategyMetrics(
+        total_return_pct=18.0,
+        net_profit=180.0,
+        max_drawdown_pct=10.0,
+        trade_count=20,
+        win_rate_pct=60.0,
+        profit_factor=1.8,
+    )
+    assert score_optimization_metrics(higher_return) > score_optimization_metrics(lower_return)
 
 
 def test_get_open_positions_recomputes_unrealized_pnl() -> None:

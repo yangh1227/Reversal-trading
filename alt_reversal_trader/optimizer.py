@@ -16,6 +16,7 @@ class OptimizationResult:
     symbol: str
     best_interval: str
     best_backtest: BacktestResult
+    score: float
     combinations_tested: int
     duration_seconds: float
     trimmed_grid: bool
@@ -23,6 +24,18 @@ class OptimizationResult:
 
 PARAMETER_SPEC_BY_KEY = {spec.key: spec for spec in PARAMETER_SPECS}
 OPTIMIZATION_RESULT_CACHE: Dict[Tuple[object, ...], OptimizationResult] = {}
+
+
+def _clamp_score(value: float, minimum: float = 0.0, maximum: float = 100.0) -> float:
+    return max(float(minimum), min(float(maximum), float(value)))
+
+
+def score_optimization_metrics(metrics: StrategyMetrics) -> float:
+    return_component = 50.0 + (50.0 * math.tanh(float(metrics.total_return_pct) / 35.0))
+    win_component = _clamp_score(float(metrics.win_rate_pct))
+    mdd_component = _clamp_score(100.0 - (float(metrics.max_drawdown_pct) * 2.5))
+    total_score = (return_component * 0.4) + (win_component * 0.4) + (mdd_component * 0.2)
+    return round(_clamp_score(total_score), 2)
 
 
 def _history_signature(df: pd.DataFrame) -> Tuple[object, ...]:
@@ -307,17 +320,21 @@ def optimize_symbol(
             continue
 
         best = best_metrics
+        current_score = score_optimization_metrics(current)
+        best_score = score_optimization_metrics(best)
         current_key = (
+            current_score,
             current.total_return_pct,
-            -current.max_drawdown_pct,
             current.win_rate_pct,
+            -current.max_drawdown_pct,
             current.trade_count,
             current.profit_factor,
         )
         best_key = (
+            best_score,
             best.total_return_pct,
-            -best.max_drawdown_pct,
             best.win_rate_pct,
+            -best.max_drawdown_pct,
             best.trade_count,
             best.profit_factor,
         )
@@ -340,6 +357,7 @@ def optimize_symbol(
         symbol=symbol,
         best_interval=result_interval or "",
         best_backtest=best_result,
+        score=score_optimization_metrics(best_result.metrics),
         combinations_tested=combinations_tested,
         duration_seconds=time.perf_counter() - started,
         trimmed_grid=trimmed,
@@ -395,16 +413,18 @@ def optimize_symbol_intervals(
         current_metrics = current.best_backtest.metrics
         best_metrics = best_result.best_backtest.metrics
         current_key = (
+            current.score,
             current_metrics.total_return_pct,
-            -current_metrics.max_drawdown_pct,
             current_metrics.win_rate_pct,
+            -current_metrics.max_drawdown_pct,
             current_metrics.trade_count,
             current_metrics.profit_factor,
         )
         best_key = (
+            best_result.score,
             best_metrics.total_return_pct,
-            -best_metrics.max_drawdown_pct,
             best_metrics.win_rate_pct,
+            -best_metrics.max_drawdown_pct,
             best_metrics.trade_count,
             best_metrics.profit_factor,
         )
@@ -420,6 +440,7 @@ def optimize_symbol_intervals(
             symbol=symbol,
             best_interval=best_result.best_interval,
             best_backtest=best_result.best_backtest,
+            score=best_result.score,
             combinations_tested=total_combinations,
             duration_seconds=time.perf_counter() - started,
             trimmed_grid=trimmed_any,

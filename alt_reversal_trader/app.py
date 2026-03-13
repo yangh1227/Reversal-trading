@@ -552,9 +552,12 @@ class ScanWorker(QThread):
             candidates = client.scan_alt_candidates(
                 daily_volatility_min=self.settings.daily_volatility_min,
                 quote_volume_min=self.settings.quote_volume_min,
+                use_rsi_filter=self.settings.use_rsi_filter,
                 rsi_length=self.settings.rsi_length,
                 rsi_lower=self.settings.rsi_lower,
                 rsi_upper=self.settings.rsi_upper,
+                use_atr_4h_filter=self.settings.use_atr_4h_filter,
+                atr_4h_min_pct=self.settings.atr_4h_min_pct,
                 workers=self.settings.scan_workers,
                 log_callback=self.progress.emit,
                 should_stop=self.isInterruptionRequested,
@@ -651,7 +654,7 @@ class OptimizeWorker(QThread):
             self.result_ready.emit({"candidate": candidate, "optimization": optimization, "history": best_history})
             self.progress.emit(
                 f"{candidate.symbol} [{optimization.best_interval}]: {optimization.combinations_tested}개 조합 완료, "
-                f"수익률 {optimization.best_backtest.metrics.total_return_pct:.2f}%"
+                f"총점 {optimization.score:.1f} | 수익률 {optimization.best_backtest.metrics.total_return_pct:.2f}%"
             )
 
     def _run_parallel(self, process_count: int) -> None:
@@ -740,7 +743,7 @@ class OptimizeWorker(QThread):
                     self.progress.emit(
                         f"[{completed}/{len(self.candidates)}] {candidate.symbol} [{optimization.best_interval}]: "
                         f"{optimization.combinations_tested}개 조합 완료, "
-                        f"수익률 {optimization.best_backtest.metrics.total_return_pct:.2f}%"
+                        f"총점 {optimization.score:.1f} | 수익률 {optimization.best_backtest.metrics.total_return_pct:.2f}%"
                     )
                 active_jobs = remaining_jobs
 
@@ -1508,6 +1511,14 @@ class AltReversalTraderWindow(QMainWindow):
         self.compound_order_widget.setVisible(not simple_mode)
         self.simple_order_widget.setVisible(simple_mode)
 
+    def _refresh_filter_controls(self) -> None:
+        rsi_enabled = bool(self.rsi_filter_check.isChecked())
+        self.rsi_length_spin.setEnabled(rsi_enabled)
+        self.rsi_lower_spin.setEnabled(rsi_enabled)
+        self.rsi_upper_spin.setEnabled(rsi_enabled)
+        atr_enabled = bool(self.atr_4h_filter_check.isChecked())
+        self.atr_4h_spin.setEnabled(atr_enabled)
+
     def _build_api_group(self) -> QGroupBox:
         group = QGroupBox("Binance API")
         layout = QFormLayout(group)
@@ -1532,6 +1543,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.quote_volume_spin.setRange(0.0, 10_000_000_000.0)
         self.quote_volume_spin.setDecimals(0)
         self.quote_volume_spin.setSingleStep(100_000.0)
+        self.rsi_filter_check = QCheckBox("사용")
         self.rsi_length_spin = QSpinBox()
         self.rsi_length_spin.setRange(2, 100)
         self.rsi_lower_spin = QDoubleSpinBox()
@@ -1540,6 +1552,11 @@ class AltReversalTraderWindow(QMainWindow):
         self.rsi_upper_spin = QDoubleSpinBox()
         self.rsi_upper_spin.setRange(0.0, 100.0)
         self.rsi_upper_spin.setDecimals(1)
+        self.atr_4h_filter_check = QCheckBox("사용")
+        self.atr_4h_spin = QDoubleSpinBox()
+        self.atr_4h_spin.setRange(0.0, 500.0)
+        self.atr_4h_spin.setDecimals(2)
+        self.atr_4h_spin.setSingleStep(1.0)
         self.interval_combo = QComboBox()
         self.interval_combo.addItems(APP_INTERVAL_OPTIONS)
         self.chart_engine_combo = QComboBox()
@@ -1548,11 +1565,16 @@ class AltReversalTraderWindow(QMainWindow):
         self.history_days_spin.setRange(1, 30)
         self.scan_workers_spin = QSpinBox()
         self.scan_workers_spin.setRange(1, 24)
+        self.rsi_filter_check.toggled.connect(self._refresh_filter_controls)
+        self.atr_4h_filter_check.toggled.connect(self._refresh_filter_controls)
         layout.addRow("1일 변동성 % >=", self.daily_vol_spin)
         layout.addRow("24h 거래량 >=", self.quote_volume_spin)
+        layout.addRow("1m RSI 필터", self.rsi_filter_check)
         layout.addRow("1m RSI Length", self.rsi_length_spin)
         layout.addRow("1m RSI Lower <=", self.rsi_lower_spin)
         layout.addRow("1m RSI Upper >=", self.rsi_upper_spin)
+        layout.addRow("4h ATR% 필터", self.atr_4h_filter_check)
+        layout.addRow("4h ATR% >=", self.atr_4h_spin)
         layout.addRow("백테스트 봉", self.interval_combo)
         layout.addRow("차트 엔진", self.chart_engine_combo)
         layout.addRow("히스토리 일수", self.history_days_spin)
@@ -1568,6 +1590,10 @@ class AltReversalTraderWindow(QMainWindow):
         self.opt_span_spin.setSingleStep(1.0)
         self.opt_steps_spin = QSpinBox()
         self.opt_steps_spin.setRange(1, 9)
+        self.opt_min_score_spin = QDoubleSpinBox()
+        self.opt_min_score_spin.setRange(0.0, 100.0)
+        self.opt_min_score_spin.setDecimals(1)
+        self.opt_min_score_spin.setSingleStep(1.0)
         self.max_combo_spin = QSpinBox()
         self.max_combo_spin.setRange(10, 20_000)
         self.opt_process_spin = QSpinBox()
@@ -1577,6 +1603,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.fee_spin.setRange(0.0, 5.0)
         self.fee_spin.setDecimals(4)
         self.fee_spin.setSingleStep(0.01)
+        self.opt_min_score_spin.valueChanged.connect(lambda _value: self.update_optimized_table())
         def _set_row_label(editor, label: str) -> None:
             field_label = layout.labelForField(editor)
             if field_label is not None:
@@ -1584,12 +1611,14 @@ class AltReversalTraderWindow(QMainWindow):
         self.optimize_timeframe_check.setText("1m / 2m 최적화")
         layout.addRow("범위 ±%", self.opt_span_spin)
         layout.addRow("격자 단계수", self.opt_steps_spin)
+        layout.addRow("최소 총점", self.opt_min_score_spin)
         layout.addRow("최대 조합수", self.max_combo_spin)
         layout.addRow("최적화 프로세스", self.opt_process_spin)
         layout.addRow("타임프레임", self.optimize_timeframe_check)
         layout.addRow("수수료 %", self.fee_spin)
         _set_row_label(self.opt_span_spin, "범위 스케일 (20=기본)")
         _set_row_label(self.opt_steps_spin, "항목별 샘플 상한")
+        _set_row_label(self.opt_min_score_spin, "최소 총점 (0=모두)")
         _set_row_label(self.max_combo_spin, "최대 조합수")
         _set_row_label(self.opt_process_spin, "최적화 프로세스")
         _set_row_label(self.optimize_timeframe_check, "타임프레임")
@@ -1657,8 +1686,8 @@ class AltReversalTraderWindow(QMainWindow):
     def _build_candidate_group(self) -> QGroupBox:
         group = QGroupBox("후보 종목")
         layout = QVBoxLayout(group)
-        self.candidate_table = QTableWidget(0, 6)
-        self.candidate_table.setHorizontalHeaderLabels(["Symbol", "DayVol%", "24h Vol", "RSI1m", "24h%", "Price"])
+        self.candidate_table = QTableWidget(0, 7)
+        self.candidate_table.setHorizontalHeaderLabels(["Symbol", "DayVol%", "ATR4h%", "24h Vol", "RSI1m", "24h%", "Price"])
         self.candidate_table.setSelectionBehavior(SELECT_ROWS)
         self.candidate_table.setSelectionMode(SINGLE_SELECTION)
         self.candidate_table.setEditTriggers(NO_EDIT_TRIGGERS)
@@ -1671,8 +1700,8 @@ class AltReversalTraderWindow(QMainWindow):
     def _build_optimized_group(self) -> QGroupBox:
         group = QGroupBox("최적화 종목")
         layout = QVBoxLayout(group)
-        self.optimized_table = QTableWidget(0, 8)
-        self.optimized_table.setHorizontalHeaderLabels(["Symbol", "TF", "Return%", "MDD%", "Trades", "Win%", "PF", "Grid"])
+        self.optimized_table = QTableWidget(0, 9)
+        self.optimized_table.setHorizontalHeaderLabels(["Symbol", "TF", "Score", "Return%", "MDD%", "Trades", "Win%", "PF", "Grid"])
         self.optimized_table.setSelectionBehavior(SELECT_ROWS)
         self.optimized_table.setSelectionMode(SINGLE_SELECTION)
         self.optimized_table.setEditTriggers(NO_EDIT_TRIGGERS)
@@ -1977,15 +2006,19 @@ class AltReversalTraderWindow(QMainWindow):
         self.leverage_spin.setValue(settings.leverage)
         self.daily_vol_spin.setValue(settings.daily_volatility_min)
         self.quote_volume_spin.setValue(settings.quote_volume_min)
+        self.rsi_filter_check.setChecked(settings.use_rsi_filter)
         self.rsi_length_spin.setValue(settings.rsi_length)
         self.rsi_lower_spin.setValue(settings.rsi_lower)
         self.rsi_upper_spin.setValue(settings.rsi_upper)
+        self.atr_4h_filter_check.setChecked(settings.use_atr_4h_filter)
+        self.atr_4h_spin.setValue(settings.atr_4h_min_pct)
         self.interval_combo.setCurrentText(settings.kline_interval)
         self.chart_engine_combo.setCurrentText(settings.chart_engine)
         self.history_days_spin.setValue(settings.history_days)
         self.scan_workers_spin.setValue(settings.scan_workers)
         self.opt_span_spin.setValue(settings.optimization_span_pct)
         self.opt_steps_spin.setValue(settings.optimization_steps)
+        self.opt_min_score_spin.setValue(settings.optimization_min_score)
         self.max_combo_spin.setValue(settings.max_grid_combinations)
         self.opt_process_spin.setValue(settings.optimize_processes)
         self.optimize_timeframe_check.setChecked(settings.optimize_timeframe)
@@ -1996,6 +2029,7 @@ class AltReversalTraderWindow(QMainWindow):
         else:
             self.compound_order_radio.setChecked(True)
         self._refresh_order_mode_ui()
+        self._refresh_filter_controls()
 
     def collect_settings(self) -> AppSettings:
         strategy_payload: Dict[str, object] = {}
@@ -2023,11 +2057,15 @@ class AltReversalTraderWindow(QMainWindow):
             kline_interval=self.interval_combo.currentText(),
             daily_volatility_min=float(self.daily_vol_spin.value()),
             quote_volume_min=float(self.quote_volume_spin.value()),
+            use_rsi_filter=bool(self.rsi_filter_check.isChecked()),
             rsi_length=int(self.rsi_length_spin.value()),
             rsi_lower=float(self.rsi_lower_spin.value()),
             rsi_upper=float(self.rsi_upper_spin.value()),
+            use_atr_4h_filter=bool(self.atr_4h_filter_check.isChecked()),
+            atr_4h_min_pct=float(self.atr_4h_spin.value()),
             optimization_span_pct=float(self.opt_span_spin.value()),
             optimization_steps=int(self.opt_steps_spin.value()),
+            optimization_min_score=float(self.opt_min_score_spin.value()),
             max_grid_combinations=int(self.max_combo_spin.value()),
             scan_workers=int(self.scan_workers_spin.value()),
             optimize_processes=int(self.opt_process_spin.value()),
@@ -2555,7 +2593,12 @@ class AltReversalTraderWindow(QMainWindow):
             result.symbol
             for result in sorted(
                 self.optimized_results.values(),
-                key=lambda item: item.best_backtest.metrics.total_return_pct,
+                key=lambda item: (
+                    item.score,
+                    item.best_backtest.metrics.total_return_pct,
+                    item.best_backtest.metrics.win_rate_pct,
+                    -item.best_backtest.metrics.max_drawdown_pct,
+                ),
                 reverse=True,
             )[:HISTORY_CACHE_SYMBOL_LIMIT]
         ]
@@ -3402,8 +3445,9 @@ class AltReversalTraderWindow(QMainWindow):
             values = [
                 candidate.symbol,
                 f"{candidate.daily_volatility_pct:.2f}",
+                f"{candidate.atr_4h_pct:.2f}" if pd.notna(candidate.atr_4h_pct) else "-",
                 f"{candidate.quote_volume:,.0f}",
-                f"{candidate.rsi_1m:.2f}",
+                f"{candidate.rsi_1m:.2f}" if pd.notna(candidate.rsi_1m) else "-",
                 f"{candidate.price_change_pct:.2f}",
                 f"{candidate.last_price:.6f}",
             ]
@@ -3413,19 +3457,31 @@ class AltReversalTraderWindow(QMainWindow):
                 self.candidate_table.setItem(row, col, item)
         self.candidate_table.setUpdatesEnabled(True)
 
-    def update_optimized_table(self) -> None:
-        self.optimized_table.setUpdatesEnabled(False)
+    def _ordered_optimized_results(self) -> List[OptimizationResult]:
+        minimum_score = float(self.opt_min_score_spin.value()) if hasattr(self, "opt_min_score_spin") else 0.0
         ordered = sorted(
             self.optimized_results.values(),
-            key=lambda result: result.best_backtest.metrics.total_return_pct,
+            key=lambda result: (
+                result.score,
+                result.best_backtest.metrics.total_return_pct,
+                result.best_backtest.metrics.win_rate_pct,
+                -result.best_backtest.metrics.max_drawdown_pct,
+                result.best_backtest.metrics.profit_factor,
+            ),
             reverse=True,
         )
+        return [result for result in ordered if result.score >= minimum_score]
+
+    def update_optimized_table(self) -> None:
+        self.optimized_table.setUpdatesEnabled(False)
+        ordered = self._ordered_optimized_results()
         self.optimized_table.setRowCount(len(ordered))
         for row, result in enumerate(ordered):
             metrics = result.best_backtest.metrics
             values = [
                 result.symbol,
                 result.best_interval or self.settings.kline_interval,
+                f"{result.score:.1f}",
                 f"{metrics.total_return_pct:.2f}",
                 f"{metrics.max_drawdown_pct:.2f}",
                 str(metrics.trade_count),
@@ -3815,7 +3871,13 @@ class AltReversalTraderWindow(QMainWindow):
         latest = result.latest_state
         self.symbol_label.setText(
             f"종목: {symbol} | TF {self.current_interval}"
-            + (f" | DayVol {candidate.daily_volatility_pct:.2f}% | RSI1m {candidate.rsi_1m:.2f}" if candidate else "")
+            + (
+                f" | DayVol {candidate.daily_volatility_pct:.2f}%"
+                + (f" | ATR4h {candidate.atr_4h_pct:.2f}%" if candidate and pd.notna(candidate.atr_4h_pct) else "")
+                + (f" | RSI1m {candidate.rsi_1m:.2f}" if candidate and pd.notna(candidate.rsi_1m) else "")
+                if candidate
+                else ""
+            )
         )
         self.signal_label.setText(
             f"신호: Trend {latest['trend']} | Zone {latest['zone']} | "
@@ -4321,6 +4383,7 @@ class AltReversalTraderWindow(QMainWindow):
         metrics = backtest.metrics
         lines = [
             f"Symbol: {symbol}",
+            f"Score: {optimization.score:.1f}" if optimization else "Score: -",
             f"Return: {metrics.total_return_pct:.2f}%",
             f"Net Profit: {metrics.net_profit:.2f}",
             f"Max Drawdown: {metrics.max_drawdown_pct:.2f}%",

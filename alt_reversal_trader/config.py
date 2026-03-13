@@ -86,11 +86,15 @@ class AppSettings:
     kline_interval: str = "1m"
     daily_volatility_min: float = 25.0
     quote_volume_min: float = 1_000_000.0
+    use_rsi_filter: bool = True
     rsi_length: int = 14
     rsi_lower: float = 40.0
     rsi_upper: float = 60.0
+    use_atr_4h_filter: bool = True
+    atr_4h_min_pct: float = 10.0
     optimization_span_pct: float = 20.0
     optimization_steps: int = 5
+    optimization_min_score: float = 0.0
     max_grid_combinations: int = 729
     scan_workers: int = 4
     optimize_processes: int = field(default_factory=default_optimize_process_count)
@@ -105,6 +109,8 @@ class AppSettings:
         if self.order_mode not in {"compound", "simple"}:
             self.order_mode = "compound"
         self.simple_order_amount = max(1.0, float(self.simple_order_amount))
+        self.atr_4h_min_pct = max(0.0, float(self.atr_4h_min_pct))
+        self.optimization_min_score = max(0.0, float(self.optimization_min_score))
         self.scan_workers = max(1, int(self.scan_workers))
         self.optimize_processes = max(1, int(self.optimize_processes))
         if not self.optimize_flags:
@@ -128,11 +134,15 @@ class AppSettings:
             "kline_interval": self.kline_interval,
             "daily_volatility_min": self.daily_volatility_min,
             "quote_volume_min": self.quote_volume_min,
+            "use_rsi_filter": self.use_rsi_filter,
             "rsi_length": self.rsi_length,
             "rsi_lower": self.rsi_lower,
             "rsi_upper": self.rsi_upper,
+            "use_atr_4h_filter": self.use_atr_4h_filter,
+            "atr_4h_min_pct": self.atr_4h_min_pct,
             "optimization_span_pct": self.optimization_span_pct,
             "optimization_steps": self.optimization_steps,
+            "optimization_min_score": self.optimization_min_score,
             "max_grid_combinations": self.max_grid_combinations,
             "scan_workers": self.scan_workers,
             "optimize_processes": self.optimize_processes,

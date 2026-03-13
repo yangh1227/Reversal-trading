@@ -41,6 +41,7 @@ class CandidateSymbol:
     quote_volume: float
     daily_volatility_pct: float
     rsi_1m: float
+    atr_4h_pct: float = float("nan")
 
 
 @dataclass(frozen=True)
@@ -97,6 +98,22 @@ def _daily_volatility_from_klines(df: pd.DataFrame) -> float:
     low = float(row["low"])
     true_range = max(high - low, abs(high - prev_close), abs(low - prev_close))
     return float(true_range / max(abs(low), 1e-9) * 100.0)
+
+
+def _atr_percent_from_klines(df: pd.DataFrame, length: int = 14) -> float:
+    if df.empty or len(df) < max(int(length), 2):
+        return float("nan")
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1.0 / max(int(length), 1), adjust=False, min_periods=int(length)).mean()
+    atr_value = atr.iloc[-1] if len(atr) else np.nan
+    close_value = close.iloc[-1] if len(close) else np.nan
+    if not np.isfinite(atr_value) or not np.isfinite(close_value) or close_value == 0.0:
+        return float("nan")
+    return float(atr_value / abs(close_value) * 100.0)
 
 
 def _rows_to_ohlcv_frame(rows: List[List[Any]]) -> pd.DataFrame:
@@ -508,9 +525,12 @@ class BinanceFuturesClient:
         self,
         daily_volatility_min: float,
         quote_volume_min: float,
+        use_rsi_filter: bool,
         rsi_length: int,
         rsi_lower: float,
         rsi_upper: float,
+        use_atr_4h_filter: bool,
+        atr_4h_min_pct: float,
         workers: int = 8,
         log_callback: Optional[Callable[[str], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
@@ -539,15 +559,23 @@ class BinanceFuturesClient:
             daily_vol = _daily_volatility_from_klines(daily_df)
             if not np.isfinite(daily_vol) or daily_vol < daily_volatility_min:
                 return None
+            atr_4h_pct = float("nan")
+            if use_atr_4h_filter:
+                atr_4h_df = _rows_to_ohlcv_frame(self.klines(symbol, "4h", limit=60, ttl_seconds=0.0))
+                atr_4h_pct = _atr_percent_from_klines(atr_4h_df, length=14)
+                if not np.isfinite(atr_4h_pct) or atr_4h_pct < atr_4h_min_pct:
+                    return None
             if should_stop and should_stop():
                 return None
-            minute_limit = min(max(rsi_length * 3, 60), 99)
-            minute_df = _rows_to_ohlcv_frame(self.klines(symbol, "1m", limit=minute_limit, ttl_seconds=0.0))
-            if len(minute_df) < max(rsi_length + 5, 30):
-                return None
-            rsi_value = _rsi_with_pandas_ta(minute_df["close"], rsi_length)
-            if not np.isfinite(rsi_value) or not (rsi_value <= rsi_lower or rsi_value >= rsi_upper):
-                return None
+            rsi_value = float("nan")
+            if use_rsi_filter:
+                minute_limit = min(max(rsi_length * 3, 60), 99)
+                minute_df = _rows_to_ohlcv_frame(self.klines(symbol, "1m", limit=minute_limit, ttl_seconds=0.0))
+                if len(minute_df) < max(rsi_length + 5, 30):
+                    return None
+                rsi_value = _rsi_with_pandas_ta(minute_df["close"], rsi_length)
+                if not np.isfinite(rsi_value) or not (rsi_value <= rsi_lower or rsi_value >= rsi_upper):
+                    return None
             return CandidateSymbol(
                 symbol=symbol,
                 last_price=float(ticker.get("lastPrice", 0.0) or 0.0),
@@ -555,6 +583,7 @@ class BinanceFuturesClient:
                 quote_volume=float(ticker.get("quoteVolume", 0.0) or 0.0),
                 daily_volatility_pct=float(daily_vol),
                 rsi_1m=float(rsi_value),
+                atr_4h_pct=float(atr_4h_pct),
             )
 
         candidates: List[CandidateSymbol] = []
@@ -580,14 +609,25 @@ class BinanceFuturesClient:
         candidates.sort(
             key=lambda item: (
                 item.daily_volatility_pct,
+                item.atr_4h_pct if np.isfinite(item.atr_4h_pct) else -1.0,
                 item.quote_volume,
-                abs(item.rsi_1m - 50.0),
+                abs(item.rsi_1m - 50.0) if np.isfinite(item.rsi_1m) else 0.0,
             ),
             reverse=True,
         )
+        active_filters = [
+            f"24h 거래량 {quote_volume_min:,.0f}+",
+            f"일변동성 {daily_volatility_min:.2f}%+",
+        ]
+        if use_rsi_filter:
+            active_filters.append(f"1m RSI <= {rsi_lower:.2f} or >= {rsi_upper:.2f}")
+        else:
+            active_filters.append("1m RSI OFF")
+        if use_atr_4h_filter:
+            active_filters.append(f"4h ATR% >= {atr_4h_min_pct:.2f}")
+        else:
+            active_filters.append("4h ATR% OFF")
         log(
-            f"후보 필터 완료 {len(candidates)}개: "
-            f"24h 거래량 {quote_volume_min:,.0f}+ / 일변동성 {daily_volatility_min:.2f}%+ / "
-            f"1m RSI <= {rsi_lower:.2f} or >= {rsi_upper:.2f}"
+            f"후보 필터 완료 {len(candidates)}개: " + " / ".join(active_filters)
         )
         return candidates
