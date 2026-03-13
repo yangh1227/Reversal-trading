@@ -49,6 +49,7 @@ from .qt_compat import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -445,6 +446,106 @@ def _preview_exit_reason(position_qty: float, latest_state: Dict[str, object]) -
     return None
 
 
+def _preview_entry_signal(
+    cursor,
+    latest_state: Dict[str, object],
+    settings: StrategySettings,
+) -> Optional[Tuple[str, int]]:
+    if cursor is None:
+        return None
+    position_qty = float(getattr(cursor, "position_qty", 0.0))
+    long_zone_used = list(getattr(cursor, "long_zone_used", (False, False, False)))
+    short_zone_used = list(getattr(cursor, "short_zone_used", (False, False, False)))
+    last_long_zone = int(getattr(cursor, "last_long_zone", 0))
+    last_short_zone = int(getattr(cursor, "last_short_zone", 0))
+
+    def reset_zones() -> None:
+        nonlocal last_long_zone, last_short_zone
+        long_zone_used[:] = [False, False, False]
+        short_zone_used[:] = [False, False, False]
+        last_long_zone = 0
+        last_short_zone = 0
+
+    if abs(position_qty) < 1e-12:
+        reset_zones()
+
+    if _preview_exit_reason(position_qty, latest_state) is not None:
+        position_qty = 0.0
+        reset_zones()
+
+    if abs(position_qty) < 1e-12:
+        reset_zones()
+
+    lev_zone = int(latest_state.get("zone") or 0)
+    if lev_zone not in {1, 2, 3}:
+        return None
+
+    trend = str(latest_state.get("trend", "")).upper()
+    is_long_trend = trend == "LONG"
+    is_short_trend = trend == "SHORT"
+    final_bull = bool(latest_state.get("final_bull"))
+    final_bear = bool(latest_state.get("final_bear"))
+
+    can_long_z1 = (
+        (not settings.beast_mode)
+        and is_long_trend
+        and final_bull
+        and lev_zone == 1
+        and (not long_zone_used[0])
+        and last_long_zone == 0
+    )
+    can_long_z2 = (
+        is_long_trend
+        and final_bull
+        and lev_zone == 2
+        and (not long_zone_used[1])
+        and last_long_zone in (0, 1)
+    )
+    can_long_z3 = (
+        is_long_trend
+        and final_bull
+        and lev_zone == 3
+        and (not long_zone_used[2])
+        and last_long_zone in (0, 2)
+    )
+    can_short_z1 = (
+        (not settings.beast_mode)
+        and is_short_trend
+        and final_bear
+        and lev_zone == 1
+        and (not short_zone_used[0])
+        and last_short_zone == 0
+    )
+    can_short_z2 = (
+        is_short_trend
+        and final_bear
+        and lev_zone == 2
+        and (not short_zone_used[1])
+        and last_short_zone in (0, 1)
+    )
+    can_short_z3 = (
+        is_short_trend
+        and final_bear
+        and lev_zone == 3
+        and (not short_zone_used[2])
+        and last_short_zone in (0, 2)
+    )
+
+    if can_long_z1:
+        return ("long", 1)
+    if can_long_z2:
+        return ("long", 2)
+    if can_long_z3:
+        return ("long", 3)
+    if can_short_z1:
+        return ("short", 1)
+    if can_short_z2:
+        return ("short", 2)
+    if can_short_z3:
+        return ("short", 3)
+    return None
+
+
 def _position_return_pct(position: PositionSnapshot) -> float:
     notional = abs(float(position.amount)) * float(position.entry_price)
     leverage = max(1, int(position.leverage) or 1)
@@ -596,6 +697,7 @@ class ScanWorker(QThread):
 
 class OptimizeWorker(QThread):
     progress = Signal(str)
+    case_plan = Signal(object)
     result_ready = Signal(object)
     completed = Signal()
     failed = Signal(str)
@@ -660,6 +762,7 @@ class OptimizeWorker(QThread):
             if not histories:
                 self.progress.emit(f"{candidate.symbol}: 히스토리 없음")
                 continue
+            self.case_plan.emit({"candidate": candidate.symbol, "cases": len(histories)})
             interval_results = optimize_symbol_interval_results(
                 symbol=candidate.symbol,
                 histories_by_interval=histories,
@@ -725,8 +828,9 @@ class OptimizeWorker(QThread):
             if not histories:
                 self.progress.emit(f"{candidate.symbol}: 히스토리 없음")
                 return False
+            self.case_plan.emit({"candidate": candidate.symbol, "cases": len(histories)})
             job = pool.apply_async(
-                    optimize_symbol_interval_results,
+                optimize_symbol_interval_results,
                     kwds={
                         "symbol": candidate.symbol,
                         "histories_by_interval": histories,
@@ -1339,7 +1443,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.chart_render_signature: Tuple[object, ...] = (None, 0)
         self.current_lightweight_markers: List[Dict[str, object]] = []
         self.current_lightweight_rendered_markers: List[Dict[str, object]] = []
-        self.current_lightweight_preview_marker: Optional[Dict[str, object]] = None
+        self.current_lightweight_preview_markers: List[Dict[str, object]] = []
         self._tracked_threads: set[QThread] = set()
         self.auto_close_enabled_symbols: set[str] = set()
         self.auto_close_monitor_histories: Dict[str, pd.DataFrame] = {}
@@ -1358,6 +1462,9 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_refresh_timer = QTimer(self)
         self.live_update_timer = QTimer(self)
         self.optimized_table_timer = QTimer(self)
+        self.backtest_progress_total_cases = 0
+        self.backtest_progress_completed_cases = 0
+        self.backtest_progress_phase = "idle"
         self.parameter_editors: Dict[str, object] = {}
         self.parameter_opt_boxes: Dict[str, QCheckBox] = {}
         self.plotly_chart_path = Path("alt_reversal_trader_plotly_chart.html").resolve()
@@ -1376,7 +1483,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.chart_render_signature = (None, 0)
         self.current_lightweight_markers = []
         self.current_lightweight_rendered_markers = []
-        self.current_lightweight_preview_marker = None
+        self.current_lightweight_preview_markers = []
         self.simple_order_buttons: List[QPushButton] = []
         self.position_close_buttons: List[QPushButton] = []
         self.position_action_widgets: List[QWidget] = []
@@ -1466,6 +1573,10 @@ class AltReversalTraderWindow(QMainWindow):
         self.balance_label = QLabel("잔고: API 미입력")
         self.balance_label.setStyleSheet("font-weight: 700; font-size: 13px;")
         balance_layout.addWidget(self.balance_label)
+        self.chart_interval_label = QLabel("차트TF: -")
+        self.chart_interval_label.setStyleSheet("color: #111827; font-weight: 700; font-size: 12px;")
+        balance_layout.addSpacing(12)
+        balance_layout.addWidget(self.chart_interval_label)
         self.bar_close_countdown_label = QLabel("봉마감: -")
         self.bar_close_countdown_label.setStyleSheet("color: #d63b53; font-weight: 700; font-size: 12px;")
         balance_layout.addSpacing(12)
@@ -1820,6 +1931,29 @@ class AltReversalTraderWindow(QMainWindow):
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
         layout.addWidget(self.log_box)
+        self.backtest_progress_label = QLabel("대기중")
+        self.backtest_progress_label.setStyleSheet("color: #5f6b7a; font-size: 12px; font-weight: 700;")
+        layout.addWidget(self.backtest_progress_label)
+        self.backtest_progress_bar = QProgressBar()
+        self.backtest_progress_bar.setRange(0, 1)
+        self.backtest_progress_bar.setValue(0)
+        self.backtest_progress_bar.setTextVisible(True)
+        self.backtest_progress_bar.setFormat("%p%")
+        self.backtest_progress_bar.setStyleSheet(
+            "QProgressBar {"
+            " border: 1px solid #1f2937;"
+            " border-radius: 4px;"
+            " background: #0f172a;"
+            " color: #e5e7eb;"
+            " text-align: center;"
+            " min-height: 14px;"
+            "}"
+            "QProgressBar::chunk {"
+            " background-color: #17c964;"
+            " border-radius: 3px;"
+            "}"
+        )
+        layout.addWidget(self.backtest_progress_bar)
         return group
 
     def _init_chart(self) -> None:
@@ -2514,15 +2648,19 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _compose_lightweight_markers(self, confirmed_markers: Optional[List[Dict[str, object]]] = None) -> List[Dict[str, object]]:
         markers = list(self.current_lightweight_markers if confirmed_markers is None else confirmed_markers)
-        preview = self.current_lightweight_preview_marker
-        if preview is None:
+        preview_markers = list(self.current_lightweight_preview_markers)
+        if not preview_markers:
             return markers
-        preview_key = (pd.Timestamp(preview["time"]), preview.get("position"), preview.get("shape"))
-        for marker in markers:
-            marker_key = (pd.Timestamp(marker["time"]), marker.get("position"), marker.get("shape"))
-            if marker_key == preview_key:
-                return markers
-        markers.append(preview)
+        marker_keys = {
+            (pd.Timestamp(marker["time"]), marker.get("position"), marker.get("shape"))
+            for marker in markers
+        }
+        for preview in preview_markers:
+            preview_key = (pd.Timestamp(preview["time"]), preview.get("position"), preview.get("shape"))
+            if preview_key in marker_keys:
+                continue
+            markers.append(preview)
+            marker_keys.add(preview_key)
         return markers
 
     def _render_lightweight_markers(self, confirmed_markers: Optional[List[Dict[str, object]]] = None) -> None:
@@ -2540,52 +2678,61 @@ class AltReversalTraderWindow(QMainWindow):
             self.chart.marker_list(rendered_markers)
         self.current_lightweight_rendered_markers = list(rendered_markers)
 
-    def _build_live_preview_exit_marker(self, symbol: str) -> Optional[Dict[str, object]]:
+    def _build_live_preview_markers(self, symbol: str) -> List[Dict[str, object]]:
         if (
             symbol != self.current_symbol
             or self.chart_mode != "Lightweight"
             or self.current_backtest is None
             or self.current_backtest.cursor is None
         ):
-            return None
+            return []
         position_qty = float(self.current_backtest.cursor.position_qty)
-        if position_qty == 0.0:
-            return None
         history = self._get_history_frame(symbol, self.current_interval)
         if history is None or history.empty:
-            return None
+            return []
         latest_state, _ = evaluate_latest_state(
             history,
             self.current_backtest.settings,
             cursor=self.current_backtest.cursor.indicator_cursor,
         )
-        reason = _preview_exit_reason(position_qty, latest_state)
-        if reason is None:
-            return None
         latest_time = pd.Timestamp(history["time"].iloc[-1])
-        side = "long" if position_qty > 0 else "short"
-        return {
-            "time": latest_time,
-            "position": "above" if side == "long" else "below",
-            "shape": "circle",
-            "color": "#ff9f1a",
-            "text": f"청산예상 {_auto_close_reason_text(reason)}",
-        }
+        preview_markers: List[Dict[str, object]] = []
+        reason = _preview_exit_reason(position_qty, latest_state)
+        if reason is not None:
+            side = "long" if position_qty > 0 else "short"
+            preview_markers.append(
+                {
+                    "time": latest_time,
+                    "position": "above" if side == "long" else "below",
+                    "shape": "circle",
+                    "color": "#ff9f1a",
+                    "text": f"청산예상 {_auto_close_reason_text(reason)}",
+                }
+            )
+        entry_signal = _preview_entry_signal(self.current_backtest.cursor, latest_state, self.current_backtest.settings)
+        if entry_signal is not None:
+            side, zone = entry_signal
+            preview_markers.append(
+                {
+                    "time": latest_time,
+                    "position": "below" if side == "long" else "above",
+                    "shape": "arrow_up" if side == "long" else "arrow_down",
+                    "color": "#ffb020",
+                    "text": f"진입예상 {side[0].upper()}{zone}",
+                }
+            )
+        return preview_markers
 
-    def _refresh_live_preview_exit_marker(self, symbol: Optional[str]) -> None:
+    def _refresh_live_preview_markers(self, symbol: Optional[str]) -> None:
         if self.chart_mode != "Lightweight":
             return
         target_symbol = str(symbol or "")
-        preview_marker = self._build_live_preview_exit_marker(target_symbol) if target_symbol else None
-        preview_signature = self._marker_signature(preview_marker) if preview_marker is not None else None
-        current_signature = (
-            self._marker_signature(self.current_lightweight_preview_marker)
-            if self.current_lightweight_preview_marker is not None
-            else None
-        )
+        preview_markers = self._build_live_preview_markers(target_symbol) if target_symbol else []
+        preview_signature = [self._marker_signature(marker) for marker in preview_markers]
+        current_signature = [self._marker_signature(marker) for marker in self.current_lightweight_preview_markers]
         if preview_signature == current_signature:
             return
-        self.current_lightweight_preview_marker = preview_marker
+        self.current_lightweight_preview_markers = list(preview_markers)
         self._render_lightweight_markers()
 
     def _build_chart_render_payload(
@@ -3102,6 +3249,8 @@ class AltReversalTraderWindow(QMainWindow):
         if worker is not None and worker.isRunning():
             worker.requestInterruption()
             worker.wait(10000)
+        if self.optimize_worker is None:
+            self._set_backtest_progress_idle()
 
     def _stop_optimize_worker(self) -> None:
         worker = self.optimize_worker
@@ -3109,6 +3258,8 @@ class AltReversalTraderWindow(QMainWindow):
         if worker is not None and worker.isRunning():
             worker.requestInterruption()
             worker.wait(5000)
+        if self.scan_worker is None:
+            self._set_backtest_progress_idle()
 
     def _stop_load_worker(self) -> None:
         worker = self.load_worker
@@ -3297,7 +3448,7 @@ class AltReversalTraderWindow(QMainWindow):
         except Exception:
             pass
         self._refresh_live_labels()
-        self._refresh_live_preview_exit_marker(symbol)
+        self._refresh_live_preview_markers(symbol)
 
     def _schedule_live_backtest(self, symbol: str) -> None:
         if symbol != self.current_symbol:
@@ -3396,6 +3547,11 @@ class AltReversalTraderWindow(QMainWindow):
             return
         self.bar_close_countdown_label.setText(f"봉마감: {countdown}" if countdown else "봉마감: -")
 
+    def _set_chart_interval_text(self, interval: Optional[str]) -> None:
+        if not hasattr(self, "chart_interval_label"):
+            return
+        self.chart_interval_label.setText(f"차트TF: {interval}" if interval else "차트TF: -")
+
     def _update_entry_price_overlay(self) -> None:
         position = self.current_position_snapshot
         if (
@@ -3432,11 +3588,13 @@ class AltReversalTraderWindow(QMainWindow):
             return
         symbol = self.current_symbol
         if not symbol:
+            self._set_chart_interval_text(None)
             self.current_price_label.setText("현재가: -")
             self._set_bar_close_countdown_text(None)
             self._set_lightweight_bar_close_overlay(None, None)
             return
 
+        self._set_chart_interval_text(self.current_interval or self.settings.kline_interval)
         frame = self._get_chart_history_frame(symbol, self.current_interval)
         if frame is None or frame.empty:
             frame = self._get_history_frame(symbol, self.current_interval)
@@ -3714,6 +3872,68 @@ class AltReversalTraderWindow(QMainWindow):
         self.scan_button.setEnabled(not is_running)
         self.refresh_balance_button.setEnabled(not is_running)
 
+    def _set_backtest_progress_idle(self, text: str = "대기중") -> None:
+        self.backtest_progress_phase = "idle"
+        self.backtest_progress_total_cases = 0
+        self.backtest_progress_completed_cases = 0
+        self.backtest_progress_label.setText(text)
+        self.backtest_progress_bar.setRange(0, 1)
+        self.backtest_progress_bar.setValue(0)
+        self.backtest_progress_bar.setFormat("%p%")
+
+    def _set_backtest_progress_scanning(self) -> None:
+        self.backtest_progress_phase = "scan"
+        self.backtest_progress_total_cases = 0
+        self.backtest_progress_completed_cases = 0
+        self.backtest_progress_label.setText("후보 스캔중...")
+        self.backtest_progress_bar.setRange(0, 0)
+        self.backtest_progress_bar.setFormat("스캔중")
+
+    def _begin_backtest_progress(self) -> None:
+        self.backtest_progress_phase = "optimize"
+        self.backtest_progress_total_cases = 0
+        self.backtest_progress_completed_cases = 0
+        self.backtest_progress_label.setText("백테스트중 0/0")
+        self.backtest_progress_bar.setRange(0, 0)
+        self.backtest_progress_bar.setFormat("준비중")
+
+    def _register_backtest_case_plan(self, cases: int) -> None:
+        if self.backtest_progress_phase != "optimize":
+            return
+        if cases <= 0:
+            return
+        self.backtest_progress_total_cases += int(cases)
+        maximum = max(self.backtest_progress_total_cases, self.backtest_progress_completed_cases, 1)
+        self.backtest_progress_bar.setRange(0, maximum)
+        self.backtest_progress_bar.setValue(min(self.backtest_progress_completed_cases, maximum))
+        self.backtest_progress_bar.setFormat("%p%")
+        self.backtest_progress_label.setText(
+            f"백테스트중 {self.backtest_progress_completed_cases}/{self.backtest_progress_total_cases}"
+        )
+
+    def _advance_backtest_progress(self, symbol: str, interval: str) -> None:
+        if self.backtest_progress_phase != "optimize":
+            return
+        self.backtest_progress_completed_cases += 1
+        maximum = max(self.backtest_progress_total_cases, self.backtest_progress_completed_cases, 1)
+        self.backtest_progress_bar.setRange(0, maximum)
+        self.backtest_progress_bar.setValue(min(self.backtest_progress_completed_cases, maximum))
+        self.backtest_progress_bar.setFormat("%p%")
+        self.backtest_progress_label.setText(
+            f"백테스트중 {self.backtest_progress_completed_cases}/{maximum} | {symbol} [{interval}]"
+        )
+
+    def _finish_backtest_progress(self, text: Optional[str] = None) -> None:
+        maximum = max(self.backtest_progress_total_cases, self.backtest_progress_completed_cases, 1)
+        self.backtest_progress_phase = "done"
+        self.backtest_progress_bar.setRange(0, maximum)
+        self.backtest_progress_bar.setValue(min(maximum, self.backtest_progress_completed_cases or maximum))
+        self.backtest_progress_bar.setFormat("%p%")
+        self.backtest_progress_label.setText(
+            text
+            or f"백테스트 완료 {self.backtest_progress_completed_cases}/{max(self.backtest_progress_total_cases, self.backtest_progress_completed_cases)}"
+        )
+
     def _is_refresh_running(self) -> bool:
         return bool(
             (self.scan_worker and self.scan_worker.isRunning())
@@ -3748,6 +3968,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.update_optimized_table()
             self.summary_box.clear()
         self.log("후보 스캔 + 최적화 시작" + (" (기존 목록 유지)" if preserve_existing else ""))
+        self._set_backtest_progress_scanning()
         self._set_refresh_running(True)
         self.scan_worker = ScanWorker(self.settings)
         self._track_thread(self.scan_worker, "scan_worker")
@@ -3775,28 +3996,38 @@ class AltReversalTraderWindow(QMainWindow):
         self.pending_optimized_results = {}
         self.pending_history_cache = {}
         self.preserve_lists_during_refresh = False
+        self._set_backtest_progress_idle("백테스트 대상 없음")
         self._set_refresh_running(False)
 
     def start_optimization(self, targets: List[CandidateSymbol]) -> None:
         if self.optimize_worker and self.optimize_worker.isRunning():
             return
         if not targets:
+            self._set_backtest_progress_idle("백테스트 대상 없음")
             self._set_refresh_running(False)
             return
         self.log(f"최적화 시작: {len(targets)}개 종목")
+        self._begin_backtest_progress()
         self.optimize_worker = OptimizeWorker(self.settings, targets)
         self._track_thread(self.optimize_worker, "optimize_worker")
         self.optimize_worker.progress.connect(self.log)
+        self.optimize_worker.case_plan.connect(self.on_optimization_case_plan)
         self.optimize_worker.result_ready.connect(self.on_optimization_result)
         self.optimize_worker.completed.connect(self.on_optimization_completed)
         self.optimize_worker.failed.connect(self.on_worker_failed)
         self.optimize_worker.start()
+
+    def on_optimization_case_plan(self, payload: object) -> None:
+        result = dict(payload)
+        self._register_backtest_case_plan(int(result.get("cases", 0)))
 
     def on_optimization_result(self, payload: object) -> None:
         result = dict(payload)
         candidate: CandidateSymbol = result["candidate"]
         optimization: OptimizationResult = result["optimization"]
         history: pd.DataFrame = result["history"]
+        interval = optimization.best_interval or self.settings.kline_interval
+        self._advance_backtest_progress(candidate.symbol, interval)
         cache_key = self._symbol_interval_key(candidate.symbol, optimization.best_interval or self.settings.kline_interval)
         self.backtest_cache[cache_key] = optimization.best_backtest
         self.chart_indicator_cache[cache_key] = _chart_indicators_from_backtest(optimization.best_backtest)
@@ -3836,6 +4067,7 @@ class AltReversalTraderWindow(QMainWindow):
         if not preserved_refresh and self.optimized_table.rowCount() > 0:
             self.optimized_table.selectRow(0)
         self._refresh_auto_close_monitors()
+        self._finish_backtest_progress()
         self._set_refresh_running(False)
 
     def on_worker_failed(self, message: str) -> None:
@@ -3845,6 +4077,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.preserve_lists_during_refresh = False
         log_runtime_event("Worker Failure", message, open_notepad=False)
         self.log(message)
+        self._set_backtest_progress_idle("백테스트 실패")
         self._set_refresh_running(False)
         self.show_error(message)
 
@@ -4056,10 +4289,10 @@ class AltReversalTraderWindow(QMainWindow):
             self.chart_render_signature = render_signature
             self.current_lightweight_markers = list(markers) if self.chart_mode == "Lightweight" else []
             self.current_lightweight_rendered_markers = list(markers) if self.chart_mode == "Lightweight" else []
-            self.current_lightweight_preview_marker = None
+            self.current_lightweight_preview_markers = []
             self._update_entry_price_overlay()
             self._refresh_live_labels()
-            self._refresh_live_preview_exit_marker(symbol)
+            self._refresh_live_preview_markers(symbol)
         self._log_perf(f"{symbol} worker apply", apply_started_at)
         if self.symbol_load_started_at > 0:
             self._log_perf(f"{symbol} symbol load ready", self.symbol_load_started_at)
@@ -4087,7 +4320,7 @@ class AltReversalTraderWindow(QMainWindow):
         chart_indicators: Optional[pd.DataFrame] = None,
     ) -> None:
         candle_df, indicators, equity_df, markers = self._build_chart_render_payload(symbol, result, chart_indicators)
-        self.current_lightweight_preview_marker = None
+        self.current_lightweight_preview_markers = []
         if self.chart_mode == "Lightweight":
             self._render_lightweight_chart(symbol, candle_df, indicators, equity_df, markers, reset_view=reset_view)
             self.current_lightweight_markers = list(markers)
@@ -4114,7 +4347,7 @@ class AltReversalTraderWindow(QMainWindow):
         )
         self._update_entry_price_overlay()
         self._refresh_live_labels()
-        self._refresh_live_preview_exit_marker(symbol)
+        self._refresh_live_preview_markers(symbol)
 
     def _render_plotly_chart(
         self,
@@ -4271,7 +4504,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.chart_render_signature = self._chart_render_signature_for_payload(candle_df, new_frame, equity_df, new_markers)
             self._update_entry_price_overlay()
             self._refresh_live_labels()
-            self._refresh_live_preview_exit_marker(symbol)
+            self._refresh_live_preview_markers(symbol)
             return True
         except Exception:
             return False

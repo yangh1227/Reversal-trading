@@ -1072,9 +1072,11 @@ def _select_active_indicators(
 
 
 def _build_latest_state(latest: pd.Series) -> Dict[str, object]:
+    lev_zone_raw = latest.get("lev_zone", 0)
+    lev_zone = int(lev_zone_raw) if pd.notna(lev_zone_raw) else 0
     return {
         "trend": "LONG" if bool(latest["is_long_trend"]) else "SHORT",
-        "zone": int(latest["lev_zone"]),
+        "zone": lev_zone,
         "trend_to_long": bool(latest["trend_to_long"]),
         "trend_to_short": bool(latest["trend_to_short"]),
         "final_bull": bool(latest["final_bull"]),
@@ -1106,7 +1108,7 @@ def _run_backtest_core(
     active_count = len(active_indicators)
     close_values = active_indicators["close"].to_numpy(dtype=float, copy=False)
     time_values = active_indicators["time"].to_numpy(copy=False)
-    lev_zone_values = active_indicators["lev_zone"].to_numpy(dtype=int, copy=False)
+    lev_zone_values = active_indicators["lev_zone"].fillna(0.0).to_numpy(dtype=int, copy=False)
     is_long_trend_values = active_indicators["is_long_trend"].to_numpy(dtype=bool, copy=False)
     is_short_trend_values = active_indicators["is_short_trend"].to_numpy(dtype=bool, copy=False)
     trend_to_long_values = active_indicators["trend_to_long"].to_numpy(dtype=bool, copy=False)
