@@ -1,20 +1,16 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 import json
 import multiprocessing as mp
 from numbers import Number
-from pathlib import Path
 import random
 import time
 from typing import Dict, List, Optional, Tuple
 import traceback
 
 import pandas as pd
-import plotly.graph_objects as go
-import plotly.io as pio
-from plotly.offline import get_plotlyjs
-from plotly.subplots import make_subplots
 from lightweight_charts.widgets import QtChart
 import websocket
 
@@ -46,7 +42,6 @@ from .qt_compat import (
     SINGLE_SELECTION,
     USER_ROLE,
     VERTICAL,
-    WEB_ATTR_FILE_URLS,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -72,9 +67,7 @@ from .qt_compat import (
     QPropertyAnimation,
     QThread,
     QTimer,
-    QUrl,
     QVBoxLayout,
-    QWebEngineView,
     QWidget,
     Signal,
 )
@@ -101,13 +94,42 @@ CHART_LAZY_LOAD_TRIGGER_BARS = 30
 RECENT_DELTA_REFRESH_BARS = 180
 RECENT_DELTA_OVERLAP_BARS = 20
 LIVE_RENDER_INTERVAL_MS = 120
-PLOTLY_LIVE_RENDER_INTERVAL_MS = 350
 OPTIMIZED_TABLE_REFRESH_MS = 250
 HISTORY_CACHE_SYMBOL_LIMIT = 10
 RECENT_SYMBOL_CACHE_LIMIT = 8
 FULL_HISTORY_REFRESH_COOLDOWN_SECONDS = 300.0
 PERFORMANCE_LOG_THRESHOLD_MS = 100.0
 AUTO_TRADE_INTERVAL_MS = 10_000
+_SNAPSHOT_KEEP = object()
+
+
+@dataclass
+class AuthoritativeChartSnapshot:
+    symbol: str
+    interval: str
+    confirmed_history: Optional[pd.DataFrame] = None
+    confirmed_chart_history: Optional[pd.DataFrame] = None
+    backtest: Optional[BacktestResult] = None
+    chart_indicators: Optional[pd.DataFrame] = None
+    preview_bar: Optional[Dict[str, object]] = None
+    render_signature: Tuple[object, ...] = (None, 0)
+
+    def display_history(self) -> Optional[pd.DataFrame]:
+        return _history_with_live_preview(self.confirmed_history, self.preview_bar)
+
+    def display_chart_history(self) -> Optional[pd.DataFrame]:
+        return _history_with_live_preview(
+            self.confirmed_chart_history,
+            self.preview_bar,
+            max_rows=CHART_HISTORY_BAR_LIMIT,
+        )
+
+    def latest_source_time(self) -> Optional[pd.Timestamp]:
+        preview_time = pd.Timestamp(self.preview_bar["time"]) if self.preview_bar is not None else None
+        chart_time = _frame_last_time(self.confirmed_chart_history)
+        history_time = _frame_last_time(self.confirmed_history)
+        candidates = [value for value in (preview_time, chart_time, history_time) if value is not None]
+        return max(candidates) if candidates else None
 
 
 def _interval_to_ms(interval: str) -> int:
@@ -1519,6 +1541,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.symbol_load_started_at = 0.0
         self.live_backtest_started_at = 0.0
         self.chart_render_signature: Tuple[object, ...] = (None, 0)
+        self.current_chart_snapshot: Optional[AuthoritativeChartSnapshot] = None
         self.current_lightweight_markers: List[Dict[str, object]] = []
         self.current_lightweight_rendered_markers: List[Dict[str, object]] = []
         self.current_lightweight_preview_markers: List[Dict[str, object]] = []
@@ -1550,14 +1573,11 @@ class AltReversalTraderWindow(QMainWindow):
         self.backtest_progress_phase = "idle"
         self.parameter_editors: Dict[str, object] = {}
         self.parameter_opt_boxes: Dict[str, QCheckBox] = {}
-        self.plotly_chart_path = Path("alt_reversal_trader_plotly_chart.html").resolve()
-        self.plotly_js_path = self.plotly_chart_path.with_name("plotly.min.js")
-        self.chart_mode = ""
+        self.chart_mode = "Lightweight"
         self.chart_transition_overlay: Optional[QWidget] = None
         self.chart_transition_effect: Optional[QGraphicsOpacityEffect] = None
         self.chart_transition_animation: Optional[QPropertyAnimation] = None
         self.chart = None
-        self.chart_view = None
         self.equity_subchart = None
         self.equity_line = None
         self.entry_price_line = None
@@ -2119,7 +2139,6 @@ class AltReversalTraderWindow(QMainWindow):
                 widget.setParent(None)
                 widget.deleteLater()
         self.chart = None
-        self.chart_view = None
         self.equity_subchart = None
         self.equity_line = None
         self.entry_price_line = None
@@ -2130,28 +2149,15 @@ class AltReversalTraderWindow(QMainWindow):
         self.ema_slow_line = None
 
     def _rebuild_chart_engine(self, force: bool = False) -> None:
-        engine = self.chart_engine_combo.currentText() if hasattr(self, "chart_engine_combo") else self.settings.chart_engine
-        if not force and engine == self.chart_mode:
+        if not force and self.chart_mode == "Lightweight":
             self.update_positions_table()
             return
-        if engine != "Lightweight":
-            self._stop_chart_history_page_worker()
         self._clear_chart_host()
-        if engine == "Lightweight":
-            self._init_lightweight_chart()
-        else:
-            self._init_plotly_chart()
-        self.chart_mode = engine
+        self._init_lightweight_chart()
+        self.chart_mode = "Lightweight"
         self._sync_chart_transition_overlay()
         if self.current_symbol and self.current_backtest:
             self.render_chart(self.current_symbol, self.current_backtest)
-
-    def _init_plotly_chart(self) -> None:
-        self.chart_view = QWebEngineView(self.chart_host)
-        self.chart_view.settings().setAttribute(WEB_ATTR_FILE_URLS, True)
-        self._attach_webview_crash_logger(self.chart_view, "Plotly")
-        self.chart_host_layout.addWidget(self.chart_view)
-        self.chart_view.setHtml(self._empty_chart_html())
 
     def _init_lightweight_chart(self) -> None:
         self.chart = QtChart(self.chart_host)
@@ -2488,6 +2494,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.history_refresh_times.clear()
             self.chart_history_exhausted.clear()
             self.current_chart_indicators = None
+            self.current_chart_snapshot = None
             self.price_precision_cache.clear()
         if previous != self.settings:
             self.backtest_cache.clear()
@@ -2667,16 +2674,106 @@ class AltReversalTraderWindow(QMainWindow):
         return self.history_cache.get(self._symbol_interval_key(symbol, interval))
 
     def _set_history_frame(self, symbol: str, frame: pd.DataFrame, interval: Optional[str] = None) -> None:
-        self.history_cache[self._symbol_interval_key(symbol, interval)] = frame
+        target_interval = interval or self.current_interval or self.settings.kline_interval
+        self.history_cache[self._symbol_interval_key(symbol, target_interval)] = frame
+        if symbol == self.current_symbol and target_interval == self.current_interval:
+            self._sync_current_chart_snapshot(symbol, target_interval, confirmed_history=frame)
 
     def _get_chart_history_frame(self, symbol: str, interval: Optional[str] = None) -> Optional[pd.DataFrame]:
         return self.chart_history_cache.get(self._symbol_interval_key(symbol, interval))
 
     def _set_chart_history_frame(self, symbol: str, frame: pd.DataFrame, interval: Optional[str] = None) -> None:
-        self.chart_history_cache[self._symbol_interval_key(symbol, interval)] = frame
+        target_interval = interval or self.current_interval or self.settings.kline_interval
+        self.chart_history_cache[self._symbol_interval_key(symbol, target_interval)] = frame
+        if symbol == self.current_symbol and target_interval == self.current_interval:
+            self._sync_current_chart_snapshot(symbol, target_interval, confirmed_chart_history=frame)
+
+    def _snapshot_matches_context(
+        self,
+        snapshot: Optional[AuthoritativeChartSnapshot],
+        symbol: Optional[str] = None,
+        interval: Optional[str] = None,
+    ) -> bool:
+        if snapshot is None:
+            return False
+        target_symbol = symbol or self.current_symbol
+        target_interval = interval or self.current_interval or self.settings.kline_interval
+        return snapshot.symbol == target_symbol and snapshot.interval == target_interval
+
+    def _clear_current_chart_snapshot(self) -> None:
+        self.current_chart_snapshot = None
+
+    def _current_authoritative_snapshot(
+        self,
+        symbol: Optional[str] = None,
+        interval: Optional[str] = None,
+    ) -> Optional[AuthoritativeChartSnapshot]:
+        target_symbol = symbol or self.current_symbol
+        target_interval = interval or self.current_interval or self.settings.kline_interval
+        if not target_symbol:
+            return None
+        if self._snapshot_matches_context(self.current_chart_snapshot, target_symbol, target_interval):
+            return self.current_chart_snapshot
+        key = self._symbol_interval_key(target_symbol, target_interval)
+        snapshot = AuthoritativeChartSnapshot(
+            symbol=target_symbol,
+            interval=target_interval,
+            confirmed_history=self._get_history_frame(target_symbol, target_interval),
+            confirmed_chart_history=self._get_chart_history_frame(target_symbol, target_interval),
+            backtest=self.current_backtest if target_symbol == self.current_symbol and target_interval == self.current_interval else self.backtest_cache.get(key),
+            chart_indicators=(
+                self.current_chart_indicators
+                if target_symbol == self.current_symbol and target_interval == self.current_interval
+                else self.chart_indicator_cache.get(key)
+            ),
+            preview_bar=self._current_live_preview_for(target_symbol, target_interval),
+            render_signature=self.chart_render_signature if target_symbol == self.current_symbol and target_interval == self.current_interval else (None, 0),
+        )
+        if target_symbol == self.current_symbol and target_interval == self.current_interval:
+            self.current_chart_snapshot = snapshot
+        return snapshot
+
+    def _sync_current_chart_snapshot(
+        self,
+        symbol: Optional[str] = None,
+        interval: Optional[str] = None,
+        *,
+        confirmed_history: object = _SNAPSHOT_KEEP,
+        confirmed_chart_history: object = _SNAPSHOT_KEEP,
+        backtest: object = _SNAPSHOT_KEEP,
+        chart_indicators: object = _SNAPSHOT_KEEP,
+        preview_bar: object = _SNAPSHOT_KEEP,
+        render_signature: object = _SNAPSHOT_KEEP,
+    ) -> Optional[AuthoritativeChartSnapshot]:
+        target_symbol = symbol or self.current_symbol
+        target_interval = interval or self.current_interval or self.settings.kline_interval
+        if not target_symbol:
+            self.current_chart_snapshot = None
+            return None
+        base = self._current_authoritative_snapshot(target_symbol, target_interval)
+        if base is None:
+            return None
+        snapshot = AuthoritativeChartSnapshot(
+            symbol=target_symbol,
+            interval=target_interval,
+            confirmed_history=base.confirmed_history if confirmed_history is _SNAPSHOT_KEEP else confirmed_history,
+            confirmed_chart_history=base.confirmed_chart_history if confirmed_chart_history is _SNAPSHOT_KEEP else confirmed_chart_history,
+            backtest=base.backtest if backtest is _SNAPSHOT_KEEP else backtest,
+            chart_indicators=base.chart_indicators if chart_indicators is _SNAPSHOT_KEEP else chart_indicators,
+            preview_bar=base.preview_bar if preview_bar is _SNAPSHOT_KEEP else preview_bar,
+            render_signature=base.render_signature if render_signature is _SNAPSHOT_KEEP else render_signature,
+        )
+        if target_symbol == self.current_symbol and target_interval == self.current_interval:
+            self.current_chart_snapshot = snapshot
+            self.current_backtest = snapshot.backtest
+            self.current_chart_indicators = snapshot.chart_indicators
+            self.chart_render_signature = snapshot.render_signature
+        return snapshot
 
     def _clear_current_live_preview(self) -> None:
         self.current_live_preview_bar = None
+        if self.current_symbol:
+            self._sync_current_chart_snapshot(self.current_symbol, self.current_interval, preview_bar=None)
 
     def _current_live_preview_for(
         self,
@@ -2697,11 +2794,11 @@ class AltReversalTraderWindow(QMainWindow):
         chart: bool = False,
     ) -> Optional[pd.DataFrame]:
         target_interval = interval or self.current_interval or self.settings.kline_interval
-        base_frame = (
-            self._get_chart_history_frame(symbol, target_interval)
-            if chart
-            else self._get_history_frame(symbol, target_interval)
-        )
+        if self._snapshot_matches_context(self.current_chart_snapshot, symbol, target_interval):
+            snapshot = self.current_chart_snapshot
+            if snapshot is not None:
+                return snapshot.display_chart_history() if chart else snapshot.display_history()
+        base_frame = self._get_chart_history_frame(symbol, target_interval) if chart else self._get_history_frame(symbol, target_interval)
         preview_bar = self._current_live_preview_for(symbol, target_interval)
         max_rows = CHART_HISTORY_BAR_LIMIT if chart else None
         return _history_with_live_preview(base_frame, preview_bar, max_rows=max_rows)
@@ -2948,17 +3045,6 @@ class AltReversalTraderWindow(QMainWindow):
             if line is not None:
                 line.precision(precision)
 
-    def _default_chart_time_range(self, candle_df: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp]:
-        if candle_df.empty:
-            now = pd.Timestamp.utcnow().tz_localize(None)
-            return now - pd.Timedelta(hours=DEFAULT_CHART_LOOKBACK_HOURS), now
-        bar_delta = pd.Timedelta(milliseconds=_interval_to_ms(self.current_interval or self.settings.kline_interval))
-        latest_time = pd.Timestamp(candle_df["time"].iloc[-1])
-        end_time = latest_time + (bar_delta * DEFAULT_CHART_RIGHT_PAD_BARS)
-        start_floor = pd.Timestamp(candle_df["time"].iloc[0])
-        start_time = max(start_floor, latest_time - pd.Timedelta(hours=DEFAULT_CHART_LOOKBACK_HOURS))
-        return start_time, end_time
-
     def _default_lightweight_logical_range(self, candle_df: pd.DataFrame) -> tuple[float, float]:
         interval_ms = _interval_to_ms(self.current_interval or self.settings.kline_interval)
         visible_bars = max(1, int((DEFAULT_CHART_LOOKBACK_HOURS * 3_600_000) // interval_ms))
@@ -2999,6 +3085,12 @@ class AltReversalTraderWindow(QMainWindow):
             return
         self.current_chart_indicators = _chart_indicators_from_backtest(self.current_backtest, chart_history)
         self.chart_indicator_cache[self._symbol_interval_key(symbol, self.current_interval)] = self.current_chart_indicators
+        self._sync_current_chart_snapshot(
+            symbol,
+            self.current_interval,
+            backtest=self.current_backtest,
+            chart_indicators=self.current_chart_indicators,
+        )
 
     def _trade_markers(self, trades, latest_time: Optional[pd.Timestamp]) -> List[Dict[str, object]]:
         markers: List[Dict[str, object]] = []
@@ -3182,16 +3274,13 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _build_chart_render_payload(
         self,
-        symbol: str,
-        result: BacktestResult,
-        chart_indicators: Optional[pd.DataFrame] = None,
+        snapshot: AuthoritativeChartSnapshot,
     ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[Dict[str, object]]]:
-        active_chart_indicators = chart_indicators
-        if active_chart_indicators is None and symbol == self.current_symbol and self.current_chart_indicators is not None:
-            active_chart_indicators = self.current_chart_indicators
+        if snapshot.backtest is None:
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), []
+        active_chart_indicators = snapshot.chart_indicators
         if active_chart_indicators is None:
-            chart_history = self._get_chart_history_frame(symbol, self.current_interval)
-            active_chart_indicators = _chart_indicators_from_backtest(result, chart_history)
+            active_chart_indicators = _chart_indicators_from_backtest(snapshot.backtest, snapshot.confirmed_chart_history)
         indicators = (
             active_chart_indicators.sort_values("time")
             .drop_duplicates(subset=["time"])
@@ -3199,13 +3288,13 @@ class AltReversalTraderWindow(QMainWindow):
         )
         candle_df = _chart_candle_frame(indicators)
         equity_df = (
-            pd.DataFrame({"time": list(result.equity_curve.index), "Equity": list(result.equity_curve.values)})
+            pd.DataFrame({"time": list(snapshot.backtest.equity_curve.index), "Equity": list(snapshot.backtest.equity_curve.values)})
             .sort_values("time")
             .drop_duplicates(subset=["time"])
             .reset_index(drop=True)
         )
         latest_time = pd.Timestamp(candle_df["time"].iloc[-1]) if not candle_df.empty else None
-        markers = self._trade_markers(result.trades, latest_time)
+        markers = self._trade_markers(snapshot.backtest.trades, latest_time)
         return candle_df, indicators, equity_df, markers
 
     def _clear_lightweight_volume_series(self) -> None:
@@ -3871,12 +3960,10 @@ class AltReversalTraderWindow(QMainWindow):
         if bar.get("symbol") != self.current_symbol:
             return
         self.live_pending_bar = bar
-        if self.chart_mode == "Lightweight" and not bool(bar.get("closed")):
+        if not bool(bar.get("closed")):
             self._flush_live_update()
             return
-        self.live_update_timer.setInterval(
-            LIVE_RENDER_INTERVAL_MS if self.chart_mode == "Lightweight" else PLOTLY_LIVE_RENDER_INTERVAL_MS
-        )
+        self.live_update_timer.setInterval(LIVE_RENDER_INTERVAL_MS)
         if not self.live_update_timer.isActive():
             self.live_update_timer.start()
 
@@ -3893,8 +3980,8 @@ class AltReversalTraderWindow(QMainWindow):
         self._apply_live_position_price(symbol, float(bar["close"]))
         if not bool(bar.get("closed")):
             self.current_live_preview_bar = dict(bar)
-            if self.chart_mode == "Lightweight":
-                self._apply_live_lightweight_bar(symbol, bar)
+            self._sync_current_chart_snapshot(symbol, self.current_interval, preview_bar=self.current_live_preview_bar)
+            self._apply_live_lightweight_bar(symbol, bar)
             return
         self._clear_current_live_preview()
         self._set_history_frame(symbol, _merge_live_bar(history, bar), self.current_interval)
@@ -3983,6 +4070,12 @@ class AltReversalTraderWindow(QMainWindow):
         self._set_chart_history_frame(symbol, merged_chart_history, self.current_interval)
         self.current_backtest = result["backtest"]
         self.current_chart_indicators = result["chart_indicators"]
+        self._sync_current_chart_snapshot(
+            symbol,
+            self.current_interval,
+            backtest=self.current_backtest,
+            chart_indicators=self.current_chart_indicators,
+        )
         self.current_lightweight_fast_exit_markers = []
         cache_key = self._symbol_interval_key(symbol, self.current_interval)
         self.backtest_cache[cache_key] = self.current_backtest
@@ -4465,6 +4558,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.current_symbol = None
             self.current_backtest = None
             self.current_chart_indicators = None
+            self.current_chart_snapshot = None
             self.update_candidate_table()
             self.update_optimized_table()
             self.summary_box.clear()
@@ -4706,6 +4800,7 @@ class AltReversalTraderWindow(QMainWindow):
         self._stop_live_backtest_worker()
         self._stop_load_worker()
         self._stop_chart_history_page_worker()
+        self._clear_current_chart_snapshot()
         self.current_symbol = symbol
         self._remember_recent_symbol(symbol)
         self.current_position_snapshot = self._find_open_position(symbol)
@@ -4730,6 +4825,16 @@ class AltReversalTraderWindow(QMainWindow):
             cached_chart_indicators = _chart_indicators_from_backtest(cached_backtest, cached_chart_history)
         self.current_backtest = cached_backtest
         self.current_chart_indicators = cached_chart_indicators
+        self._sync_current_chart_snapshot(
+            symbol,
+            target_interval,
+            confirmed_history=cached_history,
+            confirmed_chart_history=cached_chart_history,
+            backtest=cached_backtest,
+            chart_indicators=cached_chart_indicators,
+            preview_bar=None,
+            render_signature=(None, 0),
+        )
         worker_backtest = cached_backtest
         self.load_request_id += 1
         self.load_request_reset_view[self.load_request_id] = cached_backtest is None
@@ -4798,16 +4903,26 @@ class AltReversalTraderWindow(QMainWindow):
             self.current_chart_indicators = loaded_chart_indicators
         else:
             self.current_chart_indicators = _chart_indicators_from_backtest(self.current_backtest, loaded_chart_history)
+        self._sync_current_chart_snapshot(
+            symbol,
+            self.current_interval,
+            backtest=self.current_backtest,
+            chart_indicators=self.current_chart_indicators,
+        )
         cache_key = self._symbol_interval_key(symbol, self.current_interval)
         self.backtest_cache[cache_key] = self.current_backtest
         self.chart_indicator_cache[cache_key] = self.current_chart_indicators
         self._prune_caches()
         apply_started_at = time.perf_counter()
-        candle_df, indicators, equity_df, markers = self._build_chart_render_payload(
+        snapshot = self._sync_current_chart_snapshot(
             symbol,
-            self.current_backtest,
-            self.current_chart_indicators,
+            self.current_interval,
+            backtest=self.current_backtest,
+            chart_indicators=self.current_chart_indicators,
         )
+        if snapshot is None:
+            return
+        candle_df, indicators, equity_df, markers = self._build_chart_render_payload(snapshot)
         render_signature = self._chart_render_signature_for_payload(candle_df, indicators, equity_df, markers)
         needs_render = (
             reset_view
@@ -4818,8 +4933,9 @@ class AltReversalTraderWindow(QMainWindow):
             self.render_chart(symbol, self.current_backtest, reset_view=reset_view, chart_indicators=self.current_chart_indicators)
         else:
             self.chart_render_signature = render_signature
-            self.current_lightweight_markers = list(markers) if self.chart_mode == "Lightweight" else []
-            self.current_lightweight_rendered_markers = list(markers) if self.chart_mode == "Lightweight" else []
+            self._sync_current_chart_snapshot(symbol, self.current_interval, render_signature=render_signature)
+            self.current_lightweight_markers = list(markers)
+            self.current_lightweight_rendered_markers = list(markers)
             self.current_lightweight_preview_markers = []
             self.current_lightweight_fast_exit_markers = []
             self._update_entry_price_overlay()
@@ -4853,16 +4969,22 @@ class AltReversalTraderWindow(QMainWindow):
         reset_view: bool = True,
         chart_indicators: Optional[pd.DataFrame] = None,
     ) -> None:
-        candle_df, indicators, equity_df, markers = self._build_chart_render_payload(symbol, result, chart_indicators)
+        snapshot = self._sync_current_chart_snapshot(
+            symbol,
+            self.current_interval,
+            backtest=result,
+            chart_indicators=chart_indicators,
+        )
+        if snapshot is None:
+            return
+        candle_df, indicators, equity_df, markers = self._build_chart_render_payload(snapshot)
         self.current_lightweight_preview_markers = []
         self.current_lightweight_fast_exit_markers = []
-        if self.chart_mode == "Lightweight":
-            self._render_lightweight_chart(symbol, candle_df, indicators, equity_df, markers, reset_view=reset_view)
-            self.current_lightweight_markers = list(markers)
-        else:
-            self._render_plotly_chart(symbol, candle_df, indicators, equity_df, result.trades, reset_view=reset_view)
-            self.current_lightweight_markers = []
-        self.chart_render_signature = self._chart_render_signature_for_payload(candle_df, indicators, equity_df, markers)
+        self._render_lightweight_chart(symbol, candle_df, indicators, equity_df, markers, reset_view=reset_view)
+        self.current_lightweight_markers = list(markers)
+        render_signature = self._chart_render_signature_for_payload(candle_df, indicators, equity_df, markers)
+        self.chart_render_signature = render_signature
+        self._sync_current_chart_snapshot(symbol, self.current_interval, render_signature=render_signature)
 
         candidate = self._candidate_by_symbol(symbol)
         latest = result.latest_state
@@ -4884,35 +5006,6 @@ class AltReversalTraderWindow(QMainWindow):
         self._refresh_live_labels()
         self._refresh_live_preview_markers(symbol)
         QTimer.singleShot(70, self._hide_chart_transition_overlay)
-
-    def _render_plotly_chart(
-        self,
-        symbol: str,
-        candle_df: pd.DataFrame,
-        indicators: pd.DataFrame,
-        equity_df: pd.DataFrame,
-        trades,
-        reset_view: bool = True,
-    ) -> None:
-        if self.chart_view is None:
-            self._rebuild_chart_engine(force=True)
-        if not self.plotly_js_path.exists() or self.plotly_js_path.stat().st_size == 0:
-            self.plotly_js_path.write_text(get_plotlyjs(), encoding="utf-8")
-        range_start, range_end = self._default_chart_time_range(candle_df) if reset_view else (None, None)
-        html = self._plotly_chart_html(
-            symbol,
-            candle_df,
-            indicators,
-            equity_df,
-            trades,
-            range_start,
-            range_end,
-            reset_view=reset_view,
-        )
-        self.plotly_chart_path.write_text(html, encoding="utf-8")
-        chart_url = QUrl.fromLocalFile(str(self.plotly_chart_path))
-        chart_url.setQuery(f"ts={self.plotly_chart_path.stat().st_mtime_ns}")
-        self.chart_view.load(chart_url)
 
     def _render_lightweight_chart(
         self,
@@ -5067,7 +5160,9 @@ class AltReversalTraderWindow(QMainWindow):
             new_markers = self._trade_markers(new_backtest.trades, pd.Timestamp(chart_history["time"].iloc[-1]))
             self._render_lightweight_markers(new_markers)
             candle_df = _chart_candle_frame(new_frame)
-            self.chart_render_signature = self._chart_render_signature_for_payload(candle_df, new_frame, equity_df, new_markers)
+            render_signature = self._chart_render_signature_for_payload(candle_df, new_frame, equity_df, new_markers)
+            self.chart_render_signature = render_signature
+            self._sync_current_chart_snapshot(symbol, self.current_interval, render_signature=render_signature)
             self._update_entry_price_overlay()
             self._refresh_live_labels()
             self._refresh_live_preview_markers(symbol)
@@ -5532,10 +5627,7 @@ class AltReversalTraderWindow(QMainWindow):
         self._refresh_auto_close_monitors()
         self.update_positions_table()
         if self.current_backtest and self.current_symbol:
-            if self.chart_mode == "Lightweight":
-                self._update_entry_price_overlay()
-            else:
-                self.render_chart(self.current_symbol, self.current_backtest, reset_view=False)
+            self._update_entry_price_overlay()
         self._refresh_auto_trade_button_state()
         if self.auto_trade_entry_pending_symbol and self._find_open_position(self.auto_trade_entry_pending_symbol) is not None:
             self.auto_trade_entry_pending_symbol = None
