@@ -486,6 +486,25 @@ def _confirmed_exit_event_from_state(
     }
 
 
+def _confirmed_entry_event_from_state(
+    cursor,
+    latest_state: Dict[str, object],
+    settings: StrategySettings,
+    bar_time: pd.Timestamp,
+) -> Optional[Dict[str, object]]:
+    signal = _preview_entry_signal(cursor, latest_state, settings)
+    if signal is None:
+        return None
+    side, zone = signal
+    if side not in {"long", "short"}:
+        return None
+    return {
+        "side": side,
+        "zone": int(zone),
+        "bar_time": pd.Timestamp(bar_time),
+    }
+
+
 def _preview_entry_signal(
     cursor,
     latest_state: Dict[str, object],
@@ -1545,6 +1564,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.current_lightweight_markers: List[Dict[str, object]] = []
         self.current_lightweight_rendered_markers: List[Dict[str, object]] = []
         self.current_lightweight_preview_markers: List[Dict[str, object]] = []
+        self.current_lightweight_fast_entry_markers: List[Dict[str, object]] = []
         self.current_lightweight_fast_exit_markers: List[Dict[str, object]] = []
         self._tracked_threads: set[QThread] = set()
         self.auto_close_enabled_symbols: set[str] = set()
@@ -1590,6 +1610,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.current_lightweight_markers = []
         self.current_lightweight_rendered_markers = []
         self.current_lightweight_preview_markers = []
+        self.current_lightweight_fast_entry_markers = []
         self.current_lightweight_fast_exit_markers = []
         self.simple_order_buttons: List[QPushButton] = []
         self.position_close_buttons: List[QPushButton] = []
@@ -2130,6 +2151,14 @@ class AltReversalTraderWindow(QMainWindow):
         animation.setStartValue(float(effect.opacity()))
         animation.setEndValue(0.0)
         animation.start()
+
+    def _schedule_chart_transition_reveal(self, symbol: str, delay_ms: int = 180) -> None:
+        QTimer.singleShot(delay_ms, lambda s=symbol: self._hide_chart_transition_overlay_for_symbol(s))
+
+    def _hide_chart_transition_overlay_for_symbol(self, symbol: str) -> None:
+        if symbol != self.current_symbol:
+            return
+        self._hide_chart_transition_overlay()
 
     def _clear_chart_host(self) -> None:
         while self.chart_host_layout.count():
@@ -3127,13 +3156,13 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _compose_lightweight_markers(self, confirmed_markers: Optional[List[Dict[str, object]]] = None) -> List[Dict[str, object]]:
         markers = list(self.current_lightweight_markers if confirmed_markers is None else confirmed_markers)
-        fast_exit_markers = list(self.current_lightweight_fast_exit_markers)
-        if fast_exit_markers:
+        fast_markers = list(self.current_lightweight_fast_entry_markers) + list(self.current_lightweight_fast_exit_markers)
+        if fast_markers:
             marker_keys = {
                 (pd.Timestamp(marker["time"]), marker.get("position"), marker.get("shape"))
                 for marker in markers
             }
-            for marker in fast_exit_markers:
+            for marker in fast_markers:
                 marker_key = (pd.Timestamp(marker["time"]), marker.get("position"), marker.get("shape"))
                 if marker_key in marker_keys:
                     continue
@@ -3232,6 +3261,24 @@ class AltReversalTraderWindow(QMainWindow):
             }
         ]
 
+    def _build_fast_entry_markers(self, entry_event: Optional[Dict[str, object]]) -> List[Dict[str, object]]:
+        if not entry_event:
+            return []
+        bar_time = entry_event.get("bar_time")
+        side = str(entry_event.get("side", "")).lower()
+        zone = int(entry_event.get("zone", 0) or 0)
+        if bar_time is None or side not in {"long", "short"} or zone not in {1, 2, 3}:
+            return []
+        return [
+            {
+                "time": pd.Timestamp(bar_time),
+                "position": "below" if side == "long" else "above",
+                "shape": "arrow_up" if side == "long" else "arrow_down",
+                "color": "#17c964" if side == "long" else "#f31260",
+                "text": f"{side[0].upper()}{zone}",
+            }
+        ]
+
     def _evaluate_closed_bar_auto_close(self, symbol: str, history: Optional[pd.DataFrame]) -> None:
         if (
             symbol != self.current_symbol
@@ -3248,14 +3295,28 @@ class AltReversalTraderWindow(QMainWindow):
             cursor=self.current_backtest.cursor.indicator_cursor,
         )
         latest_time = pd.Timestamp(history["time"].iloc[-1])
+        entry_event = _confirmed_entry_event_from_state(
+            self.current_backtest.cursor,
+            latest_state,
+            self.current_backtest.settings,
+            latest_time,
+        )
         exit_event = _confirmed_exit_event_from_state(position_qty, latest_state, latest_time)
-        next_fast_markers = self._build_fast_exit_markers(exit_event)
-        fast_signature = [self._marker_signature(marker) for marker in next_fast_markers]
-        current_fast_signature = [self._marker_signature(marker) for marker in self.current_lightweight_fast_exit_markers]
+        next_fast_entry_markers = self._build_fast_entry_markers(entry_event)
+        next_fast_exit_markers = self._build_fast_exit_markers(exit_event)
+        fast_entry_signature = [self._marker_signature(marker) for marker in next_fast_entry_markers]
+        current_fast_entry_signature = [self._marker_signature(marker) for marker in self.current_lightweight_fast_entry_markers]
+        fast_exit_signature = [self._marker_signature(marker) for marker in next_fast_exit_markers]
+        current_fast_exit_signature = [self._marker_signature(marker) for marker in self.current_lightweight_fast_exit_markers]
         preview_was_visible = bool(self.current_lightweight_preview_markers)
         self.current_lightweight_preview_markers = []
-        if fast_signature != current_fast_signature or preview_was_visible:
-            self.current_lightweight_fast_exit_markers = list(next_fast_markers)
+        if (
+            fast_entry_signature != current_fast_entry_signature
+            or fast_exit_signature != current_fast_exit_signature
+            or preview_was_visible
+        ):
+            self.current_lightweight_fast_entry_markers = list(next_fast_entry_markers)
+            self.current_lightweight_fast_exit_markers = list(next_fast_exit_markers)
             self._render_lightweight_markers()
         if exit_event is not None:
             self._maybe_trigger_auto_close(symbol, exit_event)
@@ -3890,6 +3951,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.live_pending_bar = None
         self._clear_current_live_preview()
         self.current_lightweight_preview_markers = []
+        self.current_lightweight_fast_entry_markers = []
         self.current_lightweight_fast_exit_markers = []
         if self.live_update_timer.isActive():
             self.live_update_timer.stop()
@@ -4076,6 +4138,7 @@ class AltReversalTraderWindow(QMainWindow):
             backtest=self.current_backtest,
             chart_indicators=self.current_chart_indicators,
         )
+        self.current_lightweight_fast_entry_markers = []
         self.current_lightweight_fast_exit_markers = []
         cache_key = self._symbol_interval_key(symbol, self.current_interval)
         self.backtest_cache[cache_key] = self.current_backtest
@@ -4101,6 +4164,8 @@ class AltReversalTraderWindow(QMainWindow):
             self._log_perf(f"{symbol} live backtest", self.live_backtest_started_at)
             self.live_backtest_started_at = 0.0
         self._evaluate_backtest_auto_close(symbol, self.current_backtest)
+        if self.auto_trade_enabled and not self.open_positions and self.auto_trade_entry_pending_symbol is None:
+            QTimer.singleShot(0, self._run_auto_trade_cycle)
         if self.live_recalc_pending:
             self.live_recalc_pending = False
             self._schedule_live_backtest(symbol)
@@ -4840,7 +4905,13 @@ class AltReversalTraderWindow(QMainWindow):
         self.load_request_reset_view[self.load_request_id] = cached_backtest is None
         self.chart_range_bars_before = float("inf")
         if cached_backtest is not None:
-            self.render_chart(symbol, cached_backtest, reset_view=True, chart_indicators=cached_chart_indicators)
+            self.render_chart(
+                symbol,
+                cached_backtest,
+                reset_view=True,
+                chart_indicators=cached_chart_indicators,
+                reveal_overlay=False,
+            )
             self._defer_symbol_post_paint(
                 symbol,
                 self.load_request_id,
@@ -4941,7 +5012,7 @@ class AltReversalTraderWindow(QMainWindow):
             self._update_entry_price_overlay()
             self._refresh_live_labels()
             self._refresh_live_preview_markers(symbol)
-            QTimer.singleShot(70, self._hide_chart_transition_overlay)
+            self._schedule_chart_transition_reveal(symbol, delay_ms=120)
         self._log_perf(f"{symbol} worker apply", apply_started_at)
         if self.symbol_load_started_at > 0:
             self._log_perf(f"{symbol} symbol load ready", self.symbol_load_started_at)
@@ -4968,6 +5039,7 @@ class AltReversalTraderWindow(QMainWindow):
         result: BacktestResult,
         reset_view: bool = True,
         chart_indicators: Optional[pd.DataFrame] = None,
+        reveal_overlay: bool = True,
     ) -> None:
         snapshot = self._sync_current_chart_snapshot(
             symbol,
@@ -4980,7 +5052,15 @@ class AltReversalTraderWindow(QMainWindow):
         candle_df, indicators, equity_df, markers = self._build_chart_render_payload(snapshot)
         self.current_lightweight_preview_markers = []
         self.current_lightweight_fast_exit_markers = []
-        self._render_lightweight_chart(symbol, candle_df, indicators, equity_df, markers, reset_view=reset_view)
+        self._render_lightweight_chart(
+            symbol,
+            candle_df,
+            indicators,
+            equity_df,
+            markers,
+            reset_view=reset_view,
+            reveal_overlay=reveal_overlay,
+        )
         self.current_lightweight_markers = list(markers)
         render_signature = self._chart_render_signature_for_payload(candle_df, indicators, equity_df, markers)
         self.chart_render_signature = render_signature
@@ -5005,7 +5085,6 @@ class AltReversalTraderWindow(QMainWindow):
         self._update_entry_price_overlay()
         self._refresh_live_labels()
         self._refresh_live_preview_markers(symbol)
-        QTimer.singleShot(70, self._hide_chart_transition_overlay)
 
     def _render_lightweight_chart(
         self,
@@ -5015,6 +5094,7 @@ class AltReversalTraderWindow(QMainWindow):
         equity_df: pd.DataFrame,
         markers: List[Dict[str, object]],
         reset_view: bool = True,
+        reveal_overlay: bool = True,
     ) -> None:
         if self.chart is None:
             self._rebuild_chart_engine(force=True)
@@ -5038,7 +5118,8 @@ class AltReversalTraderWindow(QMainWindow):
             )
         else:
             QTimer.singleShot(140, lambda s=symbol: self._restore_lightweight_range(s))
-        QTimer.singleShot(90, self._hide_chart_transition_overlay)
+        if reveal_overlay:
+            self._schedule_chart_transition_reveal(symbol, delay_ms=190 if reset_view else 170)
 
     def _sync_lightweight_range(self, symbol: str, range_from: float, range_to: float) -> None:
         if symbol != self.current_symbol or self.chart is None or self.equity_subchart is None:
