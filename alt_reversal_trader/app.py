@@ -403,6 +403,11 @@ def _frame_last_time(frame: Optional[pd.DataFrame]) -> Optional[pd.Timestamp]:
     return pd.Timestamp(frame["time"].iloc[-1])
 
 
+def _chart_candle_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    columns = [column for column in ("time", "open", "high", "low", "close") if column in frame.columns]
+    return frame.loc[:, columns].copy() if columns else pd.DataFrame(columns=["time", "open", "high", "low", "close"])
+
+
 def _history_can_resume_backtest(backtest: Optional[BacktestResult], history: Optional[pd.DataFrame]) -> bool:
     if backtest is None or history is None or history.empty or backtest.indicators.empty or backtest.cursor is None:
         return False
@@ -2566,6 +2571,13 @@ class AltReversalTraderWindow(QMainWindow):
     def _pick_auto_trade_candidate(self, candidates: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
         if not candidates:
             return None
+        rank_mode = self._optimization_rank_mode()
+        if rank_mode == "return":
+            best_return = max(float(item["return_pct"]) for item in candidates)
+            return_tied = [item for item in candidates if float(item["return_pct"]) == best_return]
+            best_score = max(float(item["score"]) for item in return_tied)
+            score_tied = [item for item in return_tied if float(item["score"]) == best_score]
+            return random.choice(score_tied)
         best_score = max(float(item["score"]) for item in candidates)
         score_tied = [item for item in candidates if float(item["score"]) == best_score]
         best_return = max(float(item["return_pct"]) for item in score_tied)
@@ -3142,7 +3154,7 @@ class AltReversalTraderWindow(QMainWindow):
             .drop_duplicates(subset=["time"])
             .reset_index(drop=True)
         )
-        candle_df = indicators[["time", "open", "high", "low", "close", "volume"]].copy()
+        candle_df = _chart_candle_frame(indicators)
         equity_df = (
             pd.DataFrame({"time": list(result.equity_curve.index), "Equity": list(result.equity_curve.values)})
             .sort_values("time")
@@ -3152,6 +3164,11 @@ class AltReversalTraderWindow(QMainWindow):
         latest_time = pd.Timestamp(candle_df["time"].iloc[-1]) if not candle_df.empty else None
         markers = self._trade_markers(result.trades, latest_time)
         return candle_df, indicators, equity_df, markers
+
+    def _clear_lightweight_volume_series(self) -> None:
+        if self.chart_mode != "Lightweight" or self.chart is None:
+            return
+        self.chart.run_script(f"{self.chart.id}.volumeSeries.setData([])")
 
     def _chart_render_signature_for_payload(
         self,
@@ -3839,7 +3856,6 @@ class AltReversalTraderWindow(QMainWindow):
                 "high": float(bar["high"]),
                 "low": float(bar["low"]),
                 "close": float(bar["close"]),
-                "volume": float(bar["volume"]),
             }
         )
         try:
@@ -4847,6 +4863,7 @@ class AltReversalTraderWindow(QMainWindow):
         if not reset_view:
             self._stash_lightweight_range()
         self.chart.set(candle_df)
+        self._clear_lightweight_volume_series()
         self._apply_lightweight_precision(symbol, candle_df)
         self.supertrend_line.set(indicators[["time", "supertrend"]].rename(columns={"supertrend": "Supertrend"}))
         self.zone2_line.set(indicators[["time", "zone2_line"]].rename(columns={"zone2_line": "Zone 2"}))
@@ -4938,7 +4955,7 @@ class AltReversalTraderWindow(QMainWindow):
             return False
         try:
             if not skip_candle_update:
-                latest_bar = chart_history[["time", "open", "high", "low", "close", "volume"]].iloc[-1].copy()
+                latest_bar = _chart_candle_frame(chart_history).iloc[-1].copy()
                 self.chart.update(latest_bar)
             latest_indicator = new_frame.iloc[-1]
             latest_time = pd.Timestamp(latest_indicator["time"])
@@ -4958,7 +4975,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.equity_line.update(equity_df.iloc[-1].copy())
             new_markers = self._trade_markers(new_backtest.trades, pd.Timestamp(chart_history["time"].iloc[-1]))
             self._render_lightweight_markers(new_markers)
-            candle_df = new_frame[["time", "open", "high", "low", "close", "volume"]].copy()
+            candle_df = _chart_candle_frame(new_frame)
             self.chart_render_signature = self._chart_render_signature_for_payload(candle_df, new_frame, equity_df, new_markers)
             self._update_entry_price_overlay()
             self._refresh_live_labels()
@@ -5052,11 +5069,6 @@ class AltReversalTraderWindow(QMainWindow):
             specs=[[{"secondary_y": True}], [{}]],
         )
 
-        volume_colors = [
-            "rgba(23, 201, 100, 0.35)" if close_ >= open_ else "rgba(243, 18, 96, 0.35)"
-            for open_, close_ in zip(candle_df["open"], candle_df["close"])
-        ]
-
         fig.add_trace(
             go.Candlestick(
                 x=candle_df["time"],
@@ -5074,18 +5086,23 @@ class AltReversalTraderWindow(QMainWindow):
             col=1,
             secondary_y=False,
         )
-        fig.add_trace(
-            go.Bar(
-                x=candle_df["time"],
-                y=candle_df["volume"],
-                name="Volume",
-                marker_color=volume_colors,
-                opacity=0.35,
-            ),
-            row=1,
-            col=1,
-            secondary_y=True,
-        )
+        if "volume" in candle_df.columns:
+            volume_colors = [
+                "rgba(23, 201, 100, 0.35)" if close_ >= open_ else "rgba(243, 18, 96, 0.35)"
+                for open_, close_ in zip(candle_df["open"], candle_df["close"])
+            ]
+            fig.add_trace(
+                go.Bar(
+                    x=candle_df["time"],
+                    y=candle_df["volume"],
+                    name="Volume",
+                    marker_color=volume_colors,
+                    opacity=0.35,
+                ),
+                row=1,
+                col=1,
+                secondary_y=True,
+            )
         for column, name, color, width in (
             ("supertrend", "Supertrend", "#ffcc00", 2),
             ("zone2_line", "Zone 2", "#ff9100", 1),
