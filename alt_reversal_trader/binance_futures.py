@@ -14,8 +14,9 @@ from urllib.parse import urlencode
 
 import numpy as np
 import pandas as pd
-import pandas_ta as pta
 import requests
+
+from .strategy import rsi_last_value
 
 
 FAPI_BASE_URL = "https://fapi.binance.com"
@@ -81,9 +82,7 @@ def _interval_to_ms(interval: str) -> int:
 
 
 def _rsi_with_pandas_ta(series: pd.Series, length: int = 14) -> float:
-    rsi = pta.rsi(series.astype(float), length=length, talib=False)
-    last = rsi.iloc[-1] if rsi is not None and len(rsi) else np.nan
-    return float(last) if pd.notna(last) else float("nan")
+    return rsi_last_value(series.astype(float), length=length)
 
 
 def _daily_volatility_from_klines(df: pd.DataFrame) -> float:

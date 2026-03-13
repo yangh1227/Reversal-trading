@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 import math
 
 import numpy as np
 import pandas as pd
-import pandas_ta as pta
 
 from .config import StrategySettings
 
@@ -108,6 +108,12 @@ class BacktestCursor:
     last_long_zone: int
     last_short_zone: int
     last_equity_value: float
+    indicator_cursor: Optional["IndicatorCursor"] = None
+
+
+@dataclass(frozen=True)
+class IndicatorCursor:
+    payload: Tuple[Tuple[str, object], ...]
 
 
 @dataclass(frozen=True)
@@ -170,6 +176,343 @@ def prepare_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return _ensure_ohlcv(df)
 
 
+def _coerce_float(value: object) -> float:
+    if value is None:
+        return float("nan")
+    if isinstance(value, (np.floating, np.integer)):
+        value = value.item()
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _encode_cursor_value(value: object) -> object:
+    if isinstance(value, deque):
+        value = tuple(value)
+    if isinstance(value, tuple):
+        return tuple(_encode_cursor_value(item) for item in value)
+    if isinstance(value, list):
+        return tuple(_encode_cursor_value(item) for item in value)
+    if isinstance(value, (np.floating, np.integer)):
+        value = value.item()
+    if isinstance(value, float):
+        return None if not math.isfinite(value) else float(round(value, 15))
+    return value
+
+
+def _decode_cursor_value(value: object) -> object:
+    if isinstance(value, tuple):
+        return tuple(_decode_cursor_value(item) for item in value)
+    if value is None:
+        return float("nan")
+    return value
+
+
+class _EwmTracker:
+    def __init__(self, length: int, alpha: float, snapshot: Optional[Tuple[int, object]] = None) -> None:
+        self.length = int(length)
+        self.alpha = float(alpha)
+        self.count = 0
+        self.value = float("nan")
+        if snapshot is not None:
+            self.count = int(snapshot[0])
+            self.value = _coerce_float(_decode_cursor_value(snapshot[1]))
+
+    def update(self, value: float) -> float:
+        numeric = _coerce_float(value)
+        if not math.isfinite(numeric):
+            return self.value
+        if self.count == 0 or not math.isfinite(self.value):
+            self.value = numeric
+        else:
+            self.value = ((1.0 - self.alpha) * self.value) + (self.alpha * numeric)
+        self.count += 1
+        if self.count < self.length:
+            return float("nan")
+        return self.value
+
+    def snapshot(self) -> Tuple[int, object]:
+        return (int(self.count), _encode_cursor_value(self.value))
+
+
+class _RollingWindow:
+    def __init__(self, size: int, values: Iterable[object] = ()) -> None:
+        self.size = max(1, int(size))
+        self.values: Deque[float] = deque(maxlen=self.size)
+        self.sum = 0.0
+        self.sumsq = 0.0
+        self.finite_count = 0
+        for value in values:
+            self.push(_coerce_float(_decode_cursor_value(value)))
+
+    def push(self, value: float) -> None:
+        numeric = _coerce_float(value)
+        if len(self.values) == self.size:
+            removed = self.values[0]
+            if math.isfinite(removed):
+                self.sum -= removed
+                self.sumsq -= removed * removed
+                self.finite_count -= 1
+        self.values.append(numeric)
+        if math.isfinite(numeric):
+            self.sum += numeric
+            self.sumsq += numeric * numeric
+            self.finite_count += 1
+
+    def mean(self, min_periods: int) -> float:
+        if self.finite_count < max(int(min_periods), 1):
+            return float("nan")
+        return self.sum / max(self.finite_count, 1)
+
+    def std(self, min_periods: int, ddof: int = 1) -> float:
+        required = max(int(min_periods), 1)
+        if self.finite_count < required or self.finite_count <= ddof:
+            return float("nan")
+        numerator = self.sumsq - ((self.sum * self.sum) / self.finite_count)
+        variance = numerator / max(self.finite_count - ddof, 1)
+        return math.sqrt(max(variance, 0.0))
+
+    def min(self, min_periods: int = 1) -> float:
+        if self.finite_count < max(int(min_periods), 1):
+            return float("nan")
+        finite_values = [value for value in self.values if math.isfinite(value)]
+        return min(finite_values) if finite_values else float("nan")
+
+    def max(self, min_periods: int = 1) -> float:
+        if self.finite_count < max(int(min_periods), 1):
+            return float("nan")
+        finite_values = [value for value in self.values if math.isfinite(value)]
+        return max(finite_values) if finite_values else float("nan")
+
+    def snapshot(self) -> Tuple[object, ...]:
+        return tuple(_encode_cursor_value(value) for value in self.values)
+
+
+class _PivotTracker:
+    def __init__(self, left: int, values: Iterable[object] = ()) -> None:
+        self.left = max(1, int(left))
+        self.values: Deque[float] = deque(maxlen=self.left + 2)
+        for value in values:
+            self.values.append(_coerce_float(_decode_cursor_value(value)))
+
+    def update_high(self, value: float) -> float:
+        self.values.append(_coerce_float(value))
+        if len(self.values) < self.left + 2:
+            return float("nan")
+        candidate = self.values[-2]
+        if not math.isfinite(candidate):
+            return float("nan")
+        return candidate if candidate >= max(self.values) else float("nan")
+
+    def update_low(self, value: float) -> float:
+        self.values.append(_coerce_float(value))
+        if len(self.values) < self.left + 2:
+            return float("nan")
+        candidate = self.values[-2]
+        if not math.isfinite(candidate):
+            return float("nan")
+        return candidate if candidate <= min(self.values) else float("nan")
+
+    def snapshot(self) -> Tuple[object, ...]:
+        return tuple(_encode_cursor_value(value) for value in self.values)
+
+
+def _rsi_from_avgs(avg_gain: float, avg_loss: float) -> float:
+    if not math.isfinite(avg_gain) or not math.isfinite(avg_loss):
+        return float("nan")
+    if avg_gain == 0.0 and avg_loss == 0.0:
+        return 50.0
+    if avg_loss == 0.0:
+        return 100.0
+    if avg_gain == 0.0:
+        return 0.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _rsi_series(values: pd.Series, length: int) -> pd.Series:
+    series = pd.Series(values, dtype=float)
+    if series.empty:
+        return pd.Series(dtype=float)
+    gain_tracker = _EwmTracker(length, 1.0 / max(int(length), 1))
+    loss_tracker = _EwmTracker(length, 1.0 / max(int(length), 1))
+    result = np.full(len(series), np.nan, dtype=float)
+    prev_close = float("nan")
+    for index, close_value in enumerate(series.to_numpy(dtype=float, copy=False)):
+        if math.isfinite(prev_close):
+            delta = close_value - prev_close
+            avg_gain = gain_tracker.update(max(delta, 0.0))
+            avg_loss = loss_tracker.update(max(-delta, 0.0))
+            if math.isfinite(avg_gain) and math.isfinite(avg_loss):
+                result[index] = _rsi_from_avgs(avg_gain, avg_loss)
+        prev_close = close_value
+    return pd.Series(result, index=series.index, dtype=float)
+
+
+def rsi_last_value(values: pd.Series, length: int = 14) -> float:
+    series = _rsi_series(values, length)
+    if series.empty:
+        return float("nan")
+    value = series.iloc[-1]
+    return float(value) if pd.notna(value) else float("nan")
+
+
+def _indicator_constants(settings: StrategySettings) -> Dict[str, float]:
+    sensitivity_mult = SENSITIVITY_MULTIPLIERS.get(settings.sensitivity_mode, 1.0)
+    zz_left = max(2, int(round(settings.zz_len_raw * sensitivity_mult)))
+    qtp_sens = settings.qtp_sensitivity / 100.0
+    return {
+        "zone3_thresh": 0.5 * settings.zone_sensitivity,
+        "zone2_thresh": 1.0 * settings.zone_sensitivity,
+        "zz_left": zz_left,
+        "atr_mult": settings.atr_mult_raw / sensitivity_mult,
+        "qtp_sens": qtp_sens,
+        "qtp_pivot_left": int(round(settings.qtp_max_pvt_left - (settings.qtp_max_pvt_left - settings.qtp_min_pvt_left) * qtp_sens)),
+        "qtp_rsi_upper": 70 - round(10 * qtp_sens),
+        "qtp_rsi_lower": 30 + round(10 * qtp_sens),
+        "qtp_stoch_upper": 80 - round(10 * qtp_sens),
+        "qtp_stoch_lower": 20 + round(10 * qtp_sens),
+        "qtp_score_thr": 55 - round(15 * qtp_sens),
+    }
+
+
+def _build_indicator_state(settings: StrategySettings, cursor: Optional[IndicatorCursor] = None) -> Dict[str, Any]:
+    payload = {key: _decode_cursor_value(value) for key, value in (cursor.payload if cursor is not None else ())}
+    constants = _indicator_constants(settings)
+    state: Dict[str, Any] = {
+        "processed_rows": int(payload.get("processed_rows", 0) or 0),
+        "prev_close": _coerce_float(payload.get("prev_close")),
+        "prev_close_2": _coerce_float(payload.get("prev_close_2")),
+        "prev_high": _coerce_float(payload.get("prev_high")),
+        "prev_low": _coerce_float(payload.get("prev_low")),
+        "prev_is_long_trend": bool(payload.get("prev_is_long_trend", False)),
+        "prev_is_short_trend": bool(payload.get("prev_is_short_trend", False)),
+        "supertrend_value": _coerce_float(payload.get("supertrend_value")),
+        "supertrend_direction": _coerce_float(payload.get("supertrend_direction")),
+        "supertrend_final_upper": _coerce_float(payload.get("supertrend_final_upper")),
+        "supertrend_final_lower": _coerce_float(payload.get("supertrend_final_lower")),
+        "prev_qip_rsi": _coerce_float(payload.get("prev_qip_rsi")),
+        "prev_qip_vol_ma": _coerce_float(payload.get("prev_qip_vol_ma")),
+        "prev_volume": _coerce_float(payload.get("prev_volume")),
+        "prev_qip_ema_fast": _coerce_float(payload.get("prev_qip_ema_fast")),
+        "prev_qip_ema_slow": _coerce_float(payload.get("prev_qip_ema_slow")),
+        "prev_macd_raw": _coerce_float(payload.get("prev_macd_raw")),
+        "prev_qip_low_roll": _coerce_float(payload.get("prev_qip_low_roll")),
+        "prev_qip_high_roll": _coerce_float(payload.get("prev_qip_high_roll")),
+        "prev_atr14": _coerce_float(payload.get("prev_atr14")),
+        "last_pl_rsi": _coerce_float(payload.get("last_pl_rsi")),
+        "last_ph_rsi": _coerce_float(payload.get("last_ph_rsi")),
+        "last_pl_val": _coerce_float(payload.get("last_pl_val")),
+        "last_ph_val": _coerce_float(payload.get("last_ph_val")),
+        "last_pl_macd": _coerce_float(payload.get("last_pl_macd")),
+        "last_ph_macd": _coerce_float(payload.get("last_ph_macd")),
+        "prev_qtp_rsi": _coerce_float(payload.get("prev_qtp_rsi")),
+        "prev_qtp_stoch": _coerce_float(payload.get("prev_qtp_stoch")),
+        "prev_qtp_zdev": _coerce_float(payload.get("prev_qtp_zdev")),
+        "prev_qtp_bull_rev": bool(payload.get("prev_qtp_bull_rev", False)),
+        "prev_qtp_bear_rev": bool(payload.get("prev_qtp_bear_rev", False)),
+        "prev_qtp_vol_spike": bool(payload.get("prev_qtp_vol_spike", False)),
+        "prev_qtp_up_trend": bool(payload.get("prev_qtp_up_trend", False)),
+        "prev_qtp_dn_trend": bool(payload.get("prev_qtp_dn_trend", False)),
+        "prev_qtp_roc1": _coerce_float(payload.get("prev_qtp_roc1")),
+        "prev_qtp_roc2": _coerce_float(payload.get("prev_qtp_roc2")),
+        "constants": constants,
+        "supertrend_atr": _EwmTracker(settings.atr_period, 1.0 / max(int(settings.atr_period), 1), payload.get("supertrend_atr_state")),
+        "atr14": _EwmTracker(14, 1.0 / 14.0, payload.get("atr14_state")),
+        "qtp_atr": _EwmTracker(settings.qtp_atr_len, 1.0 / max(int(settings.qtp_atr_len), 1), payload.get("qtp_atr_state")),
+        "ema12": _EwmTracker(12, 2.0 / (12 + 1), payload.get("ema12_state")),
+        "ema26": _EwmTracker(26, 2.0 / (26 + 1), payload.get("ema26_state")),
+        "qip_ema_fast": _EwmTracker(settings.qip_ema_fast, 2.0 / (settings.qip_ema_fast + 1), payload.get("qip_ema_fast_state")),
+        "qip_ema_slow": _EwmTracker(settings.qip_ema_slow, 2.0 / (settings.qip_ema_slow + 1), payload.get("qip_ema_slow_state")),
+        "qtp_ema_fast": _EwmTracker(settings.qtp_ema_fast_len, 2.0 / (settings.qtp_ema_fast_len + 1), payload.get("qtp_ema_fast_state")),
+        "qtp_ema_slow": _EwmTracker(settings.qtp_ema_slow_len, 2.0 / (settings.qtp_ema_slow_len + 1), payload.get("qtp_ema_slow_state")),
+        "qtp_basis": _EwmTracker(settings.qtp_dev_lookback, 2.0 / (settings.qtp_dev_lookback + 1), payload.get("qtp_basis_state")),
+        "qip_rsi_gain": _EwmTracker(settings.qip_rsi_len, 1.0 / max(int(settings.qip_rsi_len), 1), payload.get("qip_rsi_gain_state")),
+        "qip_rsi_loss": _EwmTracker(settings.qip_rsi_len, 1.0 / max(int(settings.qip_rsi_len), 1), payload.get("qip_rsi_loss_state")),
+        "qtp_rsi_gain": _EwmTracker(settings.qtp_rsi_len, 1.0 / max(int(settings.qtp_rsi_len), 1), payload.get("qtp_rsi_gain_state")),
+        "qtp_rsi_loss": _EwmTracker(settings.qtp_rsi_len, 1.0 / max(int(settings.qtp_rsi_len), 1), payload.get("qtp_rsi_loss_state")),
+        "qip_volume_window": _RollingWindow(settings.vol_ma_len, payload.get("qip_volume_window", ())),
+        "qip_low_window": _RollingWindow(max(int(constants["zz_left"]) * 2, 1), payload.get("qip_low_window", ())),
+        "qip_high_window": _RollingWindow(max(int(constants["zz_left"]) * 2, 1), payload.get("qip_high_window", ())),
+        "qip_pivot_high": _PivotTracker(int(constants["zz_left"]), payload.get("qip_pivot_high_window", ())),
+        "qip_pivot_low": _PivotTracker(int(constants["zz_left"]), payload.get("qip_pivot_low_window", ())),
+        "qtp_stoch_high_window": _RollingWindow(settings.qtp_stoch_len, payload.get("qtp_stoch_high_window", ())),
+        "qtp_stoch_low_window": _RollingWindow(settings.qtp_stoch_len, payload.get("qtp_stoch_low_window", ())),
+        "qtp_volume_window": _RollingWindow(settings.qtp_vol_len, payload.get("qtp_volume_window", ())),
+        "qtp_dev_window": _RollingWindow(settings.qtp_dev_lookback, payload.get("qtp_dev_window", ())),
+        "qtp_pivot_high": _PivotTracker(int(constants["qtp_pivot_left"]), payload.get("qtp_pivot_high_window", ())),
+        "qtp_pivot_low": _PivotTracker(int(constants["qtp_pivot_left"]), payload.get("qtp_pivot_low_window", ())),
+    }
+    return state
+
+
+def _snapshot_indicator_state(state: Dict[str, Any]) -> IndicatorCursor:
+    payload = {
+        "processed_rows": int(state["processed_rows"]),
+        "prev_close": state["prev_close"],
+        "prev_close_2": state["prev_close_2"],
+        "prev_high": state["prev_high"],
+        "prev_low": state["prev_low"],
+        "prev_is_long_trend": bool(state["prev_is_long_trend"]),
+        "prev_is_short_trend": bool(state["prev_is_short_trend"]),
+        "supertrend_value": state["supertrend_value"],
+        "supertrend_direction": state["supertrend_direction"],
+        "supertrend_final_upper": state["supertrend_final_upper"],
+        "supertrend_final_lower": state["supertrend_final_lower"],
+        "prev_qip_rsi": state["prev_qip_rsi"],
+        "prev_qip_vol_ma": state["prev_qip_vol_ma"],
+        "prev_volume": state["prev_volume"],
+        "prev_qip_ema_fast": state["prev_qip_ema_fast"],
+        "prev_qip_ema_slow": state["prev_qip_ema_slow"],
+        "prev_macd_raw": state["prev_macd_raw"],
+        "prev_qip_low_roll": state["prev_qip_low_roll"],
+        "prev_qip_high_roll": state["prev_qip_high_roll"],
+        "prev_atr14": state["prev_atr14"],
+        "last_pl_rsi": state["last_pl_rsi"],
+        "last_ph_rsi": state["last_ph_rsi"],
+        "last_pl_val": state["last_pl_val"],
+        "last_ph_val": state["last_ph_val"],
+        "last_pl_macd": state["last_pl_macd"],
+        "last_ph_macd": state["last_ph_macd"],
+        "prev_qtp_rsi": state["prev_qtp_rsi"],
+        "prev_qtp_stoch": state["prev_qtp_stoch"],
+        "prev_qtp_zdev": state["prev_qtp_zdev"],
+        "prev_qtp_bull_rev": bool(state["prev_qtp_bull_rev"]),
+        "prev_qtp_bear_rev": bool(state["prev_qtp_bear_rev"]),
+        "prev_qtp_vol_spike": bool(state["prev_qtp_vol_spike"]),
+        "prev_qtp_up_trend": bool(state["prev_qtp_up_trend"]),
+        "prev_qtp_dn_trend": bool(state["prev_qtp_dn_trend"]),
+        "prev_qtp_roc1": state["prev_qtp_roc1"],
+        "prev_qtp_roc2": state["prev_qtp_roc2"],
+        "supertrend_atr_state": state["supertrend_atr"].snapshot(),
+        "atr14_state": state["atr14"].snapshot(),
+        "qtp_atr_state": state["qtp_atr"].snapshot(),
+        "ema12_state": state["ema12"].snapshot(),
+        "ema26_state": state["ema26"].snapshot(),
+        "qip_ema_fast_state": state["qip_ema_fast"].snapshot(),
+        "qip_ema_slow_state": state["qip_ema_slow"].snapshot(),
+        "qtp_ema_fast_state": state["qtp_ema_fast"].snapshot(),
+        "qtp_ema_slow_state": state["qtp_ema_slow"].snapshot(),
+        "qtp_basis_state": state["qtp_basis"].snapshot(),
+        "qip_rsi_gain_state": state["qip_rsi_gain"].snapshot(),
+        "qip_rsi_loss_state": state["qip_rsi_loss"].snapshot(),
+        "qtp_rsi_gain_state": state["qtp_rsi_gain"].snapshot(),
+        "qtp_rsi_loss_state": state["qtp_rsi_loss"].snapshot(),
+        "qip_volume_window": state["qip_volume_window"].snapshot(),
+        "qip_low_window": state["qip_low_window"].snapshot(),
+        "qip_high_window": state["qip_high_window"].snapshot(),
+        "qip_pivot_high_window": state["qip_pivot_high"].snapshot(),
+        "qip_pivot_low_window": state["qip_pivot_low"].snapshot(),
+        "qtp_stoch_high_window": state["qtp_stoch_high_window"].snapshot(),
+        "qtp_stoch_low_window": state["qtp_stoch_low_window"].snapshot(),
+        "qtp_volume_window": state["qtp_volume_window"].snapshot(),
+        "qtp_dev_window": state["qtp_dev_window"].snapshot(),
+        "qtp_pivot_high_window": state["qtp_pivot_high"].snapshot(),
+        "qtp_pivot_low_window": state["qtp_pivot_low"].snapshot(),
+    }
+    return IndicatorCursor(payload=tuple(sorted((key, _encode_cursor_value(value)) for key, value in payload.items())))
+
 def _rma(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
 
@@ -179,10 +522,7 @@ def _ema(series: pd.Series, length: int) -> pd.Series:
 
 
 def _rsi(series: pd.Series, length: int) -> pd.Series:
-    rsi = pta.rsi(series.astype(float), length=length, talib=False)
-    if rsi is None:
-        return pd.Series(np.nan, index=series.index, dtype=float)
-    return rsi.reindex(series.index)
+    return _rsi_series(series.astype(float), length)
 
 
 def _atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> pd.Series:
@@ -317,248 +657,393 @@ def _cached(cache: Optional[Dict[Tuple[object, ...], object]], key: Tuple[object
     return cache[key]
 
 
+def _stream_indicator_rows(
+    df: pd.DataFrame,
+    settings: StrategySettings,
+    cursor: Optional[IndicatorCursor] = None,
+    start_index: int = 0,
+) -> Tuple[List[Dict[str, object]], Optional[Dict[str, object]], IndicatorCursor]:
+    frame = _ensure_ohlcv(df)
+    if frame.empty:
+        return [], None, IndicatorCursor(payload=())
+    state = _build_indicator_state(settings, cursor)
+    constants = state["constants"]
+    actual_start = max(int(start_index), int(state["processed_rows"]))
+    rows: List[Dict[str, object]] = []
+    latest_row: Optional[Dict[str, object]] = None
+    time_values = pd.to_datetime(frame["time"]).to_numpy(copy=False)
+    open_values = frame["open"].to_numpy(dtype=float, copy=False)
+    high_values = frame["high"].to_numpy(dtype=float, copy=False)
+    low_values = frame["low"].to_numpy(dtype=float, copy=False)
+    close_values = frame["close"].to_numpy(dtype=float, copy=False)
+    volume_values = frame["volume"].to_numpy(dtype=float, copy=False)
+    quote_volume_values = frame["quote_volume"].to_numpy(dtype=float, copy=False) if "quote_volume" in frame.columns else None
+
+    for index in range(actual_start, len(frame)):
+        time_value = pd.Timestamp(time_values[index])
+        open_value = float(open_values[index])
+        high_value = float(high_values[index])
+        low_value = float(low_values[index])
+        close_value = float(close_values[index])
+        volume_value = float(volume_values[index])
+        prev_close = _coerce_float(state["prev_close"])
+        prev_close_2 = _coerce_float(state["prev_close_2"])
+        prev_high = _coerce_float(state["prev_high"])
+        prev_low = _coerce_float(state["prev_low"])
+
+        tr_candidates = [high_value - low_value]
+        if math.isfinite(prev_close):
+            tr_candidates.append(abs(high_value - prev_close))
+            tr_candidates.append(abs(low_value - prev_close))
+        tr_value = max(tr_candidates)
+
+        atr_st = state["supertrend_atr"].update(tr_value)
+        atr14 = state["atr14"].update(tr_value)
+        qtp_atr = state["qtp_atr"].update(tr_value)
+
+        hl2 = (high_value + low_value) / 2.0
+        upperband = hl2 + (settings.factor * atr_st) if math.isfinite(atr_st) else float("nan")
+        lowerband = hl2 - (settings.factor * atr_st) if math.isfinite(atr_st) else float("nan")
+
+        prev_supertrend = _coerce_float(state["supertrend_value"])
+        prev_direction = _coerce_float(state["supertrend_direction"])
+        prev_final_upper = _coerce_float(state["supertrend_final_upper"])
+        prev_final_lower = _coerce_float(state["supertrend_final_lower"])
+        supertrend = float("nan")
+        direction = float("nan")
+        final_upper = upperband
+        final_lower = lowerband
+        if math.isfinite(atr_st):
+            if not math.isfinite(prev_supertrend):
+                supertrend = upperband
+                direction = 1.0
+            else:
+                if not math.isfinite(prev_final_upper):
+                    prev_final_upper = upperband
+                if not math.isfinite(prev_final_lower):
+                    prev_final_lower = lowerband
+                final_upper = upperband if (upperband < prev_final_upper or (math.isfinite(prev_close) and prev_close > prev_final_upper)) else prev_final_upper
+                final_lower = lowerband if (lowerband > prev_final_lower or (math.isfinite(prev_close) and prev_close < prev_final_lower)) else prev_final_lower
+                if math.isfinite(prev_direction) and prev_direction > 0:
+                    if close_value <= final_upper:
+                        supertrend = final_upper
+                        direction = 1.0
+                    else:
+                        supertrend = final_lower
+                        direction = -1.0
+                else:
+                    if close_value >= final_lower:
+                        supertrend = final_lower
+                        direction = -1.0
+                    else:
+                        supertrend = final_upper
+                        direction = 1.0
+        state["supertrend_value"] = supertrend
+        state["supertrend_direction"] = direction
+        state["supertrend_final_upper"] = final_upper
+        state["supertrend_final_lower"] = final_lower
+
+        dist_atr = abs(close_value - supertrend) / atr_st if math.isfinite(supertrend) and math.isfinite(atr_st) and atr_st != 0 else float("nan")
+        lev_zone = 3 if math.isfinite(dist_atr) and dist_atr < constants["zone3_thresh"] else (2 if math.isfinite(dist_atr) and dist_atr < constants["zone2_thresh"] else 1)
+        is_long_trend = math.isfinite(direction) and direction < 0
+        is_short_trend = math.isfinite(direction) and direction > 0
+        trend_to_long = is_long_trend and not bool(state["prev_is_long_trend"])
+        trend_to_short = is_short_trend and not bool(state["prev_is_short_trend"])
+
+        ema12 = state["ema12"].update(close_value)
+        ema26 = state["ema26"].update(close_value)
+        macd_raw = (ema12 - ema26) if math.isfinite(ema12) and math.isfinite(ema26) else float("nan")
+        qip_ema_fast = state["qip_ema_fast"].update(close_value)
+        qip_ema_slow = state["qip_ema_slow"].update(close_value)
+        qtp_ema_fast = state["qtp_ema_fast"].update(close_value)
+        qtp_ema_slow = state["qtp_ema_slow"].update(close_value)
+        qtp_basis = state["qtp_basis"].update(close_value)
+
+        qip_rsi_full = float("nan")
+        qtp_rsi = float("nan")
+        if math.isfinite(prev_close):
+            delta = close_value - prev_close
+            avg_gain_qip = state["qip_rsi_gain"].update(max(delta, 0.0))
+            avg_loss_qip = state["qip_rsi_loss"].update(max(-delta, 0.0))
+            if math.isfinite(avg_gain_qip) and math.isfinite(avg_loss_qip):
+                qip_rsi_full = _rsi_from_avgs(avg_gain_qip, avg_loss_qip)
+            avg_gain_qtp = state["qtp_rsi_gain"].update(max(delta, 0.0))
+            avg_loss_qtp = state["qtp_rsi_loss"].update(max(-delta, 0.0))
+            if math.isfinite(avg_gain_qtp) and math.isfinite(avg_loss_qtp):
+                qtp_rsi = _rsi_from_avgs(avg_gain_qtp, avg_loss_qtp)
+
+        qip_rsi_val = _coerce_float(state["prev_qip_rsi"])
+        vol_curr = _coerce_float(state["prev_volume"])
+        vol_ma_prev = state["qip_volume_window"].mean(settings.vol_ma_len)
+        qip_ema_f = _coerce_float(state["prev_qip_ema_fast"])
+        qip_ema_s = _coerce_float(state["prev_qip_ema_slow"])
+        macd_line = _coerce_float(state["prev_macd_raw"])
+        low_roll_prev = state["qip_low_window"].min(1)
+        high_roll_prev = state["qip_high_window"].max(1)
+        atr14_prev = _coerce_float(state["prev_atr14"])
+
+        pivot_h_value = state["qip_pivot_high"].update_high(high_value)
+        pivot_l_value = state["qip_pivot_low"].update_low(low_value)
+        ph_confirmed = math.isfinite(pivot_h_value)
+        pl_confirmed = math.isfinite(pivot_l_value)
+        ph_valid = ph_confirmed and math.isfinite(pivot_h_value) and math.isfinite(low_roll_prev) and math.isfinite(atr14_prev) and ((pivot_h_value - low_roll_prev) > (atr14_prev * constants["atr_mult"]))
+        pl_valid = pl_confirmed and math.isfinite(pivot_l_value) and math.isfinite(high_roll_prev) and math.isfinite(atr14_prev) and ((high_roll_prev - pivot_l_value) > (atr14_prev * constants["atr_mult"]))
+
+        qip_rsi_bull_ok = True if not settings.qip_use_rsi_zone else (math.isfinite(qip_rsi_val) and qip_rsi_val <= settings.qip_rsi_bull_max)
+        qip_rsi_bear_ok = True if not settings.qip_use_rsi_zone else (math.isfinite(qip_rsi_val) and qip_rsi_val >= settings.qip_rsi_bear_min)
+
+        bull_div = pl_valid and math.isfinite(qip_rsi_val) and math.isfinite(state["last_pl_rsi"]) and math.isfinite(pivot_l_value) and math.isfinite(state["last_pl_val"]) and (qip_rsi_val > state["last_pl_rsi"]) and (pivot_l_value < state["last_pl_val"])
+        bear_div = ph_valid and math.isfinite(qip_rsi_val) and math.isfinite(state["last_ph_rsi"]) and math.isfinite(pivot_h_value) and math.isfinite(state["last_ph_val"]) and (qip_rsi_val < state["last_ph_rsi"]) and (pivot_h_value > state["last_ph_val"])
+        bull_macd_div = pl_valid and math.isfinite(macd_line) and math.isfinite(state["last_pl_macd"]) and math.isfinite(pivot_l_value) and math.isfinite(state["last_pl_val"]) and (macd_line > state["last_pl_macd"]) and (pivot_l_value < state["last_pl_val"])
+        bear_macd_div = ph_valid and math.isfinite(macd_line) and math.isfinite(state["last_ph_macd"]) and math.isfinite(pivot_h_value) and math.isfinite(state["last_ph_val"]) and (macd_line < state["last_ph_macd"]) and (pivot_h_value > state["last_ph_val"])
+
+        bull_score = float(pl_valid)
+        bear_score = float(ph_valid)
+        if settings.use_rsi_div:
+            bull_score += float(bull_div)
+            bear_score += float(bear_div)
+        if settings.use_macd_div:
+            bull_score += float(bull_macd_div)
+            bear_score += float(bear_macd_div)
+        if settings.use_volume:
+            bull_score += float(math.isfinite(vol_curr) and math.isfinite(vol_ma_prev) and vol_curr > (vol_ma_prev * 1.2))
+            bear_score += float(math.isfinite(vol_curr) and math.isfinite(vol_ma_prev) and vol_curr > (vol_ma_prev * 1.2))
+        if settings.use_ema_conf:
+            bull_score += float(math.isfinite(qip_ema_f) and math.isfinite(qip_ema_s) and qip_ema_f > qip_ema_s)
+            bear_score += float(math.isfinite(qip_ema_f) and math.isfinite(qip_ema_s) and qip_ema_f < qip_ema_s)
+        qip_final_bull = bool(settings.use_qip) and pl_valid and bull_score >= settings.min_score and qip_rsi_bull_ok
+        qip_final_bear = bool(settings.use_qip) and ph_valid and bear_score >= settings.min_score and qip_rsi_bear_ok
+
+        if pl_confirmed and math.isfinite(qip_rsi_val):
+            state["last_pl_rsi"] = qip_rsi_val
+        if ph_confirmed and math.isfinite(qip_rsi_val):
+            state["last_ph_rsi"] = qip_rsi_val
+        if pl_confirmed and math.isfinite(pivot_l_value):
+            state["last_pl_val"] = pivot_l_value
+        if ph_confirmed and math.isfinite(pivot_h_value):
+            state["last_ph_val"] = pivot_h_value
+        if pl_confirmed and math.isfinite(macd_line):
+            state["last_pl_macd"] = macd_line
+        if ph_confirmed and math.isfinite(macd_line):
+            state["last_ph_macd"] = macd_line
+
+        state["qip_low_window"].push(low_value)
+        state["qip_high_window"].push(high_value)
+        state["qip_volume_window"].push(volume_value)
+
+        state["qtp_stoch_high_window"].push(high_value)
+        state["qtp_stoch_low_window"].push(low_value)
+        stoch_high = state["qtp_stoch_high_window"].max(settings.qtp_stoch_len)
+        stoch_low = state["qtp_stoch_low_window"].min(settings.qtp_stoch_len)
+        qtp_stoch = ((close_value - stoch_low) / (stoch_high - stoch_low) * 100.0) if math.isfinite(stoch_high) and math.isfinite(stoch_low) and stoch_high != stoch_low else float("nan")
+
+        state["qtp_volume_window"].push(volume_value)
+        qtp_vol_sma = state["qtp_volume_window"].mean(settings.qtp_vol_len)
+        qtp_dev = ((close_value - qtp_basis) / qtp_atr) if math.isfinite(qtp_basis) and math.isfinite(qtp_atr) and qtp_atr != 0 else float("nan")
+        state["qtp_dev_window"].push(qtp_dev)
+        qtp_d_mean = state["qtp_dev_window"].mean(settings.qtp_dev_lookback)
+        qtp_d_std = state["qtp_dev_window"].std(settings.qtp_dev_lookback, ddof=1)
+        qtp_zdev = ((qtp_dev - qtp_d_mean) / qtp_d_std) if math.isfinite(qtp_dev) and math.isfinite(qtp_d_mean) and math.isfinite(qtp_d_std) and qtp_d_std != 0 else float("nan")
+
+        qtp_body = abs(close_value - open_value)
+        qtp_range = high_value - low_value
+        qtp_upper_wick = high_value - max(open_value, close_value)
+        qtp_lower_wick = min(open_value, close_value) - low_value
+        qtp_bull_rev = qtp_range > 0 and qtp_lower_wick > (qtp_body * 1.2) and close_value > open_value
+        qtp_bear_rev = qtp_range > 0 and qtp_upper_wick > (qtp_body * 1.2) and close_value < open_value
+        qtp_vol_spike = math.isfinite(qtp_vol_sma) and volume_value > (qtp_vol_sma * (1.1 + (0.5 * constants["qtp_sens"])))
+        qtp_up_trend = math.isfinite(qtp_ema_fast) and math.isfinite(qtp_ema_slow) and qtp_ema_fast > qtp_ema_slow
+        qtp_dn_trend = math.isfinite(qtp_ema_fast) and math.isfinite(qtp_ema_slow) and qtp_ema_fast < qtp_ema_slow
+        qtp_roc1 = (close_value - prev_close) if math.isfinite(prev_close) else float("nan")
+        qtp_roc2 = (prev_close - prev_close_2) if math.isfinite(prev_close) and math.isfinite(prev_close_2) else float("nan")
+
+        qtp_bot_score = 0.0
+        qtp_top_score = 0.0
+        qtp_bot_score += 18.0 if math.isfinite(state["prev_qtp_rsi"]) and state["prev_qtp_rsi"] < constants["qtp_rsi_lower"] else 0.0
+        qtp_top_score += 18.0 if math.isfinite(state["prev_qtp_rsi"]) and state["prev_qtp_rsi"] > constants["qtp_rsi_upper"] else 0.0
+        qtp_bot_score += 12.0 if math.isfinite(state["prev_qtp_stoch"]) and state["prev_qtp_stoch"] < constants["qtp_stoch_lower"] else 0.0
+        qtp_top_score += 12.0 if math.isfinite(state["prev_qtp_stoch"]) and state["prev_qtp_stoch"] > constants["qtp_stoch_upper"] else 0.0
+        qtp_bot_score += 22.0 if math.isfinite(state["prev_qtp_zdev"]) and state["prev_qtp_zdev"] < -(1.0 + ((1.0 - constants["qtp_sens"]) * 0.8)) else 0.0
+        qtp_top_score += 22.0 if math.isfinite(state["prev_qtp_zdev"]) and state["prev_qtp_zdev"] > (1.0 + ((1.0 - constants["qtp_sens"]) * 0.8)) else 0.0
+        qtp_bot_score += 16.0 if state["prev_qtp_bull_rev"] else 0.0
+        qtp_top_score += 16.0 if state["prev_qtp_bear_rev"] else 0.0
+        qtp_bot_score += 10.0 if state["prev_qtp_vol_spike"] and math.isfinite(prev_close) and math.isfinite(prev_low) and prev_close > prev_low else 0.0
+        qtp_top_score += 10.0 if state["prev_qtp_vol_spike"] and math.isfinite(prev_close) and math.isfinite(prev_high) and prev_close < prev_high else 0.0
+        qtp_bot_score += 10.0 if math.isfinite(state["prev_qtp_roc2"]) and math.isfinite(state["prev_qtp_roc1"]) and state["prev_qtp_roc2"] < 0 and state["prev_qtp_roc1"] > state["prev_qtp_roc2"] else 0.0
+        qtp_top_score += 10.0 if math.isfinite(state["prev_qtp_roc2"]) and math.isfinite(state["prev_qtp_roc1"]) and state["prev_qtp_roc2"] > 0 and state["prev_qtp_roc1"] < state["prev_qtp_roc2"] else 0.0
+        if settings.qtp_use_trend:
+            qtp_bot_score += 8.0 if state["prev_qtp_up_trend"] else 0.0
+            qtp_top_score += 8.0 if state["prev_qtp_dn_trend"] else 0.0
+        qtp_bot_score = min(qtp_bot_score, 100.0)
+        qtp_top_score = min(qtp_top_score, 100.0)
+
+        qtp_rsi_bull_ok = True if not settings.qtp_use_rsi_zone else (math.isfinite(state["prev_qtp_rsi"]) and state["prev_qtp_rsi"] <= settings.qtp_rsi_bull_max)
+        qtp_rsi_bear_ok = True if not settings.qtp_use_rsi_zone else (math.isfinite(state["prev_qtp_rsi"]) and state["prev_qtp_rsi"] >= settings.qtp_rsi_bear_min)
+        qtp_p_low = state["qtp_pivot_low"].update_low(low_value)
+        qtp_p_high = state["qtp_pivot_high"].update_high(high_value)
+        qtp_p_low_confirmed = math.isfinite(qtp_p_low)
+        qtp_p_high_confirmed = math.isfinite(qtp_p_high)
+        qtp_final_bull = bool(settings.use_qtp) and qtp_p_low_confirmed and qtp_bot_score >= constants["qtp_score_thr"] and qtp_rsi_bull_ok
+        qtp_final_bear = bool(settings.use_qtp) and qtp_p_high_confirmed and qtp_top_score >= constants["qtp_score_thr"] and qtp_rsi_bear_ok
+
+        final_bull = bool(qip_final_bull or qtp_final_bull)
+        final_bear = bool(qip_final_bear or qtp_final_bear)
+        sign = 1.0 if is_long_trend else -1.0
+        zone2_line = supertrend + (sign * constants["zone2_thresh"] * atr_st) if math.isfinite(supertrend) and math.isfinite(atr_st) else float("nan")
+        zone3_line = supertrend + (sign * constants["zone3_thresh"] * atr_st) if math.isfinite(supertrend) and math.isfinite(atr_st) else float("nan")
+
+        row: Dict[str, object] = {
+            "time": time_value,
+            "open": open_value,
+            "high": high_value,
+            "low": low_value,
+            "close": close_value,
+            "volume": volume_value,
+            "supertrend": supertrend,
+            "direction": direction,
+            "dist_atr": dist_atr,
+            "lev_zone": lev_zone,
+            "zone2_line": zone2_line,
+            "zone3_line": zone3_line,
+            "is_long_trend": bool(is_long_trend),
+            "is_short_trend": bool(is_short_trend),
+            "trend_to_long": bool(trend_to_long),
+            "trend_to_short": bool(trend_to_short),
+            "qip_final_bull": bool(qip_final_bull),
+            "qip_final_bear": bool(qip_final_bear),
+            "qtp_final_bull": bool(qtp_final_bull),
+            "qtp_final_bear": bool(qtp_final_bear),
+            "final_bull": bool(final_bull),
+            "final_bear": bool(final_bear),
+            "bull_score": bull_score,
+            "bear_score": bear_score,
+            "qtp_bot_score": qtp_bot_score,
+            "qtp_top_score": qtp_top_score,
+            "ema_fast": qip_ema_fast,
+            "ema_slow": qip_ema_slow,
+            "rsi": qip_rsi_full,
+        }
+        if quote_volume_values is not None:
+            row["quote_volume"] = float(quote_volume_values[index])
+        rows.append(row)
+        latest_row = row
+
+        state["processed_rows"] = int(index + 1)
+        state["prev_close_2"] = prev_close
+        state["prev_close"] = close_value
+        state["prev_high"] = high_value
+        state["prev_low"] = low_value
+        state["prev_is_long_trend"] = bool(is_long_trend)
+        state["prev_is_short_trend"] = bool(is_short_trend)
+        state["prev_qip_rsi"] = qip_rsi_full
+        state["prev_qip_vol_ma"] = state["qip_volume_window"].mean(settings.vol_ma_len)
+        state["prev_volume"] = volume_value
+        state["prev_qip_ema_fast"] = qip_ema_fast
+        state["prev_qip_ema_slow"] = qip_ema_slow
+        state["prev_macd_raw"] = macd_raw
+        state["prev_qip_low_roll"] = state["qip_low_window"].min(1)
+        state["prev_qip_high_roll"] = state["qip_high_window"].max(1)
+        state["prev_atr14"] = atr14
+        state["prev_qtp_rsi"] = qtp_rsi
+        state["prev_qtp_stoch"] = qtp_stoch
+        state["prev_qtp_zdev"] = qtp_zdev
+        state["prev_qtp_bull_rev"] = bool(qtp_bull_rev)
+        state["prev_qtp_bear_rev"] = bool(qtp_bear_rev)
+        state["prev_qtp_vol_spike"] = bool(qtp_vol_spike)
+        state["prev_qtp_up_trend"] = bool(qtp_up_trend)
+        state["prev_qtp_dn_trend"] = bool(qtp_dn_trend)
+        state["prev_qtp_roc1"] = qtp_roc1
+        state["prev_qtp_roc2"] = qtp_roc2
+
+    return rows, latest_row, _snapshot_indicator_state(state)
+
+
+def evaluate_latest_state(
+    df: pd.DataFrame,
+    settings: StrategySettings,
+    cursor: Optional[IndicatorCursor] = None,
+) -> Tuple[Dict[str, object], Optional[IndicatorCursor]]:
+    rows, latest_row, latest_cursor = _stream_indicator_rows(df, settings, cursor=cursor)
+    if latest_row is None:
+        return {}, latest_cursor
+    latest_series = pd.Series(latest_row)
+    return _build_latest_state(latest_series), latest_cursor
+
+
+def _indicator_cursor_processed_rows(cursor: Optional[IndicatorCursor]) -> int:
+    if cursor is None:
+        return 0
+    for key, value in cursor.payload:
+        if key == "processed_rows":
+            return int(value or 0)
+    return 0
+
+
+def _empty_indicator_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    indicators = frame.iloc[0:0].copy()
+    extra_columns = [
+        "supertrend",
+        "direction",
+        "dist_atr",
+        "lev_zone",
+        "zone2_line",
+        "zone3_line",
+        "is_long_trend",
+        "is_short_trend",
+        "trend_to_long",
+        "trend_to_short",
+        "qip_final_bull",
+        "qip_final_bear",
+        "qtp_final_bull",
+        "qtp_final_bear",
+        "final_bull",
+        "final_bear",
+        "bull_score",
+        "bear_score",
+        "qtp_bot_score",
+        "qtp_top_score",
+        "ema_fast",
+        "ema_slow",
+        "rsi",
+    ]
+    for column in extra_columns:
+        if column not in indicators.columns:
+            indicators[column] = pd.Series(dtype=float)
+    return indicators
+
+
+def _stream_indicator_frame(
+    df: pd.DataFrame,
+    settings: StrategySettings,
+    cursor: Optional[IndicatorCursor] = None,
+    start_index: int = 0,
+) -> Tuple[pd.DataFrame, IndicatorCursor]:
+    frame = _ensure_ohlcv(df)
+    rows, _, indicator_cursor = _stream_indicator_rows(frame, settings, cursor=cursor, start_index=start_index)
+    if rows:
+        indicators = pd.DataFrame(rows)
+    else:
+        indicators = _empty_indicator_frame(frame)
+    indicators.attrs[PREPARED_OHLCV_ATTR] = True
+    indicators.attrs["indicator_cursor"] = indicator_cursor
+    return indicators, indicator_cursor
+
+
 def compute_indicators(
     df: pd.DataFrame,
     settings: StrategySettings,
     cache: Optional[Dict[Tuple[object, ...], object]] = None,
 ) -> pd.DataFrame:
     frame = _ensure_ohlcv(df)
-    close = frame["close"]
-    high = frame["high"]
-    low = frame["low"]
-    open_ = frame["open"]
-    volume = frame["volume"]
-
-    supertrend, direction, atr_st = _cached(
-        cache,
-        ("supertrend", settings.atr_period, settings.factor),
-        lambda: _supertrend(frame, settings.atr_period, settings.factor),
-    )
-    dist_atr = (close - supertrend).abs() / atr_st.replace(0.0, np.nan)
-    zone3_thresh = 0.5 * settings.zone_sensitivity
-    zone2_thresh = 1.0 * settings.zone_sensitivity
-    lev_zone = np.where(dist_atr < zone3_thresh, 3, np.where(dist_atr < zone2_thresh, 2, 1))
-
-    is_long_trend = direction < 0
-    is_short_trend = direction > 0
-    trend_to_long = is_long_trend & ~is_long_trend.shift(1, fill_value=False)
-    trend_to_short = is_short_trend & ~is_short_trend.shift(1, fill_value=False)
-
-    sens_mult = SENSITIVITY_MULTIPLIERS.get(settings.sensitivity_mode, 1.0)
-    zz_left = max(2, int(round(settings.zz_len_raw * sens_mult)))
-    atr_mult = settings.atr_mult_raw / sens_mult
-    atr_val = _cached(cache, ("atr", 14), lambda: _atr(high, low, close, 14))
-    macd_raw = _cached(cache, ("macd_line",), lambda: _macd_line(close))
-
-    pivot_h_series = _cached(
-        cache,
-        ("pivot_high_series", zz_left, 1),
-        lambda: pd.Series(_pivot_high(high.to_numpy(dtype=float), zz_left, 1), index=frame.index),
-    )
-    pivot_l_series = _cached(
-        cache,
-        ("pivot_low_series", zz_left, 1),
-        lambda: pd.Series(_pivot_low(low.to_numpy(dtype=float), zz_left, 1), index=frame.index),
-    )
-    ph_confirmed = pivot_h_series.notna()
-    pl_confirmed = pivot_l_series.notna()
-
-    lowest_low_prev = _cached(
-        cache,
-        ("rolling_low_shift", zz_left * 2),
-        lambda: low.rolling(zz_left * 2, min_periods=1).min().shift(1),
-    )
-    highest_high_prev = _cached(
-        cache,
-        ("rolling_high_shift", zz_left * 2),
-        lambda: high.rolling(zz_left * 2, min_periods=1).max().shift(1),
-    )
-    ph_valid = ph_confirmed & ((pivot_h_series - lowest_low_prev) > (atr_val.shift(1) * atr_mult))
-    pl_valid = pl_confirmed & ((highest_high_prev - pivot_l_series) > (atr_val.shift(1) * atr_mult))
-
-    qip_rsi_full = _cached(cache, ("rsi", settings.qip_rsi_len), lambda: _rsi(close, settings.qip_rsi_len))
-    qip_rsi_val = qip_rsi_full.shift(1)
-    vol_ma = _cached(
-        cache,
-        ("volume_mean_shift", settings.vol_ma_len),
-        lambda: volume.rolling(settings.vol_ma_len, min_periods=settings.vol_ma_len).mean().shift(1),
-    )
-    vol_curr = volume.shift(1)
-    qip_ema_fast_full = _cached(cache, ("ema", settings.qip_ema_fast), lambda: _ema(close, settings.qip_ema_fast))
-    qip_ema_slow_full = _cached(cache, ("ema", settings.qip_ema_slow), lambda: _ema(close, settings.qip_ema_slow))
-    qip_ema_f = qip_ema_fast_full.shift(1)
-    qip_ema_s = qip_ema_slow_full.shift(1)
-    macd_line = macd_raw.shift(1)
-
-    qip_rsi_bull_ok = pd.Series(True, index=frame.index) if not settings.qip_use_rsi_zone else (qip_rsi_val <= settings.qip_rsi_bull_max)
-    qip_rsi_bear_ok = pd.Series(True, index=frame.index) if not settings.qip_use_rsi_zone else (qip_rsi_val >= settings.qip_rsi_bear_min)
-
-    prev_pl_rsi = _cached(
-        cache,
-        ("previous_occurrence", "pl_rsi", zz_left, settings.qip_rsi_len),
-        lambda: _previous_occurrence(pl_confirmed.to_numpy(dtype=bool), qip_rsi_val.to_numpy(dtype=float)),
-    )
-    prev_ph_rsi = _cached(
-        cache,
-        ("previous_occurrence", "ph_rsi", zz_left, settings.qip_rsi_len),
-        lambda: _previous_occurrence(ph_confirmed.to_numpy(dtype=bool), qip_rsi_val.to_numpy(dtype=float)),
-    )
-    prev_pl_val = _cached(
-        cache,
-        ("previous_occurrence", "pl_val", zz_left),
-        lambda: _previous_occurrence(pl_confirmed.to_numpy(dtype=bool), pivot_l_series.to_numpy(dtype=float)),
-    )
-    prev_ph_val = _cached(
-        cache,
-        ("previous_occurrence", "ph_val", zz_left),
-        lambda: _previous_occurrence(ph_confirmed.to_numpy(dtype=bool), pivot_h_series.to_numpy(dtype=float)),
-    )
-    prev_pl_macd = _cached(
-        cache,
-        ("previous_occurrence", "pl_macd", zz_left),
-        lambda: _previous_occurrence(pl_confirmed.to_numpy(dtype=bool), macd_line.to_numpy(dtype=float)),
-    )
-    prev_ph_macd = _cached(
-        cache,
-        ("previous_occurrence", "ph_macd", zz_left),
-        lambda: _previous_occurrence(ph_confirmed.to_numpy(dtype=bool), macd_line.to_numpy(dtype=float)),
-    )
-
-    bull_div = pl_valid & (qip_rsi_val > prev_pl_rsi) & (pivot_l_series < prev_pl_val)
-    bear_div = ph_valid & (qip_rsi_val < prev_ph_rsi) & (pivot_h_series > prev_ph_val)
-    bull_macd_div = pl_valid & (macd_line > prev_pl_macd) & (pivot_l_series < prev_pl_val)
-    bear_macd_div = ph_valid & (macd_line < prev_ph_macd) & (pivot_h_series > prev_ph_val)
-
-    bull_score = pd.Series(0, index=frame.index, dtype=float)
-    bull_score += pl_valid.astype(float)
-    bull_score += bull_div.astype(float) if settings.use_rsi_div else 0.0
-    bull_score += bull_macd_div.astype(float) if settings.use_macd_div else 0.0
-    bull_score += (vol_curr > vol_ma * 1.2).astype(float) if settings.use_volume else 0.0
-    bull_score += (qip_ema_f > qip_ema_s).astype(float) if settings.use_ema_conf else 0.0
-
-    bear_score = pd.Series(0, index=frame.index, dtype=float)
-    bear_score += ph_valid.astype(float)
-    bear_score += bear_div.astype(float) if settings.use_rsi_div else 0.0
-    bear_score += bear_macd_div.astype(float) if settings.use_macd_div else 0.0
-    bear_score += (vol_curr > vol_ma * 1.2).astype(float) if settings.use_volume else 0.0
-    bear_score += (qip_ema_f < qip_ema_s).astype(float) if settings.use_ema_conf else 0.0
-
-    qip_final_bull = (pl_valid & (bull_score >= settings.min_score) & qip_rsi_bull_ok) if settings.use_qip else pd.Series(False, index=frame.index)
-    qip_final_bear = (ph_valid & (bear_score >= settings.min_score) & qip_rsi_bear_ok) if settings.use_qip else pd.Series(False, index=frame.index)
-
-    qtp_sens = settings.qtp_sensitivity / 100.0
-    qtp_pivot_left = int(round(settings.qtp_max_pvt_left - (settings.qtp_max_pvt_left - settings.qtp_min_pvt_left) * qtp_sens))
-    qtp_rsi_upper = 70 - round(10 * qtp_sens)
-    qtp_rsi_lower = 30 + round(10 * qtp_sens)
-    qtp_stoch_upper = 80 - round(10 * qtp_sens)
-    qtp_stoch_lower = 20 + round(10 * qtp_sens)
-    qtp_score_thr = 55 - round(15 * qtp_sens)
-
-    qtp_ema_fast_val = _cached(cache, ("ema", settings.qtp_ema_fast_len), lambda: _ema(close, settings.qtp_ema_fast_len))
-    qtp_ema_slow_val = _cached(cache, ("ema", settings.qtp_ema_slow_len), lambda: _ema(close, settings.qtp_ema_slow_len))
-    qtp_atr = _cached(cache, ("atr", settings.qtp_atr_len), lambda: _atr(high, low, close, settings.qtp_atr_len))
-    qtp_rsi = _cached(cache, ("rsi", settings.qtp_rsi_len), lambda: _rsi(close, settings.qtp_rsi_len))
-    qtp_stoch = _cached(cache, ("stoch", settings.qtp_stoch_len), lambda: _stoch(close, high, low, settings.qtp_stoch_len))
-    qtp_vol_sma = _cached(
-        cache,
-        ("volume_mean", settings.qtp_vol_len),
-        lambda: volume.rolling(settings.qtp_vol_len, min_periods=settings.qtp_vol_len).mean(),
-    )
-
-    qtp_basis = _cached(cache, ("ema", settings.qtp_dev_lookback), lambda: _ema(close, settings.qtp_dev_lookback))
-    qtp_dev = (close - qtp_basis) / qtp_atr.replace(0.0, np.nan)
-    qtp_d_mean = _cached(
-        cache,
-        ("qtp_dev_mean", settings.qtp_dev_lookback, settings.qtp_atr_len),
-        lambda: qtp_dev.rolling(settings.qtp_dev_lookback, min_periods=settings.qtp_dev_lookback).mean(),
-    )
-    qtp_d_std = _cached(
-        cache,
-        ("qtp_dev_std", settings.qtp_dev_lookback, settings.qtp_atr_len),
-        lambda: qtp_dev.rolling(settings.qtp_dev_lookback, min_periods=settings.qtp_dev_lookback).std(),
-    )
-    qtp_zdev = (qtp_dev - qtp_d_mean) / qtp_d_std.replace(0.0, np.nan)
-
-    qtp_body = (close - open_).abs()
-    qtp_range = high - low
-    open_close_max = np.maximum(open_.to_numpy(dtype=float), close.to_numpy(dtype=float))
-    open_close_min = np.minimum(open_.to_numpy(dtype=float), close.to_numpy(dtype=float))
-    qtp_upper_wick = high - pd.Series(open_close_max, index=frame.index)
-    qtp_lower_wick = pd.Series(open_close_min, index=frame.index) - low
-
-    qtp_bull_rev = (qtp_range > 0) & (qtp_lower_wick > qtp_body * 1.2) & (close > open_)
-    qtp_bear_rev = (qtp_range > 0) & (qtp_upper_wick > qtp_body * 1.2) & (close < open_)
-    qtp_vol_spike = volume > qtp_vol_sma * (1.1 + 0.5 * qtp_sens)
-    qtp_up_trend = qtp_ema_fast_val > qtp_ema_slow_val
-    qtp_dn_trend = qtp_ema_fast_val < qtp_ema_slow_val
-    qtp_roc1 = close - close.shift(1)
-    qtp_roc2 = close.shift(1) - close.shift(2)
-
-    qtp_bot_score = pd.Series(0.0, index=frame.index)
-    qtp_top_score = pd.Series(0.0, index=frame.index)
-    qtp_bot_score += np.where(qtp_rsi.shift(1) < qtp_rsi_lower, 18, 0)
-    qtp_top_score += np.where(qtp_rsi.shift(1) > qtp_rsi_upper, 18, 0)
-    qtp_bot_score += np.where(qtp_stoch.shift(1) < qtp_stoch_lower, 12, 0)
-    qtp_top_score += np.where(qtp_stoch.shift(1) > qtp_stoch_upper, 12, 0)
-    qtp_bot_score += np.where(qtp_zdev.shift(1) < -(1.0 + (1.0 - qtp_sens) * 0.8), 22, 0)
-    qtp_top_score += np.where(qtp_zdev.shift(1) > (1.0 + (1.0 - qtp_sens) * 0.8), 22, 0)
-    qtp_bot_score += np.where(qtp_bull_rev.shift(1), 16, 0)
-    qtp_top_score += np.where(qtp_bear_rev.shift(1), 16, 0)
-    qtp_bot_score += np.where(qtp_vol_spike.shift(1) & (close.shift(1) > low.shift(1)), 10, 0)
-    qtp_top_score += np.where(qtp_vol_spike.shift(1) & (close.shift(1) < high.shift(1)), 10, 0)
-    qtp_bot_score += np.where((qtp_roc2.shift(1) < 0) & (qtp_roc1.shift(1) > qtp_roc2.shift(1)), 10, 0)
-    qtp_top_score += np.where((qtp_roc2.shift(1) > 0) & (qtp_roc1.shift(1) < qtp_roc2.shift(1)), 10, 0)
-    if settings.qtp_use_trend:
-        qtp_bot_score += np.where(qtp_up_trend.shift(1), 8, 0)
-        qtp_top_score += np.where(qtp_dn_trend.shift(1), 8, 0)
-    qtp_bot_score = qtp_bot_score.clip(upper=100)
-    qtp_top_score = qtp_top_score.clip(upper=100)
-
-    qtp_rsi_bull_ok = pd.Series(True, index=frame.index) if not settings.qtp_use_rsi_zone else (qtp_rsi.shift(1) <= settings.qtp_rsi_bull_max)
-    qtp_rsi_bear_ok = pd.Series(True, index=frame.index) if not settings.qtp_use_rsi_zone else (qtp_rsi.shift(1) >= settings.qtp_rsi_bear_min)
-    qtp_p_low = _cached(
-        cache,
-        ("pivot_low", qtp_pivot_left, 1),
-        lambda: _pivot_low(low.to_numpy(dtype=float), qtp_pivot_left, 1),
-    )
-    qtp_p_high = _cached(
-        cache,
-        ("pivot_high", qtp_pivot_left, 1),
-        lambda: _pivot_high(high.to_numpy(dtype=float), qtp_pivot_left, 1),
-    )
-    qtp_p_low_series = pd.Series(np.isfinite(qtp_p_low), index=frame.index)
-    qtp_p_high_series = pd.Series(np.isfinite(qtp_p_high), index=frame.index)
-    qtp_final_bull = (qtp_p_low_series & (qtp_bot_score >= qtp_score_thr) & qtp_rsi_bull_ok) if settings.use_qtp else pd.Series(False, index=frame.index)
-    qtp_final_bear = (qtp_p_high_series & (qtp_top_score >= qtp_score_thr) & qtp_rsi_bear_ok) if settings.use_qtp else pd.Series(False, index=frame.index)
-
-    final_bull = qip_final_bull | qtp_final_bull
-    final_bear = qip_final_bear | qtp_final_bear
-    sign = np.where(is_long_trend, 1.0, -1.0)
-
-    indicators = frame.copy()
-    indicators["supertrend"] = supertrend
-    indicators["direction"] = direction
-    indicators["dist_atr"] = dist_atr
-    indicators["lev_zone"] = lev_zone
-    indicators["zone2_line"] = supertrend + sign * zone2_thresh * atr_st
-    indicators["zone3_line"] = supertrend + sign * zone3_thresh * atr_st
-    indicators["is_long_trend"] = is_long_trend
-    indicators["is_short_trend"] = is_short_trend
-    indicators["trend_to_long"] = trend_to_long
-    indicators["trend_to_short"] = trend_to_short
-    indicators["qip_final_bull"] = qip_final_bull
-    indicators["qip_final_bear"] = qip_final_bear
-    indicators["qtp_final_bull"] = qtp_final_bull
-    indicators["qtp_final_bear"] = qtp_final_bear
-    indicators["final_bull"] = final_bull
-    indicators["final_bear"] = final_bear
-    indicators["bull_score"] = bull_score
-    indicators["bear_score"] = bear_score
-    indicators["qtp_bot_score"] = qtp_bot_score
-    indicators["qtp_top_score"] = qtp_top_score
-    indicators["ema_fast"] = qip_ema_fast_full
-    indicators["ema_slow"] = qip_ema_slow_full
-    indicators["rsi"] = qip_rsi_full
+    cache_key = ("stream_indicators", id(frame), settings)
+    if cache is not None and cache_key in cache:
+        cached = cache[cache_key]
+        if isinstance(cached, pd.DataFrame):
+            return cached.copy()
+    indicators, indicator_cursor = _stream_indicator_frame(frame, settings)
+    indicators.attrs["indicator_cursor"] = indicator_cursor
+    if cache is not None:
+        cache[cache_key] = indicators.copy()
     return indicators
 
 
@@ -613,6 +1098,7 @@ def _run_backtest_core(
     resume_cursor: Optional[BacktestCursor] = None,
     existing_trades: Optional[List[TradeRecord]] = None,
     existing_equity_curve: Optional[pd.Series] = None,
+    indicator_cursor: Optional[IndicatorCursor] = None,
 ) -> Tuple[StrategyMetrics, List[TradeRecord], pd.Series, pd.DataFrame, Dict[str, object], Optional[BacktestCursor]]:
     latest = indicators.iloc[-1]
     active_indicators, result_indicators = _select_active_indicators(indicators, backtest_start_time)
@@ -818,6 +1304,7 @@ def _run_backtest_core(
             last_long_zone=int(last_long_zone),
             last_short_zone=int(last_short_zone),
             last_equity_value=last_equity_value,
+            indicator_cursor=indicator_cursor,
         )
 
     if abs(position_qty) > 1e-12 and active_count:
@@ -889,6 +1376,7 @@ def run_backtest(
     indicator_cache: Optional[Dict[Tuple[object, ...], object]] = None,
 ) -> BacktestResult:
     indicators = compute_indicators(df, settings, cache=indicator_cache)
+    indicator_cursor = indicators.attrs.get("indicator_cursor")
     metrics, trades, curve, result_indicators, latest_state, cursor = _run_backtest_core(
         indicators,
         settings=settings,
@@ -896,6 +1384,7 @@ def run_backtest(
         starting_equity=starting_equity,
         backtest_start_time=backtest_start_time,
         include_details=True,
+        indicator_cursor=indicator_cursor,
     )
     return BacktestResult(
         settings=settings,
@@ -927,11 +1416,36 @@ def resume_backtest(
             backtest_start_time=backtest_start_time,
             indicator_cache=indicator_cache,
         )
-
-    indicators = compute_indicators(df, settings, cache=indicator_cache)
-    active_indicators, _ = _select_active_indicators(indicators, backtest_start_time)
     previous_indicators = previous_result.indicators.sort_values("time").drop_duplicates(subset=["time"]).reset_index(drop=True)
-    if previous_indicators.empty or len(active_indicators) <= len(previous_indicators):
+    previous_indicator_cursor = previous_result.cursor.indicator_cursor
+    full_history = _ensure_ohlcv(df)
+    previous_processed_rows = _indicator_cursor_processed_rows(previous_indicator_cursor)
+    if previous_indicators.empty or previous_indicator_cursor is None or previous_processed_rows <= 0 or len(full_history) <= previous_processed_rows:
+        return run_backtest(
+            df,
+            settings=settings,
+            fee_rate=fee_rate,
+            starting_equity=starting_equity,
+            backtest_start_time=backtest_start_time,
+            indicator_cache=indicator_cache,
+        )
+    prefix_last = full_history.iloc[previous_processed_rows - 1]
+    previous_last = previous_indicators.iloc[-1]
+    compare_columns = ["time", "open", "high", "low", "close", "volume"]
+    prefix_matches = True
+    for column in compare_columns:
+        if column not in previous_last.index:
+            continue
+        left = prefix_last[column]
+        right = previous_last[column]
+        if column == "time":
+            if pd.Timestamp(left) != pd.Timestamp(right):
+                prefix_matches = False
+                break
+        elif not np.isclose(float(left), float(right), equal_nan=True, atol=1e-12):
+            prefix_matches = False
+            break
+    if not prefix_matches:
         return run_backtest(
             df,
             settings=settings,
@@ -941,21 +1455,18 @@ def resume_backtest(
             indicator_cache=indicator_cache,
         )
 
-    prefix = active_indicators.iloc[: len(previous_indicators)].reset_index(drop=True)
-    compare_columns = [
-        column
-        for column in ("time", "open", "high", "low", "close", "volume", "final_bull", "final_bear", "trend_to_long", "trend_to_short")
-        if column in previous_indicators.columns and column in prefix.columns
-    ]
-    if not previous_indicators.loc[:, compare_columns].equals(prefix.loc[:, compare_columns]):
-        return run_backtest(
-            df,
-            settings=settings,
-            fee_rate=fee_rate,
-            starting_equity=starting_equity,
-            backtest_start_time=backtest_start_time,
-            indicator_cache=indicator_cache,
-        )
+    new_indicators, indicator_cursor = _stream_indicator_frame(
+        full_history,
+        settings,
+        cursor=previous_indicator_cursor,
+        start_index=previous_processed_rows,
+    )
+    if new_indicators.empty:
+        return previous_result
+
+    indicators = pd.concat([previous_indicators, new_indicators], ignore_index=True)
+    indicators = indicators.drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
+    indicators.attrs["indicator_cursor"] = indicator_cursor
 
     existing_curve = previous_result.equity_curve.copy()
     if not existing_curve.empty:
@@ -971,6 +1482,7 @@ def resume_backtest(
         resume_cursor=previous_result.cursor,
         existing_trades=_strip_provisional_trade(previous_result.trades, previous_result.cursor),
         existing_equity_curve=existing_curve,
+        indicator_cursor=indicator_cursor,
     )
     return BacktestResult(
         settings=settings,
