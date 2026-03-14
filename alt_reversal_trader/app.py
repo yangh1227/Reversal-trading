@@ -82,6 +82,19 @@ from .strategy import (
     run_backtest,
     signal_fraction_for_zone,
 )
+from .trade_engine import (
+    EngineCloseOrderCommand,
+    EngineHealthEvent,
+    EngineLogEvent,
+    EngineOpenOrderCommand,
+    EngineOrderCompletedEvent,
+    EngineOrderFailedEvent,
+    EngineOrderSubmittedEvent,
+    EngineSignalEvent,
+    EngineSyncCommand,
+    EngineWatchlistItem,
+    TradeEngineController,
+)
 
 
 CHART_HISTORY_BAR_LIMIT = 8_000
@@ -102,6 +115,7 @@ FULL_HISTORY_REFRESH_COOLDOWN_SECONDS = 300.0
 PERFORMANCE_LOG_THRESHOLD_MS = 100.0
 AUTO_TRADE_INTERVAL_MS = 10_000
 AUTO_CLOSE_RETRY_INTERVAL_MS = 10_000
+TRADE_ENGINE_POLL_INTERVAL_MS = 100
 _SNAPSHOT_KEEP = object()
 
 
@@ -425,6 +439,27 @@ def _latest_backtest_exit_event(backtest: Optional[BacktestResult]) -> Optional[
             "bar_time": latest_time,
         }
     return None
+
+
+def _backtest_has_latest_trade_marker_change(
+    previous_backtest: Optional[BacktestResult],
+    new_backtest: Optional[BacktestResult],
+    latest_time: Optional[pd.Timestamp],
+) -> bool:
+    if previous_backtest is None or new_backtest is None or latest_time is None:
+        return False
+    previous_trades = list(previous_backtest.trades or ())
+    new_trades = list(new_backtest.trades or ())
+    if len(new_trades) <= len(previous_trades):
+        return False
+    latest_bar_time = pd.Timestamp(latest_time)
+    for trade in new_trades[len(previous_trades) :]:
+        if pd.Timestamp(trade.exit_time) == latest_bar_time:
+            return True
+        for event_time, _event_label in list(getattr(trade, "entry_events", ()) or ()):
+            if pd.Timestamp(event_time) == latest_bar_time:
+                return True
+    return False
 
 
 def _auto_close_reason(position: Optional[PositionSnapshot], exit_event: Optional[Dict[str, object]]) -> Optional[str]:
@@ -1559,6 +1594,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.live_backtest_worker: Optional[LiveBacktestWorker] = None
         self.account_worker: Optional[AccountInfoWorker] = None
         self.order_worker: Optional[OrderWorker] = None
+        self.trade_engine: Optional[TradeEngineController] = None
         self.load_request_id = 0
         self.load_request_reset_view: Dict[int, bool] = {}
         self.load_request_targets: Dict[int, Tuple[str, str]] = {}
@@ -1607,11 +1643,14 @@ class AltReversalTraderWindow(QMainWindow):
         self.order_worker_symbol: Optional[str] = None
         self.order_worker_is_auto_close = False
         self.order_worker_is_auto_trade = False
+        self.engine_order_pending = False
+        self.engine_failed = False
         self.pending_open_order_interval: Optional[str] = None
         self.auto_refresh_minutes = 10
         self.auto_refresh_timer = QTimer(self)
         self.live_update_timer = QTimer(self)
         self.optimized_table_timer = QTimer(self)
+        self.trade_engine_poll_timer = QTimer(self)
         self.backtest_progress_total_cases = 0
         self.backtest_progress_completed_cases = 0
         self.backtest_progress_phase = "idle"
@@ -1652,6 +1691,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.live_update_timer.timeout.connect(self._flush_live_update)
         self.optimized_table_timer.setSingleShot(True)
         self.optimized_table_timer.timeout.connect(self._flush_optimized_table)
+        self.trade_engine_poll_timer.setInterval(TRADE_ENGINE_POLL_INTERVAL_MS)
+        self.trade_engine_poll_timer.timeout.connect(self._poll_trade_engine_events)
         self.price_label_timer.setInterval(250)
         self.price_label_timer.timeout.connect(self._refresh_live_labels)
         self.price_label_timer.start()
@@ -1661,6 +1702,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_trade_timer.timeout.connect(self._run_auto_trade_cycle)
         self.chart_engine_combo.currentTextChanged.connect(self.on_chart_engine_changed)
         self._init_auto_refresh()
+        self._start_trade_engine()
         self.statusBar().showMessage("준비됨")
         self._refresh_auto_trade_button_state()
         QTimer.singleShot(0, self.refresh_account_info)
@@ -2638,6 +2680,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.auto_close_last_attempt_at.clear()
             self._stop_all_auto_close_monitors()
             self._refresh_auto_close_monitors()
+        self._sync_trade_engine_state()
         if persist:
             self.settings.save()
             self.public_client = BinanceFuturesClient()
@@ -2653,6 +2696,136 @@ class AltReversalTraderWindow(QMainWindow):
     def log(self, message: str) -> None:
         self.log_box.appendPlainText(message)
         self.statusBar().showMessage(message, 5000)
+
+    def _is_order_pending(self) -> bool:
+        return self.engine_order_pending or (self.order_worker is not None and self.order_worker.isRunning())
+
+    def _trade_engine_alive(self) -> bool:
+        return self.trade_engine is not None and self.trade_engine.is_alive() and not self.engine_failed
+
+    def _start_trade_engine(self) -> None:
+        self._stop_trade_engine()
+        controller = TradeEngineController()
+        controller.start()
+        self.trade_engine = controller
+        self.engine_failed = False
+        self.trade_engine_poll_timer.start()
+        self._sync_trade_engine_state()
+
+    def _stop_trade_engine(self) -> None:
+        self.trade_engine_poll_timer.stop()
+        if self.trade_engine is not None:
+            self.trade_engine.stop()
+        self.trade_engine = None
+        self.engine_failed = False
+
+    def _trade_engine_watchlist_items(self) -> Tuple[EngineWatchlistItem, ...]:
+        items: List[EngineWatchlistItem] = []
+        for result in self._ordered_optimized_results():
+            interval = result.best_interval or self.settings.kline_interval
+            items.append(
+                EngineWatchlistItem(
+                    symbol=result.symbol,
+                    interval=interval,
+                    score=float(result.score),
+                    return_pct=float(result.best_backtest.metrics.total_return_pct),
+                    strategy_settings=result.best_backtest.settings,
+                )
+            )
+        return tuple(items)
+
+    def _sync_trade_engine_state(self) -> None:
+        if not self._trade_engine_alive():
+            return
+        try:
+            self.trade_engine.send(
+                EngineSyncCommand(
+                    api_key=self.settings.api_key,
+                    api_secret=self.settings.api_secret,
+                    leverage=int(self.settings.leverage),
+                    fee_rate=float(self.settings.fee_rate),
+                    history_days=int(self.settings.history_days),
+                    default_interval=str(self.settings.kline_interval),
+                    default_strategy_settings=self.settings.strategy,
+                    optimization_rank_mode=self._optimization_rank_mode(),
+                    auto_trade_enabled=bool(self.auto_trade_enabled),
+                    auto_close_enabled_symbols=tuple(sorted(self.auto_close_enabled_symbols)),
+                    position_intervals=dict(self.settings.position_intervals),
+                    watchlist=self._trade_engine_watchlist_items(),
+                )
+            )
+        except Exception as exc:
+            self._handle_trade_engine_failure(f"Trade engine sync failed: {exc}")
+
+    def _poll_trade_engine_events(self) -> None:
+        if self.trade_engine is None:
+            return
+        if not self.trade_engine.is_alive():
+            self._handle_trade_engine_failure("Trade engine process stopped")
+            return
+        for event in self.trade_engine.drain_events():
+            self._handle_trade_engine_event(event)
+
+    def _handle_trade_engine_failure(self, message: str) -> None:
+        if self.engine_failed:
+            return
+        self.engine_failed = True
+        self.auto_trade_enabled = False
+        self.engine_order_pending = False
+        self.trade_engine_poll_timer.stop()
+        if self.trade_engine is not None:
+            self.trade_engine.stop()
+            self.trade_engine = None
+        self.log(message)
+        self._refresh_auto_trade_button_state()
+        self._set_order_buttons_enabled(True)
+
+    def _handle_trade_engine_event(self, event: object) -> None:
+        if isinstance(event, EngineLogEvent):
+            self.log(event.message)
+            return
+        if isinstance(event, EngineHealthEvent):
+            if event.status == "failed":
+                self._handle_trade_engine_failure(event.detail or "Trade engine failed")
+            elif event.detail:
+                self.log(event.detail)
+            return
+        if isinstance(event, EngineOrderSubmittedEvent):
+            self.engine_order_pending = True
+            self.order_worker_symbol = event.symbol
+            self.order_worker_is_auto_close = bool(event.auto_close)
+            self.order_worker_is_auto_trade = bool(event.auto_trade)
+            self.pending_open_order_interval = event.interval
+            if event.auto_trade:
+                self.auto_trade_entry_pending_symbol = event.symbol
+                self.auto_trade_entry_pending_fraction = float(event.fraction)
+            self._set_order_buttons_enabled(False)
+            return
+        if isinstance(event, EngineSignalEvent):
+            return
+        if isinstance(event, EngineOrderCompletedEvent):
+            self.engine_order_pending = False
+            self.order_worker_symbol = event.symbol
+            self.order_worker_is_auto_close = bool(event.auto_close)
+            self.order_worker_is_auto_trade = bool(event.auto_trade)
+            self.pending_open_order_interval = event.interval
+            if event.auto_trade:
+                self.auto_trade_entry_pending_symbol = event.symbol
+                self.auto_trade_entry_pending_fraction = float(event.fraction)
+                if event.interval in APP_INTERVAL_OPTIONS:
+                    self._request_symbol_load(event.symbol, event.interval)
+            self._on_order_completed({"symbol": event.symbol, "message": event.message})
+            return
+        if isinstance(event, EngineOrderFailedEvent):
+            self.engine_order_pending = False
+            self.order_worker_symbol = event.symbol
+            self.order_worker_is_auto_close = bool(event.auto_close)
+            self.order_worker_is_auto_trade = bool(event.auto_trade)
+            self.pending_open_order_interval = event.interval
+            if event.auto_trade:
+                self.auto_trade_entry_pending_symbol = event.symbol
+                self.auto_trade_entry_pending_fraction = float(event.fraction)
+            self._on_order_failed(event.message)
 
     def _candidate_by_symbol(self, symbol: str) -> Optional[CandidateSymbol]:
         return next((candidate for candidate in self.candidates if candidate.symbol == symbol), None)
@@ -2687,15 +2860,6 @@ class AltReversalTraderWindow(QMainWindow):
         return symbol in self._auto_close_managed_symbols()
 
     def _refresh_auto_close_retry_timer(self) -> None:
-        should_run = (
-            bool(self._auto_close_managed_symbols())
-            and bool(self.settings.api_key)
-            and bool(self.settings.api_secret)
-        )
-        if should_run:
-            if not self.auto_close_retry_timer.isActive():
-                self.auto_close_retry_timer.start()
-            return
         self.auto_close_retry_timer.stop()
 
     def _auto_close_retry_allowed(self, symbol: str, bar_time: Optional[pd.Timestamp]) -> bool:
@@ -2713,13 +2877,9 @@ class AltReversalTraderWindow(QMainWindow):
             self.auto_close_last_trigger_time[symbol] = bar_time
 
     def _run_auto_close_retry_cycle(self) -> None:
-        self._refresh_auto_close_retry_timer()
-        if not self.auto_close_retry_timer.isActive():
+        if self._trade_engine_alive():
+            self._sync_trade_engine_state()
             return
-        if self.account_worker is None or not self.account_worker.isRunning():
-            self.refresh_account_info()
-        self._refresh_auto_close_monitors()
-        self._flush_queued_auto_close_orders()
 
     def _eligible_auto_trade_results(self) -> List[OptimizationResult]:
         return list(self._ordered_optimized_results())
@@ -2764,26 +2924,25 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_trade_enabled = bool(checked)
         if self.auto_trade_enabled:
             self.log("자동매매 활성화")
-            self.auto_trade_timer.start()
             self.refresh_account_info()
-            self._refresh_auto_close_monitors()
-            QTimer.singleShot(0, self._run_auto_trade_cycle)
         else:
             self.log("자동매매 비활성화")
-            self.auto_trade_timer.stop()
             self.auto_trade_entry_pending_symbol = None
             self.auto_trade_entry_pending_fraction = 0.0
-            self._refresh_auto_close_monitors()
-        self._refresh_auto_close_retry_timer()
+        self._refresh_auto_close_monitors()
+        self._sync_trade_engine_state()
         self.update_positions_table()
         self._refresh_auto_trade_button_state()
 
     def _run_auto_trade_cycle(self) -> None:
+        if self._trade_engine_alive():
+            self._sync_trade_engine_state()
+            return
         if not self.auto_trade_enabled:
             return
         if self._is_refresh_running():
             return
-        if self.order_worker is not None and self.order_worker.isRunning():
+        if self._is_order_pending():
             return
         if self.account_worker is not None and self.account_worker.isRunning():
             return
@@ -3151,7 +3310,7 @@ class AltReversalTraderWindow(QMainWindow):
     def _refresh_auto_trade_button_state(self) -> None:
         if not hasattr(self, "auto_trade_button"):
             return
-        ready = bool(self.optimized_results) and bool(self.settings.api_key and self.settings.api_secret)
+        ready = bool(self.optimized_results) and bool(self.settings.api_key and self.settings.api_secret) and not self.engine_failed
         self.auto_trade_button.setEnabled(bool(self.auto_trade_enabled) or (ready and not self._is_refresh_running()))
         self._set_auto_trade_button_state(self.auto_trade_enabled)
 
@@ -3988,6 +4147,10 @@ class AltReversalTraderWindow(QMainWindow):
         self.update_positions_table()
 
     def _refresh_auto_close_monitors(self) -> None:
+        if self._trade_engine_alive():
+            self._stop_all_auto_close_monitors()
+            self._sync_trade_engine_state()
+            return
         open_symbols = {position.symbol for position in self.open_positions}
         for symbol in list(self.auto_close_enabled_symbols):
             if symbol not in open_symbols:
@@ -4081,6 +4244,8 @@ class AltReversalTraderWindow(QMainWindow):
             self.log(message)
 
     def _evaluate_backtest_auto_close(self, symbol: str, backtest: BacktestResult) -> None:
+        if self._trade_engine_alive():
+            return
         if not self._is_auto_close_active_for_symbol(symbol):
             return
         if backtest.indicators.empty:
@@ -4092,6 +4257,8 @@ class AltReversalTraderWindow(QMainWindow):
         symbol: str,
         exit_event: Optional[Dict[str, object]],
     ) -> None:
+        if self._trade_engine_alive():
+            return
         if not self._is_auto_close_active_for_symbol(symbol):
             return
         position = self._find_open_position(symbol)
@@ -4108,7 +4275,7 @@ class AltReversalTraderWindow(QMainWindow):
         normalized_bar_time = pd.Timestamp(bar_time) if bar_time is not None else None
         if not self._auto_close_retry_allowed(symbol, normalized_bar_time):
             return
-        if self.order_worker is not None and self.order_worker.isRunning():
+        if self._is_order_pending():
             if symbol not in self.auto_close_queued_orders:
                 self.log(f"{symbol} 자동청산 대기: 기존 주문 처리 중")
             self.auto_close_queued_orders[symbol] = (reason, normalized_bar_time)
@@ -4119,7 +4286,9 @@ class AltReversalTraderWindow(QMainWindow):
             self._record_auto_close_attempt(symbol, normalized_bar_time)
 
     def _flush_queued_auto_close_orders(self) -> None:
-        if self.order_worker is not None and self.order_worker.isRunning():
+        if self._trade_engine_alive():
+            return
+        if self._is_order_pending():
             return
         for symbol, (reason, bar_time) in list(self.auto_close_queued_orders.items()):
             if not self._is_auto_close_active_for_symbol(symbol):
@@ -4194,6 +4363,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.order_worker_symbol = None
         self.order_worker_is_auto_close = False
         self.order_worker_is_auto_trade = False
+        self.engine_order_pending = False
         self.pending_open_order_interval = None
         self.auto_trade_entry_pending_symbol = None
         if worker is not None and worker.isRunning():
@@ -4746,7 +4916,7 @@ class AltReversalTraderWindow(QMainWindow):
 
                 self.positions_table.setCellWidget(row, 6, action_widget)
                 self.position_close_buttons.append(button)
-            self._set_position_close_buttons_enabled(self.order_worker is None or not self.order_worker.isRunning())
+            self._set_position_close_buttons_enabled(not self._is_order_pending())
         finally:
             self.positions_table.blockSignals(False)
             self.suppress_positions_selection_load = previous_suppress
@@ -4810,6 +4980,7 @@ class AltReversalTraderWindow(QMainWindow):
                 item.setData(USER_ROLE, (result.symbol, result_interval))
                 self.optimized_table.setItem(row, col, item)
         self.optimized_table.setUpdatesEnabled(True)
+        self._sync_trade_engine_state()
 
     def _schedule_optimized_table_refresh(self) -> None:
         if not self.optimized_table_timer.isActive():
@@ -5530,6 +5701,9 @@ class AltReversalTraderWindow(QMainWindow):
                 next_prefix = new_frame.iloc[:-1].loc[:, tracked_columns].reset_index(drop=True)
                 if not previous_prefix.equals(next_prefix):
                     return False
+        latest_chart_time = pd.Timestamp(chart_history["time"].iloc[-1])
+        if _backtest_has_latest_trade_marker_change(previous_backtest, new_backtest, latest_chart_time):
+            return False
         try:
             if not skip_candle_update:
                 latest_bar = _chart_candle_frame(chart_history).iloc[-1].copy()
@@ -5550,7 +5724,7 @@ class AltReversalTraderWindow(QMainWindow):
             if equity_df.empty:
                 return False
             self.equity_line.update(equity_df.iloc[-1].copy())
-            new_markers = self._trade_markers(new_backtest.trades, pd.Timestamp(chart_history["time"].iloc[-1]))
+            new_markers = self._trade_markers(new_backtest.trades, latest_chart_time)
             self._render_lightweight_markers(new_markers)
             candle_df = _chart_candle_frame(new_frame)
             render_signature = self._chart_render_signature_for_payload(candle_df, new_frame, equity_df, new_markers)
@@ -5684,6 +5858,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.update_positions_table()
             self._clear_entry_price_overlay()
             self._refresh_auto_trade_button_state()
+            self._sync_trade_engine_state()
             return
         if self.account_worker is not None and self.account_worker.isRunning():
             self.pending_account_refresh = True
@@ -5742,6 +5917,7 @@ class AltReversalTraderWindow(QMainWindow):
         self._refresh_position_price_streams()
         self._refresh_auto_close_monitors()
         self.update_positions_table()
+        self._sync_trade_engine_state()
         if self.current_backtest and self.current_symbol:
             self._update_entry_price_overlay()
         self._refresh_auto_trade_button_state()
@@ -5768,6 +5944,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_trade_filled_fraction_by_symbol = {}
         self._refresh_auto_close_retry_timer()
         self._refresh_auto_trade_button_state()
+        self._sync_trade_engine_state()
         if self.pending_account_refresh:
             self.pending_account_refresh = False
             self.refresh_account_info()
@@ -5801,7 +5978,7 @@ class AltReversalTraderWindow(QMainWindow):
             else:
                 self.show_warning("API Key / Secret을 입력해야 실제 주문할 수 있습니다.")
             return
-        if self.order_worker is not None and self.order_worker.isRunning():
+        if self._is_order_pending():
             if auto_trade:
                 self.log(f"{target_symbol} 자동매매 진입 대기: 기존 주문 처리 중")
             else:
@@ -5813,21 +5990,15 @@ class AltReversalTraderWindow(QMainWindow):
             else:
                 self.show_warning("주문금액은 0보다 커야 합니다.")
             return
-        worker = OrderWorker(
-            self.settings.api_key,
-            self.settings.api_secret,
-            target_symbol,
-            self.settings.leverage,
-            side=side,
-            fraction=fraction,
-            margin=margin,
-        )
-        worker.completed.connect(self._on_order_completed)
-        worker.failed.connect(self._on_order_failed)
-        self.order_worker = worker
+        if not self._trade_engine_alive():
+            self.show_error("Trade engine is not available.")
+            return
+        optimization = self._optimization_result(target_symbol, target_interval)
+        strategy_settings = optimization.best_backtest.settings if optimization else self.settings.strategy
         self.order_worker_symbol = target_symbol
         self.order_worker_is_auto_close = False
         self.order_worker_is_auto_trade = auto_trade
+        self.engine_order_pending = True
         self.pending_open_order_interval = target_interval
         if auto_trade:
             self.auto_trade_entry_pending_symbol = target_symbol
@@ -5835,7 +6006,6 @@ class AltReversalTraderWindow(QMainWindow):
             self._request_symbol_load(target_symbol, target_interval)
         else:
             self.auto_trade_entry_pending_fraction = 0.0
-        self._track_thread(worker, "order_worker")
         self._set_order_buttons_enabled(False)
         if auto_trade:
             self.log(
@@ -5843,7 +6013,23 @@ class AltReversalTraderWindow(QMainWindow):
                 f"{int(round((fraction or 0.0) * 100)) if fraction is not None else 0}%"
             )
         self.statusBar().showMessage(f"{target_symbol} 주문 처리 중...", 3000)
-        worker.start()
+        try:
+            self.trade_engine.send(
+                EngineOpenOrderCommand(
+                    symbol=target_symbol,
+                    interval=target_interval,
+                    side=side,
+                    leverage=int(self.settings.leverage),
+                    fraction=fraction,
+                    margin=margin,
+                    auto_trade=auto_trade,
+                    strategy_settings=strategy_settings,
+                )
+            )
+        except Exception as exc:
+            self.engine_order_pending = False
+            self._set_order_buttons_enabled(True)
+            self._on_order_failed(f"Trade engine open order failed: {exc}")
 
     def close_selected_position(self) -> None:
         if not self.current_symbol:
@@ -5859,38 +6045,47 @@ class AltReversalTraderWindow(QMainWindow):
             else:
                 self.log(f"{symbol} 자동청산 실패: API Key / Secret이 없습니다.")
             return False
-        if self.order_worker is not None and self.order_worker.isRunning():
+        if self._is_order_pending():
             if auto_close_reason is None:
                 self.show_warning("이미 주문 처리 중입니다.")
             return False
-        worker = OrderWorker(
-            self.settings.api_key,
-            self.settings.api_secret,
-            symbol,
-            self.settings.leverage,
-            close_only=True,
-        )
-        worker.completed.connect(self._on_order_completed)
-        worker.failed.connect(self._on_order_failed)
-        self.order_worker = worker
+        if not self._trade_engine_alive():
+            if auto_close_reason is None:
+                self.show_error("Trade engine is not available.")
+            else:
+                self.log(f"{symbol} 자동청산 실패: trade engine unavailable")
+            return False
         self.order_worker_symbol = symbol
         self.order_worker_is_auto_close = auto_close_reason is not None
         self.order_worker_is_auto_trade = False
+        self.engine_order_pending = True
         self.pending_open_order_interval = None
-        self._track_thread(worker, "order_worker")
         self._set_order_buttons_enabled(False)
         if auto_close_reason is None:
             self.statusBar().showMessage(f"{symbol} 청산 처리 중...", 3000)
         else:
             self.log(f"{symbol} 자동청산 실행: {_auto_close_reason_text(auto_close_reason)}")
             self.statusBar().showMessage(f"{symbol} 자동청산 처리 중...", 3000)
-        worker.start()
+        try:
+            self.trade_engine.send(
+                EngineCloseOrderCommand(
+                    symbol=symbol,
+                    reason=auto_close_reason,
+                    auto_close=auto_close_reason is not None,
+                )
+            )
+        except Exception as exc:
+            self.engine_order_pending = False
+            self._set_order_buttons_enabled(True)
+            self._on_order_failed(f"Trade engine close order failed: {exc}")
+            return False
         return True
 
     def close_position_for_symbol(self, symbol: str) -> None:
         self._submit_close_position(symbol)
 
     def _on_order_completed(self, payload: object) -> None:
+        self.engine_order_pending = False
         self._set_order_buttons_enabled(True)
         result = dict(payload)
         order_symbol = self.order_worker_symbol or str(result.get("symbol", ""))
@@ -5918,6 +6113,7 @@ class AltReversalTraderWindow(QMainWindow):
             QTimer.singleShot(0, self._run_auto_trade_cycle)
 
     def _on_order_failed(self, message: str) -> None:
+        self.engine_order_pending = False
         order_symbol = self.order_worker_symbol
         was_auto_close = self.order_worker_is_auto_close
         was_auto_trade = self.order_worker_is_auto_trade
@@ -5954,6 +6150,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.optimized_table_timer.stop()
             self.auto_close_retry_timer.stop()
             self.auto_trade_timer.stop()
+            self.trade_engine_poll_timer.stop()
             self._stop_scan_worker()
             self._stop_optimize_worker()
             self._stop_load_worker()
@@ -5965,6 +6162,7 @@ class AltReversalTraderWindow(QMainWindow):
             for symbol in list(self.position_price_workers):
                 self._stop_position_price_worker(symbol)
             self._stop_all_auto_close_monitors()
+            self._stop_trade_engine()
             self._drain_tracked_threads()
             self.save_settings()
         finally:
