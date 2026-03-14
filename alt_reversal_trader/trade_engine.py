@@ -233,6 +233,43 @@ def _latest_backtest_exit_event(backtest: Optional[BacktestResult]) -> Optional[
     return None
 
 
+def _confirmed_exit_event_from_position_backtest(
+    position: Optional[PositionSnapshot],
+    backtest: Optional[BacktestResult],
+) -> Optional[Dict[str, object]]:
+    if (
+        position is None
+        or backtest is None
+        or backtest.indicators.empty
+        or "time" not in backtest.indicators.columns
+    ):
+        return None
+    amount = float(position.amount)
+    if abs(amount) < 1e-12:
+        return None
+    latest_state = dict(backtest.latest_state or {})
+    reason: Optional[str] = None
+    side = "long" if amount > 0 else "short"
+    if amount > 0:
+        if bool(latest_state.get("trend_to_short")):
+            reason = "trend_to_short"
+        elif bool(latest_state.get("final_bear")):
+            reason = "opposite_signal"
+    else:
+        if bool(latest_state.get("trend_to_long")):
+            reason = "trend_to_long"
+        elif bool(latest_state.get("final_bull")):
+            reason = "opposite_signal"
+    if reason is None:
+        return None
+    latest_time = pd.Timestamp(backtest.indicators["time"].iloc[-1])
+    return {
+        "side": side,
+        "reason": reason,
+        "bar_time": latest_time,
+    }
+
+
 def _auto_close_reason(position: Optional[PositionSnapshot], exit_event: Optional[Dict[str, object]]) -> Optional[str]:
     if position is None or not exit_event:
         return None
@@ -896,7 +933,10 @@ class _TradeEngine:
     def _evaluate_backtest_auto_close(self, state: _EngineSymbolState) -> None:
         if state.backtest is None:
             return
-        exit_event = _latest_backtest_exit_event(state.backtest)
+        position = self.open_positions.get(state.symbol)
+        exit_event = _confirmed_exit_event_from_position_backtest(position, state.backtest)
+        if exit_event is None:
+            exit_event = _latest_backtest_exit_event(state.backtest)
         if exit_event is None:
             return
         self._maybe_trigger_auto_close(state.symbol, exit_event)
@@ -940,7 +980,10 @@ class _TradeEngine:
             state = self._state_for_symbol(symbol)
             if state is None or state.backtest is None:
                 continue
-            exit_event = _latest_backtest_exit_event(state.backtest)
+            position = self.open_positions.get(symbol)
+            exit_event = _confirmed_exit_event_from_position_backtest(position, state.backtest)
+            if exit_event is None:
+                exit_event = _latest_backtest_exit_event(state.backtest)
             if exit_event is None:
                 continue
             self._maybe_trigger_auto_close(symbol, exit_event)
