@@ -548,6 +548,28 @@ def _confirmed_entry_event_from_state(
     }
 
 
+def _confirmed_entry_event_from_cursor(
+    cursor,
+    bar_time: pd.Timestamp,
+) -> Optional[Dict[str, object]]:
+    """Detect confirmed entry directly from cursor signal fields.
+
+    Unlike ``_confirmed_entry_event_from_state`` (which re-derives the signal
+    from zone-used flags that are already consumed after the backtest runs),
+    this checks whether ``last_entry_signal_time`` matches *bar_time*.
+    """
+    if cursor is None:
+        return None
+    signal_time = getattr(cursor, "last_entry_signal_time", None)
+    if signal_time is None or pd.Timestamp(signal_time) != pd.Timestamp(bar_time):
+        return None
+    side = str(getattr(cursor, "last_entry_signal_side", "") or "").lower()
+    zone = int(getattr(cursor, "last_entry_signal_zone", 0) or 0)
+    if side not in {"long", "short"} or zone not in {1, 2, 3}:
+        return None
+    return {"side": side, "zone": int(zone), "bar_time": pd.Timestamp(bar_time)}
+
+
 def _preview_entry_signal(
     cursor,
     latest_state: Dict[str, object],
@@ -1588,9 +1610,11 @@ class AltReversalTraderWindow(QMainWindow):
         self.pending_history_cache: Dict[Tuple[str, str], pd.DataFrame] = {}
         self.preserve_lists_during_refresh = False
         self.open_positions: List[PositionSnapshot] = []
+        self.position_strategy_by_symbol: Dict[str, StrategySettings] = {}
         self.current_position_snapshot: Optional[PositionSnapshot] = None
         self.current_symbol: Optional[str] = None
         self.current_interval = self.settings.kline_interval
+        self.current_chart_prefers_locked_position_settings = False
         self.current_backtest: Optional[BacktestResult] = None
         self.current_chart_indicators: Optional[pd.DataFrame] = None
         self.scan_worker: Optional[ScanWorker] = None
@@ -2815,6 +2839,8 @@ class AltReversalTraderWindow(QMainWindow):
             self.order_worker_is_auto_close = bool(event.auto_close)
             self.order_worker_is_auto_trade = bool(event.auto_trade)
             self.pending_open_order_interval = event.interval
+            if event.strategy_settings is not None:
+                self.position_strategy_by_symbol[event.symbol] = event.strategy_settings
             if event.auto_trade:
                 self.auto_trade_entry_pending_symbol = event.symbol
                 self.auto_trade_entry_pending_fraction = float(event.fraction)
@@ -3222,6 +3248,22 @@ class AltReversalTraderWindow(QMainWindow):
             return remembered
         optimization = self._optimization_result(symbol)
         return (optimization.best_interval or self.settings.kline_interval) if optimization else self.settings.kline_interval
+
+    def _locked_position_strategy_settings(
+        self,
+        symbol: str,
+        interval: Optional[str] = None,
+    ) -> Optional[StrategySettings]:
+        if self._find_open_position(symbol) is None:
+            return None
+        locked_settings = self.position_strategy_by_symbol.get(symbol)
+        if locked_settings is None:
+            return None
+        target_interval = interval if interval in APP_INTERVAL_OPTIONS else None
+        remembered_interval = self.settings.position_intervals.get(symbol)
+        if target_interval is not None and remembered_interval in APP_INTERVAL_OPTIONS and target_interval != remembered_interval:
+            return None
+        return locked_settings
 
     def _position_symbol_text(self, symbol: str) -> str:
         return f"{symbol} [{self._position_interval_for_symbol(symbol)}]"
@@ -3651,18 +3693,26 @@ class AltReversalTraderWindow(QMainWindow):
             or history.empty
         ):
             return
-        position_qty = float(self.current_backtest.cursor.position_qty)
+        # Prefer the real Binance position amount: after the backtest processes
+        # an exit on the latest bar, cursor.position_qty becomes 0 even though
+        # the real position is still open (auto-close order hasn't executed yet).
+        real_position = (
+            self.current_position_snapshot
+            if self.current_position_snapshot is not None and self.current_position_snapshot.symbol == symbol
+            else self._find_open_position(symbol)
+        )
+        if real_position is not None and abs(float(real_position.amount)) > 1e-12:
+            position_qty = float(real_position.amount)
+        else:
+            position_qty = float(self.current_backtest.cursor.position_qty)
         latest_state, _ = evaluate_latest_state(
             history,
             self.current_backtest.settings,
             cursor=self.current_backtest.cursor.indicator_cursor,
         )
         latest_time = pd.Timestamp(history["time"].iloc[-1])
-        entry_event = _confirmed_entry_event_from_state(
-            self.current_backtest.cursor,
-            latest_state,
-            self.current_backtest.settings,
-            latest_time,
+        entry_event = _confirmed_entry_event_from_cursor(
+            self.current_backtest.cursor, latest_time
         )
         exit_event = _confirmed_exit_event_from_state(position_qty, latest_state, latest_time)
         next_fast_entry_markers = self._build_fast_entry_markers(entry_event)
@@ -3951,8 +4001,48 @@ class AltReversalTraderWindow(QMainWindow):
             """
         )
 
-    def _active_backtest_settings(self, symbol: str, interval: Optional[str] = None) -> StrategySettings:
+    def _restore_lightweight_range_via_raf(self, symbol: str) -> None:
+        if symbol != self.current_symbol or self.chart is None or self.equity_subchart is None:
+            return
+        shift = float(self.pending_lightweight_range_shift)
+        self.pending_lightweight_range_shift = 0
+        equity_id = self.equity_subchart.id
+        chart_id = self.chart.id
+        self.chart.run_script(f"""
+            requestAnimationFrame(function() {{
+                requestAnimationFrame(function() {{
+                    var range = window.__alt_lwc_view_range;
+                    if (range && Number.isFinite(range.from) && Number.isFinite(range.to) && range.to > range.from) {{
+                        var fromValue = range.from + {shift};
+                        var toValue = range.to + {shift};
+                        {equity_id}.chart.timeScale().setVisibleLogicalRange({{
+                            from: fromValue, to: toValue
+                        }});
+                        {chart_id}.chart.timeScale().setVisibleLogicalRange({{
+                            from: fromValue, to: toValue
+                        }});
+                    }}
+                }});
+            }});
+        """)
+
+    def _active_backtest_settings(
+        self,
+        symbol: str,
+        interval: Optional[str] = None,
+        *,
+        prefer_locked_position_settings: bool = False,
+    ) -> StrategySettings:
         target_interval = interval if interval in APP_INTERVAL_OPTIONS else self._active_interval_for_symbol(symbol)
+        locked_settings = None
+        if prefer_locked_position_settings or (
+            self.current_chart_prefers_locked_position_settings
+            and symbol == self.current_symbol
+            and target_interval == self.current_interval
+        ):
+            locked_settings = self._locked_position_strategy_settings(symbol, target_interval)
+        if locked_settings is not None:
+            return locked_settings
         optimization = self._optimization_result(symbol, target_interval)
         return optimization.best_backtest.settings if optimization else self.settings.strategy
 
@@ -3961,7 +4051,14 @@ class AltReversalTraderWindow(QMainWindow):
         symbol: str,
         interval: str,
         optimization: Optional[OptimizationResult] = None,
+        *,
+        prefer_locked_position_settings: bool = False,
     ) -> StrategySettings:
+        locked_settings = None
+        if prefer_locked_position_settings:
+            locked_settings = self._locked_position_strategy_settings(symbol, interval)
+        if locked_settings is not None:
+            return locked_settings
         candidate = optimization or self._optimization_result(symbol, interval)
         if candidate is not None and (candidate.best_interval or self.settings.kline_interval) == interval:
             return candidate.best_backtest.settings
@@ -5311,13 +5408,27 @@ class AltReversalTraderWindow(QMainWindow):
         table.setCurrentCell(next_row, 0)
         return True
 
-    def _request_symbol_load(self, symbol: str, interval: Optional[str] = None) -> None:
+    def _request_symbol_load(
+        self,
+        symbol: str,
+        interval: Optional[str] = None,
+        *,
+        prefer_locked_position_settings: bool = False,
+    ) -> None:
         if not symbol:
             return
         target_interval = interval if interval in APP_INTERVAL_OPTIONS else self._active_interval_for_symbol(symbol)
-        if symbol == self.current_symbol and target_interval == self.current_interval:
+        if (
+            symbol == self.current_symbol
+            and target_interval == self.current_interval
+            and bool(prefer_locked_position_settings) == bool(self.current_chart_prefers_locked_position_settings)
+        ):
             return
-        self.load_symbol(symbol, target_interval)
+        self.load_symbol(
+            symbol,
+            target_interval,
+            prefer_locked_position_settings=prefer_locked_position_settings,
+        )
 
     def eventFilter(self, source: object, event: object) -> bool:
         if source in (getattr(self, "candidate_table", None), getattr(self, "optimized_table", None)):
@@ -5345,28 +5456,28 @@ class AltReversalTraderWindow(QMainWindow):
         if selected:
             symbol, interval = self._item_symbol_interval(selected[0])
             if symbol:
-                self._request_symbol_load(symbol, interval)
+                self._request_symbol_load(symbol, interval, prefer_locked_position_settings=False)
 
     def on_candidate_cell_clicked(self, row: int, _column: int) -> None:
         item = self.candidate_table.item(row, 0)
         if item:
             symbol, interval = self._item_symbol_interval(item)
             if symbol:
-                self._request_symbol_load(symbol, interval)
+                self._request_symbol_load(symbol, interval, prefer_locked_position_settings=False)
 
     def on_optimized_selection_changed(self) -> None:
         selected = self.optimized_table.selectedItems()
         if selected:
             symbol, interval = self._item_symbol_interval(selected[0])
             if symbol:
-                self._request_symbol_load(symbol, interval)
+                self._request_symbol_load(symbol, interval, prefer_locked_position_settings=False)
 
     def on_optimized_cell_clicked(self, row: int, _column: int) -> None:
         item = self.optimized_table.item(row, 0)
         if item:
             symbol, interval = self._item_symbol_interval(item)
             if symbol:
-                self._request_symbol_load(symbol, interval)
+                self._request_symbol_load(symbol, interval, prefer_locked_position_settings=False)
 
     def on_positions_selection_changed(self) -> None:
         if self.suppress_positions_selection_load or not self.positions_table.hasFocus():
@@ -5375,16 +5486,22 @@ class AltReversalTraderWindow(QMainWindow):
         if selected:
             symbol, interval = self._item_symbol_interval(selected[0])
             if symbol:
-                self._request_symbol_load(symbol, interval)
+                self._request_symbol_load(symbol, interval, prefer_locked_position_settings=True)
 
     def on_positions_cell_clicked(self, row: int, _column: int) -> None:
         item = self.positions_table.item(row, 0)
         if item:
             symbol, interval = self._item_symbol_interval(item)
             if symbol:
-                self._request_symbol_load(symbol, interval)
+                self._request_symbol_load(symbol, interval, prefer_locked_position_settings=True)
 
-    def load_symbol(self, symbol: str, target_interval: Optional[str] = None) -> None:
+    def load_symbol(
+        self,
+        symbol: str,
+        target_interval: Optional[str] = None,
+        *,
+        prefer_locked_position_settings: bool = False,
+    ) -> None:
         started_at = time.perf_counter()
         self.symbol_load_started_at = started_at
         self._sync_settings()
@@ -5400,6 +5517,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.current_position_snapshot = self._find_open_position(symbol)
         self._refresh_position_status_label()
         target_interval = target_interval if target_interval in APP_INTERVAL_OPTIONS else self._active_interval_for_symbol(symbol)
+        self.current_chart_prefers_locked_position_settings = bool(prefer_locked_position_settings)
         optimization = self._optimization_result(symbol, target_interval)
         cache_key = self._symbol_interval_key(symbol, target_interval)
         self.current_interval = target_interval
@@ -5408,7 +5526,12 @@ class AltReversalTraderWindow(QMainWindow):
         seed_backtest = self.backtest_cache.get(cache_key)
         if seed_backtest is None and optimization is not None and optimization.best_interval == target_interval:
             seed_backtest = optimization.best_backtest
-        initial_settings = self._backtest_settings_for_symbol_interval(symbol, target_interval, optimization)
+        initial_settings = self._backtest_settings_for_symbol_interval(
+            symbol,
+            target_interval,
+            optimization,
+            prefer_locked_position_settings=prefer_locked_position_settings,
+        )
         should_refresh_initial_backtest = (
             cached_history is not None
             and not cached_history.empty
@@ -5655,14 +5778,11 @@ class AltReversalTraderWindow(QMainWindow):
         range_from, range_to = self._default_lightweight_logical_range(candle_df)
         self._render_lightweight_markers(markers)
         if reset_view:
-            QTimer.singleShot(
-                140,
-                lambda s=symbol, rf=range_from, rt=range_to: self._sync_lightweight_range(s, rf, rt),
-            )
+            self._sync_lightweight_range_via_raf(symbol, range_from, range_to)
         else:
-            QTimer.singleShot(140, lambda s=symbol: self._restore_lightweight_range(s))
+            self._restore_lightweight_range_via_raf(symbol)
         if reveal_overlay:
-            self._schedule_chart_transition_reveal(symbol, delay_ms=190 if reset_view else 170)
+            self._schedule_chart_transition_reveal(symbol, delay_ms=250 if reset_view else 220)
 
     def _sync_lightweight_range(self, symbol: str, range_from: float, range_to: float) -> None:
         if symbol != self.current_symbol or self.chart is None or self.equity_subchart is None:
@@ -5680,6 +5800,32 @@ class AltReversalTraderWindow(QMainWindow):
                 }});
                 """
             )
+        except Exception:
+            self.chart.fit()
+            self.equity_subchart.fit()
+
+    def _sync_lightweight_range_via_raf(self, symbol: str, range_from: float, range_to: float) -> None:
+        if symbol != self.current_symbol or self.chart is None or self.equity_subchart is None:
+            return
+        equity_id = self.equity_subchart.id
+        chart_id = self.chart.id
+        rf = float(range_from)
+        rt = float(range_to)
+        try:
+            self.chart.run_script(f"""
+                requestAnimationFrame(function() {{
+                    requestAnimationFrame(function() {{
+                        try {{
+                            {equity_id}.chart.timeScale().setVisibleLogicalRange({{
+                                from: {rf}, to: {rt}
+                            }});
+                            {chart_id}.chart.timeScale().setVisibleLogicalRange({{
+                                from: {rf}, to: {rt}
+                            }});
+                        }} catch(e) {{}}
+                    }});
+                }});
+            """)
         except Exception:
             self.chart.fit()
             self.equity_subchart.fit()
@@ -5910,6 +6056,7 @@ class AltReversalTraderWindow(QMainWindow):
                 self.auto_trade_entry_pending_symbol = None
                 self.log("API 키가 없어 자동매매를 비활성화했습니다.")
             self.open_positions = []
+            self.position_strategy_by_symbol = {}
             self.current_position_snapshot = None
             self.account_balance_snapshot = None
             self._refresh_position_price_streams()
@@ -5948,6 +6095,11 @@ class AltReversalTraderWindow(QMainWindow):
         position = result["position"]
         self.open_positions = list(result.get("positions", []))
         open_symbols = {entry.symbol for entry in self.open_positions}
+        self.position_strategy_by_symbol = {
+            symbol: strategy_settings
+            for symbol, strategy_settings in self.position_strategy_by_symbol.items()
+            if symbol in open_symbols
+        }
         self.auto_trade_filled_fraction_by_symbol = {
             symbol: fraction
             for symbol, fraction in self.auto_trade_filled_fraction_by_symbol.items()
@@ -5992,6 +6144,7 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _on_account_info_failed(self, message: str) -> None:
         self.open_positions = []
+        self.position_strategy_by_symbol = {}
         self.current_position_snapshot = None
         self.account_balance_snapshot = None
         self._refresh_position_price_streams()

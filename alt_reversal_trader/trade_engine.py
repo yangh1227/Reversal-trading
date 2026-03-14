@@ -103,6 +103,7 @@ class EngineOrderCompletedEvent:
     auto_trade: bool = False
     interval: Optional[str] = None
     fraction: float = 0.0
+    strategy_settings: Optional[StrategySettings] = None
 
 
 @dataclass(frozen=True)
@@ -709,6 +710,7 @@ class _TradeEngine:
                         auto_trade=result.auto_trade,
                         interval=result.interval,
                         fraction=result.fraction,
+                        strategy_settings=result.strategy_settings,
                     )
                 )
             else:
@@ -786,10 +788,15 @@ class _TradeEngine:
         return keys
 
     def _settings_for_key(self, symbol: str, interval: str) -> StrategySettings:
+        locked_settings = self.position_strategy_by_symbol.get(symbol)
+        if symbol in self.open_positions and locked_settings is not None:
+            return locked_settings
         watchlist_item = self.watchlist.get((symbol, interval))
         if watchlist_item is not None:
             return watchlist_item.strategy_settings
-        return self.position_strategy_by_symbol.get(symbol, self.default_strategy_settings)
+        if locked_settings is not None:
+            return locked_settings
+        return self.default_strategy_settings
 
     def _ensure_active_states(self) -> None:
         active_keys = self._active_symbol_keys()
@@ -811,7 +818,12 @@ class _TradeEngine:
                     loading=False,
                 )
             else:
-                state.strategy_settings = settings
+                if state.strategy_settings != settings:
+                    state.strategy_settings = settings
+                    state.backtest = None
+                    state.loading = True
+                else:
+                    state.strategy_settings = settings
                 watch = self.watchlist.get(key)
                 state.score = float(watch.score) if watch is not None else state.score
                 state.return_pct = float(watch.return_pct) if watch is not None else state.return_pct
@@ -836,8 +848,10 @@ class _TradeEngine:
         try:
             if self.client is None:
                 return
-            start_time = _history_fetch_start_time_ms(self.history_days, state.interval, state.strategy_settings)
-            history = self.client.historical_ohlcv(state.symbol, state.interval, start_time=start_time)
+            history = state.history
+            if history is None or history.empty:
+                start_time = _history_fetch_start_time_ms(self.history_days, state.interval, state.strategy_settings)
+                history = self.client.historical_ohlcv(state.symbol, state.interval, start_time=start_time)
             history = prepare_ohlcv(history)
             backtest = run_backtest(
                 history,
@@ -1044,11 +1058,23 @@ class _TradeEngine:
             current_price = float(ticker.get("lastPrice", 0.0) or 0.0)
             signal_price = float(signal["price"])
             side = str(signal["side"])
-            favorable = current_price < signal_price if side == "long" else current_price > signal_price
-            if not favorable:
-                continue
+            # Skip entry when the backtest's exit condition is already active for
+            # this direction: the auto-close would fire immediately, causing a
+            # wasteful enter→close→re-enter cycle on the same bar.
+            bt_latest_state = latest_backtest.latest_state
+            if bt_latest_state:
+                if side == "long" and (
+                    bool(bt_latest_state.get("trend_to_short")) or bool(bt_latest_state.get("final_bear"))
+                ):
+                    continue
+                if side == "short" and (
+                    bool(bt_latest_state.get("trend_to_long")) or bool(bt_latest_state.get("final_bull"))
+                ):
+                    continue
             fraction = float(signal["fraction"])
             if open_position is not None:
+                # Additional entry (e.g. L2→L3): enter immediately on signal,
+                # no favorable-price gate.
                 position_side = "long" if float(open_position.amount) > 0 else "short"
                 if side != position_side:
                     continue
@@ -1058,6 +1084,11 @@ class _TradeEngine:
                 )
                 fraction = max(0.0, fraction - float(filled_fraction))
                 if fraction <= 1e-9:
+                    continue
+            else:
+                # New entry: only enter at favorable price (counter-trend).
+                favorable = current_price < signal_price if side == "long" else current_price > signal_price
+                if not favorable:
                     continue
             candidates.append(
                 {
