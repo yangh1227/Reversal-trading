@@ -80,6 +80,7 @@ from .strategy import (
     prepare_ohlcv,
     resume_backtest,
     run_backtest,
+    signal_fraction_for_zone,
 )
 
 
@@ -607,11 +608,7 @@ def _preview_entry_signal(
 
 
 def _signal_fraction_for_zone(zone: int) -> float:
-    if int(zone) == 3:
-        return 0.99
-    if int(zone) == 2:
-        return 0.50
-    return 0.33
+    return signal_fraction_for_zone(zone)
 
 
 def _auto_trade_signal_from_backtest(backtest: BacktestResult) -> Optional[Dict[str, object]]:
@@ -631,6 +628,22 @@ def _auto_trade_signal_from_backtest(backtest: BacktestResult) -> Optional[Dict[
         "time": pd.Timestamp(signal_time),
         "fraction": _signal_fraction_for_zone(zone),
     }
+
+
+def _inferred_auto_trade_fraction(backtest: BacktestResult, position: Optional[PositionSnapshot]) -> float:
+    cursor = backtest.cursor
+    if cursor is None or position is None or abs(float(position.amount)) < 1e-12:
+        return 0.0
+    side = "long" if float(position.amount) > 0 else "short"
+    zone = 0
+    signal_side = str(cursor.last_entry_signal_side or "").lower()
+    signal_zone = int(cursor.last_entry_signal_zone or 0)
+    if signal_side == side and signal_zone in {1, 2, 3}:
+        zone = signal_zone
+    fallback_zone = int(cursor.last_long_zone if side == "long" else cursor.last_short_zone)
+    if fallback_zone in {1, 2, 3}:
+        zone = max(zone, fallback_zone)
+    return _signal_fraction_for_zone(zone) if zone in {1, 2, 3} else 0.0
 
 
 def _position_return_pct(position: PositionSnapshot) -> float:
@@ -1585,6 +1598,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_close_retry_timer = QTimer(self)
         self.auto_trade_timer = QTimer(self)
         self.auto_trade_entry_pending_symbol: Optional[str] = None
+        self.auto_trade_entry_pending_fraction = 0.0
+        self.auto_trade_filled_fraction_by_symbol: Dict[str, float] = {}
         self.order_worker_symbol: Optional[str] = None
         self.order_worker_is_auto_close = False
         self.order_worker_is_auto_trade = False
@@ -2753,6 +2768,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.log("자동매매 비활성화")
             self.auto_trade_timer.stop()
             self.auto_trade_entry_pending_symbol = None
+            self.auto_trade_entry_pending_fraction = 0.0
             self._refresh_auto_close_monitors()
         self._refresh_auto_close_retry_timer()
         self.update_positions_table()
@@ -2770,8 +2786,7 @@ class AltReversalTraderWindow(QMainWindow):
         if self.auto_trade_entry_pending_symbol:
             return
         self._refresh_auto_close_monitors()
-        if self.open_positions:
-            return
+        open_positions_by_symbol = {position.symbol: position for position in self.open_positions}
         eligible_results = self._eligible_auto_trade_results()
         if not eligible_results:
             return
@@ -2782,6 +2797,9 @@ class AltReversalTraderWindow(QMainWindow):
             return
         candidates: List[Dict[str, object]] = []
         for result in eligible_results:
+            open_position = open_positions_by_symbol.get(result.symbol)
+            if open_positions_by_symbol and open_position is None:
+                continue
             latest_backtest = self._latest_auto_trade_backtest(result)
             signal = _auto_trade_signal_from_backtest(latest_backtest)
             if signal is None:
@@ -2795,6 +2813,18 @@ class AltReversalTraderWindow(QMainWindow):
             favorable = current_price < signal_price if side == "long" else current_price > signal_price
             if not favorable:
                 continue
+            fraction = float(signal["fraction"])
+            if open_position is not None:
+                position_side = "long" if float(open_position.amount) > 0 else "short"
+                if side != position_side:
+                    continue
+                filled_fraction = self.auto_trade_filled_fraction_by_symbol.get(
+                    result.symbol,
+                    _inferred_auto_trade_fraction(latest_backtest, open_position),
+                )
+                fraction = max(0.0, fraction - float(filled_fraction))
+                if fraction <= 1e-9:
+                    continue
             candidates.append(
                 {
                     "symbol": result.symbol,
@@ -2802,7 +2832,7 @@ class AltReversalTraderWindow(QMainWindow):
                     "side": "BUY" if side == "long" else "SELL",
                     "score": float(result.score),
                     "return_pct": float(latest_backtest.metrics.total_return_pct),
-                    "fraction": float(signal["fraction"]),
+                    "fraction": float(fraction),
                     "signal_price": signal_price,
                     "current_price": current_price,
                     "zone": int(signal["zone"]),
@@ -3245,15 +3275,19 @@ class AltReversalTraderWindow(QMainWindow):
     def _trade_markers(self, trades, latest_time: Optional[pd.Timestamp]) -> List[Dict[str, object]]:
         markers: List[Dict[str, object]] = []
         for trade in trades:
-            markers.append(
-                {
-                    "time": trade.entry_time,
-                    "position": "below" if trade.side == "long" else "above",
-                    "shape": "arrow_up" if trade.side == "long" else "arrow_down",
-                    "color": "#17c964" if trade.side == "long" else "#f31260",
-                    "text": trade.zones,
-                }
-            )
+            entry_events = list(getattr(trade, "entry_events", ()) or ())
+            if not entry_events:
+                entry_events = [(pd.Timestamp(trade.entry_time), str(trade.zones or ""))]
+            for event_time, event_label in entry_events:
+                markers.append(
+                    {
+                        "time": pd.Timestamp(event_time),
+                        "position": "below" if trade.side == "long" else "above",
+                        "shape": "arrow_up" if trade.side == "long" else "arrow_down",
+                        "color": "#17c964" if trade.side == "long" else "#f31260",
+                        "text": str(event_label),
+                    }
+                )
             if not _is_provisional_exit_trade(trade, latest_time):
                 markers.append(
                     {
@@ -3277,6 +3311,18 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _compose_lightweight_markers(self, confirmed_markers: Optional[List[Dict[str, object]]] = None) -> List[Dict[str, object]]:
         markers = list(self.current_lightweight_markers if confirmed_markers is None else confirmed_markers)
+        active_signal_markers = self._build_active_entry_signal_markers()
+        if active_signal_markers:
+            marker_keys = {
+                (pd.Timestamp(marker["time"]), marker.get("position"), marker.get("shape"))
+                for marker in markers
+            }
+            for marker in active_signal_markers:
+                marker_key = (pd.Timestamp(marker["time"]), marker.get("position"), marker.get("shape"))
+                if marker_key in marker_keys:
+                    continue
+                markers.append(marker)
+                marker_keys.add(marker_key)
         fast_markers = list(self.current_lightweight_fast_entry_markers) + list(self.current_lightweight_fast_exit_markers)
         if fast_markers:
             marker_keys = {
@@ -3393,6 +3439,26 @@ class AltReversalTraderWindow(QMainWindow):
         return [
             {
                 "time": pd.Timestamp(bar_time),
+                "position": "below" if side == "long" else "above",
+                "shape": "arrow_up" if side == "long" else "arrow_down",
+                "color": "#17c964" if side == "long" else "#f31260",
+                "text": f"{side[0].upper()}{zone}",
+            }
+        ]
+
+    def _build_active_entry_signal_markers(self) -> List[Dict[str, object]]:
+        backtest = self.current_backtest
+        cursor = backtest.cursor if backtest is not None else None
+        if cursor is None or abs(float(cursor.position_qty)) < 1e-12:
+            return []
+        side = str(cursor.last_entry_signal_side or cursor.entry_side or ("long" if float(cursor.position_qty) > 0 else "short")).lower()
+        zone = int(cursor.last_entry_signal_zone or (cursor.last_long_zone if side == "long" else cursor.last_short_zone) or 0)
+        signal_time = cursor.last_entry_signal_time or cursor.entry_time
+        if side not in {"long", "short"} or zone not in {1, 2, 3} or signal_time is None:
+            return []
+        return [
+            {
+                "time": pd.Timestamp(signal_time),
                 "position": "below" if side == "long" else "above",
                 "shape": "arrow_up" if side == "long" else "arrow_down",
                 "color": "#17c964" if side == "long" else "#f31260",
@@ -5640,6 +5706,11 @@ class AltReversalTraderWindow(QMainWindow):
         position = result["position"]
         self.open_positions = list(result.get("positions", []))
         open_symbols = {entry.symbol for entry in self.open_positions}
+        self.auto_trade_filled_fraction_by_symbol = {
+            symbol: fraction
+            for symbol, fraction in self.auto_trade_filled_fraction_by_symbol.items()
+            if symbol in open_symbols
+        }
         self._forget_closed_position_intervals(open_symbols, persist=False)
         self._remember_missing_open_position_intervals(open_symbols)
         if self.current_symbol and requested_symbol == self.current_symbol:
@@ -5687,6 +5758,8 @@ class AltReversalTraderWindow(QMainWindow):
         self._clear_entry_price_overlay()
         self.log(message)
         self.auto_trade_entry_pending_symbol = None
+        self.auto_trade_entry_pending_fraction = 0.0
+        self.auto_trade_filled_fraction_by_symbol = {}
         self._refresh_auto_close_retry_timer()
         self._refresh_auto_trade_button_state()
         if self.pending_account_refresh:
@@ -5752,7 +5825,10 @@ class AltReversalTraderWindow(QMainWindow):
         self.pending_open_order_interval = target_interval
         if auto_trade:
             self.auto_trade_entry_pending_symbol = target_symbol
+            self.auto_trade_entry_pending_fraction = float(fraction or 0.0)
             self._request_symbol_load(target_symbol, target_interval)
+        else:
+            self.auto_trade_entry_pending_fraction = 0.0
         self._track_thread(worker, "order_worker")
         self._set_order_buttons_enabled(False)
         if auto_trade:
@@ -5818,10 +5894,17 @@ class AltReversalTraderWindow(QMainWindow):
         if not self.order_worker_is_auto_close and order_symbol:
             self._remember_position_interval(order_symbol, self.pending_open_order_interval)
         was_auto_trade = self.order_worker_is_auto_trade
+        if was_auto_trade and order_symbol:
+            current_fraction = float(self.auto_trade_filled_fraction_by_symbol.get(order_symbol, 0.0))
+            self.auto_trade_filled_fraction_by_symbol[order_symbol] = min(
+                signal_fraction_for_zone(3),
+                current_fraction + float(self.auto_trade_entry_pending_fraction or 0.0),
+            )
         self.order_worker_symbol = None
         self.order_worker_is_auto_close = False
         self.order_worker_is_auto_trade = False
         self.pending_open_order_interval = None
+        self.auto_trade_entry_pending_fraction = 0.0
         self.log(str(result.get("message", "주문 완료")))
         self.refresh_account_info()
         QTimer.singleShot(0, self._flush_queued_auto_close_orders)
@@ -5837,6 +5920,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.auto_close_last_attempt_at[order_symbol] = time.time()
         if was_auto_trade:
             self.auto_trade_entry_pending_symbol = None
+            self.auto_trade_entry_pending_fraction = 0.0
         self.order_worker_symbol = None
         self.order_worker_is_auto_close = False
         self.order_worker_is_auto_trade = False

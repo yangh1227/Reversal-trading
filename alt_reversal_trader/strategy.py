@@ -69,6 +69,21 @@ SENSITIVITY_MULTIPLIERS = {
 
 PREPARED_OHLCV_ATTR = "_alt_prepared_ohlcv"
 POSITION_EPSILON = 1e-12
+ZONE_TARGET_FRACTIONS = {
+    1: 0.33,
+    2: 0.50,
+    3: 0.99,
+}
+
+
+def signal_fraction_for_zone(zone: int) -> float:
+    return float(ZONE_TARGET_FRACTIONS.get(int(zone), ZONE_TARGET_FRACTIONS[1]))
+
+
+def incremental_signal_fraction_for_entry(zone: int, previous_zone: int) -> float:
+    target_fraction = signal_fraction_for_zone(zone)
+    previous_fraction = signal_fraction_for_zone(previous_zone) if int(previous_zone) in ZONE_TARGET_FRACTIONS else 0.0
+    return max(0.0, target_fraction - previous_fraction)
 
 
 @dataclass(frozen=True)
@@ -83,6 +98,7 @@ class TradeRecord:
     return_pct: float
     reason: str
     zones: str
+    entry_events: Tuple[Tuple[pd.Timestamp, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -106,6 +122,7 @@ class BacktestCursor:
     entry_time: pd.Timestamp
     entry_price: float
     zone_events: Tuple[str, ...]
+    zone_event_times: Tuple[Tuple[pd.Timestamp, str], ...]
     gross_profit: float
     gross_loss: float
     trade_count: int
@@ -1104,6 +1121,21 @@ def _build_latest_state(latest: pd.Series) -> Dict[str, object]:
 if NUMBA_AVAILABLE:
 
     @njit(cache=True)
+    def _signal_fraction_for_zone_numba(zone):
+        if zone == 3:
+            return 0.99
+        if zone == 2:
+            return 0.50
+        return 0.33
+
+    @njit(cache=True)
+    def _incremental_entry_fraction_numba(zone, previous_zone):
+        target_fraction = _signal_fraction_for_zone_numba(zone)
+        previous_fraction = _signal_fraction_for_zone_numba(previous_zone) if previous_zone in (1, 2, 3) else 0.0
+        delta = target_fraction - previous_fraction
+        return delta if delta > 0.0 else 0.0
+
+    @njit(cache=True)
     def _run_backtest_metrics_numba(
         close_values,
         lev_zone_values,
@@ -1115,7 +1147,6 @@ if NUMBA_AVAILABLE:
         final_bear_values,
         fee_rate,
         starting_equity,
-        entry_size_pct,
         beast_mode,
     ):
         active_count = len(close_values)
@@ -1295,11 +1326,7 @@ if NUMBA_AVAILABLE:
 
             if can_long_z1 or can_long_z2 or can_long_z3:
                 zone = 1 if can_long_z1 else (2 if can_long_z2 else 3)
-                allocation_pct = entry_size_pct
-                if beast_mode and zone == 2:
-                    allocation_pct = 0.5
-                elif beast_mode and zone == 3:
-                    allocation_pct = 1.0 if last_long_zone == 0 else 0.5
+                allocation_pct = _incremental_entry_fraction_numba(zone, last_long_zone)
                 qty = (equity * allocation_pct) / max(current_price, 1e-9)
                 equity -= qty * current_price * fee_rate
                 if abs(position_qty) < POSITION_EPSILON:
@@ -1319,11 +1346,7 @@ if NUMBA_AVAILABLE:
 
             if can_short_z1 or can_short_z2 or can_short_z3:
                 zone = 1 if can_short_z1 else (2 if can_short_z2 else 3)
-                allocation_pct = entry_size_pct
-                if beast_mode and zone == 2:
-                    allocation_pct = 0.5
-                elif beast_mode and zone == 3:
-                    allocation_pct = 1.0 if last_short_zone == 0 else 0.5
+                allocation_pct = _incremental_entry_fraction_numba(zone, last_short_zone)
                 qty = (equity * allocation_pct) / max(current_price, 1e-9)
                 equity -= qty * current_price * fee_rate
                 if abs(position_qty) < POSITION_EPSILON:
@@ -1420,6 +1443,7 @@ def _run_backtest_core(
         entry_time = pd.Timestamp(result_indicators["time"].iloc[0])
         entry_price = 0.0
         zone_events: List[str] = []
+        zone_event_times: List[Tuple[pd.Timestamp, str]] = []
         trades: List[TradeRecord] = []
         gross_profit = 0.0
         gross_loss = 0.0
@@ -1441,6 +1465,7 @@ def _run_backtest_core(
         entry_time = pd.Timestamp(resume_cursor.entry_time)
         entry_price = float(resume_cursor.entry_price)
         zone_events = list(resume_cursor.zone_events)
+        zone_event_times = list(resume_cursor.zone_event_times)
         trades = list(existing_trades or [])
         gross_profit = float(resume_cursor.gross_profit)
         gross_loss = float(resume_cursor.gross_loss)
@@ -1471,14 +1496,10 @@ def _run_backtest_core(
     def add_position(side: str, price: float, time_value: pd.Timestamp, zone: int) -> None:
         nonlocal equity, position_qty, avg_entry_price, entry_side, entry_time, entry_price, last_long_zone, last_short_zone
         nonlocal last_entry_signal_time, last_entry_signal_price, last_entry_signal_side, last_entry_signal_zone
-        allocation_pct = settings.entry_size_pct / 100.0
-        if settings.beast_mode and zone in (2, 3):
-            if zone == 2:
-                allocation_pct = 0.5
-            elif zone == 3 and ((side == "long" and last_long_zone == 0) or (side == "short" and last_short_zone == 0)):
-                allocation_pct = 1.0
-            else:
-                allocation_pct = 0.5
+        previous_zone = last_long_zone if side == "long" else last_short_zone
+        allocation_pct = incremental_signal_fraction_for_entry(zone, previous_zone)
+        if allocation_pct <= 0.0:
+            return
 
         qty = (equity * allocation_pct) / max(price, 1e-9)
         equity -= qty * price * fee_rate
@@ -1492,12 +1513,14 @@ def _run_backtest_core(
             entry_price = price
             if include_details:
                 zone_events[:] = [f"{side[0].upper()}{zone}"]
+                zone_event_times[:] = [(pd.Timestamp(time_value), f"{side[0].upper()}{zone}")]
         else:
             total_qty = abs(position_qty) + qty
             avg_entry_price = ((avg_entry_price * abs(position_qty)) + (price * qty)) / max(total_qty, 1e-12)
             position_qty += signed_qty
             if include_details:
                 zone_events.append(f"{side[0].upper()}{zone}")
+                zone_event_times.append((pd.Timestamp(time_value), f"{side[0].upper()}{zone}"))
 
         if side == "long":
             long_zone_used[zone - 1] = True
@@ -1540,9 +1563,11 @@ def _run_backtest_core(
                     return_pct=float(return_pct),
                     reason=reason,
                     zones=",".join(zone_events),
+                    entry_events=tuple(zone_event_times),
                 )
             )
             zone_events.clear()
+            zone_event_times.clear()
         position_qty = 0.0
         avg_entry_price = 0.0
         entry_side = ""
@@ -1609,6 +1634,7 @@ def _run_backtest_core(
             entry_time=pd.Timestamp(entry_time),
             entry_price=float(entry_price),
             zone_events=tuple(zone_events),
+            zone_event_times=tuple(zone_event_times),
             gross_profit=float(gross_profit),
             gross_loss=float(gross_loss),
             trade_count=int(trade_count),
@@ -1705,7 +1731,6 @@ def _run_backtest_metrics_fast(
         active_indicators["final_bear"].to_numpy(dtype=np.bool_, copy=False),
         float(fee_rate),
         float(starting_equity),
-        float(settings.entry_size_pct) / 100.0,
         bool(settings.beast_mode),
     )
     return StrategyMetrics(

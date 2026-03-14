@@ -16,7 +16,13 @@ from alt_reversal_trader.optimizer import (
     score_optimization_metrics,
 )
 from alt_reversal_trader.strategy import StrategyMetrics
-from alt_reversal_trader.strategy import resume_backtest, run_backtest, run_backtest_metrics
+from alt_reversal_trader.strategy import (
+    incremental_signal_fraction_for_entry,
+    resume_backtest,
+    run_backtest,
+    run_backtest_metrics,
+    signal_fraction_for_zone,
+)
 
 
 def make_sample_ohlcv(rows: int = 500) -> pd.DataFrame:
@@ -86,7 +92,16 @@ def test_parameter_grid_uses_profiled_ranges() -> None:
     )
     assert trimmed is False
     assert sorted({settings.atr_period for settings in grid}) == [6, 8, 10, 12, 14]
-    assert sorted({settings.factor for settings in grid}) == [2.2, 2.6, 3.0, 3.4, 3.8]
+    assert sorted({settings.factor for settings in grid}) == [1.8, 2.4, 3.0, 3.6, 4.2]
+
+
+def test_signal_fraction_targets_use_total_position_sizes() -> None:
+    assert signal_fraction_for_zone(1) == 0.33
+    assert signal_fraction_for_zone(2) == 0.50
+    assert signal_fraction_for_zone(3) == 0.99
+    assert round(incremental_signal_fraction_for_entry(2, 0), 2) == 0.50
+    assert round(incremental_signal_fraction_for_entry(2, 1), 2) == 0.17
+    assert round(incremental_signal_fraction_for_entry(3, 2), 2) == 0.49
 
 
 def test_parameter_grid_filters_invalid_combinations() -> None:
