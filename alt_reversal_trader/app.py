@@ -459,6 +459,12 @@ def _backtest_has_latest_trade_marker_change(
         for event_time, _event_label in list(getattr(trade, "entry_events", ()) or ()):
             if pd.Timestamp(event_time) == latest_bar_time:
                 return True
+    previous_open_events = list(getattr(previous_backtest, "open_entry_events", ()) or ())
+    new_open_events = list(getattr(new_backtest, "open_entry_events", ()) or ())
+    if len(new_open_events) > len(previous_open_events):
+        for event_time, _event_label in new_open_events[len(previous_open_events) :]:
+            if pd.Timestamp(event_time) == latest_bar_time:
+                return True
     return False
 
 
@@ -1110,39 +1116,36 @@ class SymbolLoadWorker(QThread):
                 history_updated = True
                 refreshed_at = time.time()
             else:
-                latest_bar_time = pd.Timestamp(history["time"].iloc[-1]) if not history.empty else None
+                history, history_updated, repair_needed = _refresh_cached_ohlcv_recent_delta(
+                    client,
+                    self.symbol,
+                    self.interval,
+                    history,
+                )
+                recent_delta_used = True
+                latest_bar_time = pd.Timestamp(history["time"].iloc[-1]) if history is not None and not history.empty else None
                 latest_bar_stale = (
                     latest_bar_time is None
                     or (pd.Timestamp.utcnow().tz_localize(None) - latest_bar_time)
                     >= pd.Timedelta(milliseconds=_interval_to_ms(self.interval) * 2)
                 )
-                should_refresh = (
-                    latest_bar_stale
-                    or
-                    self.history_last_refresh_at is None
+                should_full_refresh = (
+                    repair_needed
+                    or latest_bar_stale
+                    or self.history_last_refresh_at is None
                     or (time.time() - float(self.history_last_refresh_at)) >= FULL_HISTORY_REFRESH_COOLDOWN_SECONDS
                 )
-                if should_refresh:
-                    history, history_updated, repair_needed = _refresh_cached_ohlcv_recent_delta(
+                if should_full_refresh:
+                    history, repair_updated = _refresh_cached_ohlcv(
                         client,
                         self.symbol,
                         self.interval,
                         history,
+                        _history_fetch_start_time_ms(self.settings, self.interval),
                     )
-                    recent_delta_used = True
-                    if repair_needed:
-                        history, repair_updated = _refresh_cached_ohlcv(
-                            client,
-                            self.symbol,
-                            self.interval,
-                            history,
-                            _history_fetch_start_time_ms(self.settings, self.interval),
-                        )
-                        history_updated = history_updated or repair_updated
-                        repair_used = True
-                    refreshed_at = time.time()
-                else:
-                    history = prepare_ohlcv(history.copy())
+                    history_updated = history_updated or repair_updated
+                    repair_used = True
+                refreshed_at = time.time()
             if history.empty:
                 raise RuntimeError(f"{self.symbol} 히스토리 데이터가 없습니다.")
             history = prepare_ohlcv(history)
@@ -3438,6 +3441,8 @@ class AltReversalTraderWindow(QMainWindow):
     def _trade_markers(self, trades, latest_time: Optional[pd.Timestamp]) -> List[Dict[str, object]]:
         markers: List[Dict[str, object]] = []
         for trade in trades:
+            if _is_provisional_exit_trade(trade, latest_time):
+                continue
             entry_events = list(getattr(trade, "entry_events", ()) or ())
             if not entry_events:
                 entry_events = [(pd.Timestamp(trade.entry_time), str(trade.zones or ""))]
@@ -3451,16 +3456,33 @@ class AltReversalTraderWindow(QMainWindow):
                         "text": str(event_label),
                     }
                 )
-            if not _is_provisional_exit_trade(trade, latest_time):
-                markers.append(
-                    {
-                        "time": trade.exit_time,
-                        "position": "above" if trade.side == "long" else "below",
-                        "shape": "circle",
-                        "color": "#f801e8",
-                        "text": f"{trade.return_pct:+.1f}%",
-                    }
-                )
+            markers.append(
+                {
+                    "time": trade.exit_time,
+                    "position": "above" if trade.side == "long" else "below",
+                    "shape": "circle",
+                    "color": "#f801e8",
+                    "text": f"{trade.return_pct:+.1f}%",
+                }
+            )
+        return markers
+
+    def _open_entry_markers(self, backtest: Optional[BacktestResult]) -> List[Dict[str, object]]:
+        if backtest is None:
+            return []
+        markers: List[Dict[str, object]] = []
+        for event_time, event_label in list(getattr(backtest, "open_entry_events", ()) or ()):
+            label_text = str(event_label)
+            is_long = label_text.upper().startswith("L")
+            markers.append(
+                {
+                    "time": pd.Timestamp(event_time),
+                    "position": "below" if is_long else "above",
+                    "shape": "arrow_up" if is_long else "arrow_down",
+                    "color": "#17c964" if is_long else "#f31260",
+                    "text": label_text,
+                }
+            )
         return markers
 
     def _marker_signature(self, marker: Dict[str, object]) -> Tuple[object, ...]:
@@ -3474,18 +3496,6 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _compose_lightweight_markers(self, confirmed_markers: Optional[List[Dict[str, object]]] = None) -> List[Dict[str, object]]:
         markers = list(self.current_lightweight_markers if confirmed_markers is None else confirmed_markers)
-        active_signal_markers = self._build_active_entry_signal_markers()
-        if active_signal_markers:
-            marker_keys = {
-                (pd.Timestamp(marker["time"]), marker.get("position"), marker.get("shape"))
-                for marker in markers
-            }
-            for marker in active_signal_markers:
-                marker_key = (pd.Timestamp(marker["time"]), marker.get("position"), marker.get("shape"))
-                if marker_key in marker_keys:
-                    continue
-                markers.append(marker)
-                marker_keys.add(marker_key)
         fast_markers = list(self.current_lightweight_fast_entry_markers) + list(self.current_lightweight_fast_exit_markers)
         if fast_markers:
             marker_keys = {
@@ -3685,7 +3695,7 @@ class AltReversalTraderWindow(QMainWindow):
             or chart_history.empty
         ):
             return False
-        strategy_settings = self._active_backtest_settings(symbol)
+        strategy_settings = self._active_backtest_settings(symbol, self.current_interval)
         previous_backtest = self.current_backtest
         previous_chart_indicators = self.current_chart_indicators
         backtest_start_time = pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms")
@@ -3789,6 +3799,7 @@ class AltReversalTraderWindow(QMainWindow):
         )
         latest_time = pd.Timestamp(candle_df["time"].iloc[-1]) if not candle_df.empty else None
         markers = self._trade_markers(snapshot.backtest.trades, latest_time)
+        markers.extend(self._open_entry_markers(snapshot.backtest))
         return candle_df, indicators, equity_df, markers
 
     def _clear_lightweight_volume_series(self) -> None:
@@ -3937,9 +3948,49 @@ class AltReversalTraderWindow(QMainWindow):
             """
         )
 
-    def _active_backtest_settings(self, symbol: str) -> StrategySettings:
-        optimization = self._optimization_result(symbol, self._active_interval_for_symbol(symbol))
+    def _active_backtest_settings(self, symbol: str, interval: Optional[str] = None) -> StrategySettings:
+        target_interval = interval if interval in APP_INTERVAL_OPTIONS else self._active_interval_for_symbol(symbol)
+        optimization = self._optimization_result(symbol, target_interval)
         return optimization.best_backtest.settings if optimization else self.settings.strategy
+
+    def _backtest_settings_for_symbol_interval(
+        self,
+        symbol: str,
+        interval: str,
+        optimization: Optional[OptimizationResult] = None,
+    ) -> StrategySettings:
+        candidate = optimization or self._optimization_result(symbol, interval)
+        if candidate is not None and (candidate.best_interval or self.settings.kline_interval) == interval:
+            return candidate.best_backtest.settings
+        return self.settings.strategy
+
+    def _materialize_cached_backtest(
+        self,
+        symbol: str,
+        interval: str,
+        history: Optional[pd.DataFrame],
+        seed_backtest: Optional[BacktestResult],
+        strategy_settings: StrategySettings,
+    ) -> Optional[BacktestResult]:
+        if history is None or history.empty:
+            return seed_backtest
+        if seed_backtest is not None and seed_backtest.settings == strategy_settings:
+            if _backtest_matches_history(seed_backtest, history):
+                return seed_backtest
+            if _history_can_resume_backtest(seed_backtest, history):
+                return resume_backtest(
+                    history,
+                    previous_result=seed_backtest,
+                    settings=strategy_settings,
+                    fee_rate=self.settings.fee_rate,
+                    backtest_start_time=pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms"),
+                )
+        return run_backtest(
+            history,
+            settings=strategy_settings,
+            fee_rate=self.settings.fee_rate,
+            backtest_start_time=pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms"),
+        )
 
     def _track_thread(self, worker: QThread, attr_name: str) -> None:
         self._tracked_threads.add(worker)
@@ -4117,7 +4168,7 @@ class AltReversalTraderWindow(QMainWindow):
             symbol,
             desired_interval,
             history,
-            self._active_backtest_settings(symbol),
+            self._active_backtest_settings(symbol, desired_interval),
             self.backtest_cache.get(cache_key),
         )
         worker.completed.connect(self._on_auto_close_signal_completed)
@@ -4515,9 +4566,10 @@ class AltReversalTraderWindow(QMainWindow):
         self._mark_history_refreshed(symbol, time.time(), self.current_interval)
         confirmed_history = self._get_history_frame(symbol, self.current_interval)
         confirmed_chart_history = self._get_chart_history_frame(symbol, self.current_interval)
-        if not self._apply_closed_bar_confirmed_backtest(symbol, confirmed_history, confirmed_chart_history):
-            self._evaluate_closed_bar_auto_close(symbol, confirmed_history)
+        applied = self._apply_closed_bar_confirmed_backtest(symbol, confirmed_history, confirmed_chart_history)
+        if not applied:
             self._schedule_live_backtest(symbol)
+        self._evaluate_closed_bar_auto_close(symbol, confirmed_history)
 
     def _apply_live_lightweight_bar(self, symbol: str, bar: Dict[str, object]) -> None:
         if symbol != self.current_symbol or self.chart_mode != "Lightweight" or self.chart is None:
@@ -4548,7 +4600,7 @@ class AltReversalTraderWindow(QMainWindow):
         chart_history = self._get_chart_history_frame(symbol, self.current_interval)
         if history is None or chart_history is None:
             return
-        active_settings = self._active_backtest_settings(symbol)
+        active_settings = self._active_backtest_settings(symbol, self.current_interval)
         if (
             self.current_backtest is not None
             and self.current_backtest.settings == active_settings
@@ -4636,6 +4688,9 @@ class AltReversalTraderWindow(QMainWindow):
             self._log_perf(f"{symbol} live backtest", self.live_backtest_started_at)
             self.live_backtest_started_at = 0.0
         self._evaluate_backtest_auto_close(symbol, self.current_backtest)
+        self._evaluate_closed_bar_auto_close(
+            symbol, self._get_history_frame(symbol, self.current_interval)
+        )
         if self.auto_trade_enabled and not self.open_positions and self.auto_trade_entry_pending_symbol is None:
             QTimer.singleShot(0, self._run_auto_trade_cycle)
         if self.live_recalc_pending:
@@ -5347,9 +5402,26 @@ class AltReversalTraderWindow(QMainWindow):
         self.current_interval = target_interval
         cached_history = self._get_history_frame(symbol, target_interval)
         cached_chart_history = self._get_chart_history_frame(symbol, target_interval)
-        cached_backtest = self.backtest_cache.get(cache_key)
-        if cached_backtest is None and optimization is not None and optimization.best_interval == target_interval:
-            cached_backtest = optimization.best_backtest
+        seed_backtest = self.backtest_cache.get(cache_key)
+        if seed_backtest is None and optimization is not None and optimization.best_interval == target_interval:
+            seed_backtest = optimization.best_backtest
+        initial_settings = self._backtest_settings_for_symbol_interval(symbol, target_interval, optimization)
+        should_refresh_initial_backtest = (
+            cached_history is not None
+            and not cached_history.empty
+            and (
+                seed_backtest is None
+                or seed_backtest.settings != initial_settings
+                or not _backtest_matches_history(seed_backtest, cached_history)
+            )
+        )
+        cached_backtest = (
+            self._materialize_cached_backtest(symbol, target_interval, cached_history, seed_backtest, initial_settings)
+            if should_refresh_initial_backtest
+            else seed_backtest
+        )
+        if cached_backtest is not None:
+            self.backtest_cache[cache_key] = cached_backtest
         if cached_chart_history is None:
             cached_chart_history = self._build_initial_chart_history(symbol, target_interval, cached_history, cached_backtest)
             if cached_chart_history is not None and not cached_chart_history.empty:
@@ -5376,22 +5448,6 @@ class AltReversalTraderWindow(QMainWindow):
         self.load_request_reset_view[self.load_request_id] = True
         self.load_request_targets[self.load_request_id] = (symbol, target_interval)
         self.chart_range_bars_before = float("inf")
-        if cached_backtest is not None:
-            self.render_chart(
-                symbol,
-                cached_backtest,
-                reset_view=True,
-                chart_indicators=cached_chart_indicators,
-                reveal_overlay=False,
-            )
-            self._defer_symbol_post_paint(
-                symbol,
-                self.load_request_id,
-                update_summary=True,
-                refresh_account=False,
-                refresh_monitors=False,
-                evaluate_auto_close=False,
-            )
         worker = SymbolLoadWorker(
             self.load_request_id,
             self.settings,
@@ -5725,6 +5781,7 @@ class AltReversalTraderWindow(QMainWindow):
                 return False
             self.equity_line.update(equity_df.iloc[-1].copy())
             new_markers = self._trade_markers(new_backtest.trades, latest_chart_time)
+            new_markers.extend(self._open_entry_markers(new_backtest))
             self._render_lightweight_markers(new_markers)
             candle_df = _chart_candle_frame(new_frame)
             render_signature = self._chart_render_signature_for_payload(candle_df, new_frame, equity_df, new_markers)

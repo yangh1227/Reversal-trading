@@ -149,11 +149,18 @@ class BacktestResult:
     settings: StrategySettings
     metrics: StrategyMetrics
     trades: List[TradeRecord]
+    open_entry_events: Tuple[Tuple[pd.Timestamp, str], ...]
     indicators: pd.DataFrame
     latest_state: Dict[str, object]
     equity_curve: pd.Series
     cursor: Optional[BacktestCursor] = None
     history_signature: Tuple[object, ...] = ()
+
+
+def _open_entry_events_from_cursor(cursor: Optional[BacktestCursor]) -> Tuple[Tuple[pd.Timestamp, str], ...]:
+    if cursor is None or abs(float(cursor.position_qty)) < POSITION_EPSILON:
+        return ()
+    return tuple((pd.Timestamp(time_value), str(label)) for time_value, label in cursor.zone_event_times)
 
 
 def compact_indicator_frame(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
@@ -1784,6 +1791,7 @@ def run_backtest(
         settings=settings,
         metrics=metrics,
         trades=trades,
+        open_entry_events=_open_entry_events_from_cursor(cursor),
         indicators=result_indicators,
         latest_state=latest_state,
         equity_curve=curve,
@@ -1882,6 +1890,7 @@ def resume_backtest(
         settings=settings,
         metrics=metrics,
         trades=trades,
+        open_entry_events=_open_entry_events_from_cursor(cursor),
         indicators=result_indicators,
         latest_state=latest_state,
         equity_curve=curve,
