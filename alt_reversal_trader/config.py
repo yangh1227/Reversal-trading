@@ -218,8 +218,8 @@ class ParameterSpec:
 
 PARAMETER_SPECS: List[ParameterSpec] = [
     ParameterSpec("atr_period", "ATR Length", "core", "int", 2, 100, 1, optimize_default=True, optimize_span=4, optimize_step=1, optimize_priority=3),
-    ParameterSpec("factor", "Factor", "core", "float", 0.5, 20.0, 0.1, optimize_default=True, optimize_span=0.8, optimize_step=0.1, optimize_priority=1),
-    ParameterSpec("zone_sensitivity", "Zone Sensitivity", "core", "float", 0.1, 10.0, 0.1, optimize_default=True, optimize_span=0.4, optimize_step=0.1, optimize_priority=1),
+    ParameterSpec("factor", "Factor", "core", "float", 0.5, 20.0, 0.1, optimize_default=True, optimize_span=1.2, optimize_step=0.1, optimize_priority=1),
+    ParameterSpec("zone_sensitivity", "Zone Sensitivity", "core", "float", 0.1, 10.0, 0.1, optimize_default=True, optimize_span=0.8, optimize_step=0.1, optimize_priority=1),
     ParameterSpec("entry_size_pct", "Entry Size %", "core", "float", 1.0, 100.0, 1.0, optimize_span=6.0, optimize_step=2.0, optimize_priority=8),
     ParameterSpec("sensitivity_mode", "QIP Sensitivity Mode", "qip", "choice", choices=QIP_SENSITIVITY_OPTIONS, optimize_choice_radius=2, optimize_priority=7),
     ParameterSpec("zz_len_raw", "QIP Pivot Length", "qip", "int", 2, 50, 1, optimize_default=True, optimize_span=2, optimize_step=1, optimize_priority=2),
