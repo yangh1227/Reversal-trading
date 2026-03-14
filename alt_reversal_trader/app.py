@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 import traceback
 
 import pandas as pd
+from lightweight_charts.widgets import QtChart
 import websocket
 
 from .binance_futures import (
@@ -21,7 +22,6 @@ from .binance_futures import (
     resample_ohlcv,
     resolve_base_interval,
 )
-from .chart_widgets import QtChart
 from .config import APP_INTERVAL_OPTIONS, CHART_ENGINE_OPTIONS, PARAMETER_SPECS, AppSettings, StrategySettings
 from .crash_logger import log_runtime_event
 from .live_chart_utils import (
@@ -1668,6 +1668,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_close_retry_timer = QTimer(self)
         self.auto_trade_timer = QTimer(self)
         self.auto_trade_entry_pending_symbol: Optional[str] = None
+        self.auto_trade_entry_pending_at: float = 0.0
         self.auto_trade_entry_pending_fraction = 0.0
         self.auto_trade_filled_fraction_by_symbol: Dict[str, float] = {}
         self.order_worker_symbol: Optional[str] = None
@@ -2828,6 +2829,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.pending_open_order_interval = event.interval
             if event.auto_trade:
                 self.auto_trade_entry_pending_symbol = event.symbol
+                self.auto_trade_entry_pending_at = time.time()
                 self.auto_trade_entry_pending_fraction = float(event.fraction)
             self._set_order_buttons_enabled(False)
             return
@@ -2843,6 +2845,7 @@ class AltReversalTraderWindow(QMainWindow):
                 self.position_strategy_by_symbol[event.symbol] = event.strategy_settings
             if event.auto_trade:
                 self.auto_trade_entry_pending_symbol = event.symbol
+                self.auto_trade_entry_pending_at = time.time()
                 self.auto_trade_entry_pending_fraction = float(event.fraction)
                 if event.interval in APP_INTERVAL_OPTIONS:
                     self._request_symbol_load(
@@ -2860,6 +2863,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.pending_open_order_interval = event.interval
             if event.auto_trade:
                 self.auto_trade_entry_pending_symbol = event.symbol
+                self.auto_trade_entry_pending_at = time.time()
                 self.auto_trade_entry_pending_fraction = float(event.fraction)
             self._on_order_failed(event.message)
 
@@ -2983,7 +2987,11 @@ class AltReversalTraderWindow(QMainWindow):
         if self.account_worker is not None and self.account_worker.isRunning():
             return
         if self.auto_trade_entry_pending_symbol:
-            return
+            if time.time() - self.auto_trade_entry_pending_at > 60.0:
+                self.log(f"Auto-trade pending timeout: {self.auto_trade_entry_pending_symbol}")
+                self.auto_trade_entry_pending_symbol = None
+            else:
+                return
         self._refresh_auto_close_monitors()
         open_positions_by_symbol = {position.symbol: position for position in self.open_positions}
         eligible_results = self._eligible_auto_trade_results()
@@ -6224,6 +6232,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.pending_open_order_interval = target_interval
         if auto_trade:
             self.auto_trade_entry_pending_symbol = target_symbol
+            self.auto_trade_entry_pending_at = time.time()
             self.auto_trade_entry_pending_fraction = float(fraction or 0.0)
             self._request_symbol_load(target_symbol, target_interval)
         else:

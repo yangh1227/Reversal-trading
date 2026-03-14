@@ -33,6 +33,7 @@ POSITION_REFRESH_INTERVAL_SECONDS = 5.0
 COMMAND_POLL_TIMEOUT_SECONDS = 0.25
 STREAM_RECONNECT_DELAY_SECONDS = 2.0
 BACKTEST_WARMUP_BAR_FLOOR = 1_500
+PENDING_ORDER_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -515,18 +516,21 @@ class _OrderExecutor(threading.Thread):
                     )
                 self.result_queue.put(payload)
             except Exception:
-                self.result_queue.put(
-                    _OrderExecutionResult(
-                        symbol=request.symbol,
-                        success=False,
-                        message=traceback.format_exc(),
-                        auto_close=request.auto_close,
-                        auto_trade=request.auto_trade,
-                        interval=request.interval,
-                        fraction=float(request.fraction or 0.0),
-                        strategy_settings=request.strategy_settings,
-                    )
+                payload = _OrderExecutionResult(
+                    symbol=request.symbol,
+                    success=False,
+                    message=traceback.format_exc(),
+                    auto_close=request.auto_close,
+                    auto_trade=request.auto_trade,
+                    interval=request.interval,
+                    fraction=float(request.fraction or 0.0),
+                    strategy_settings=request.strategy_settings,
                 )
+                try:
+                    self.result_queue.put(payload)
+                except Exception:
+                    # Queue itself failed — log only. Pending timeout (#1) handles unlock.
+                    traceback.print_exc()
 
 
 class TradeEngineController:
@@ -611,7 +615,7 @@ class _TradeEngine:
         self.open_positions: Dict[str, PositionSnapshot] = {}
         self.filled_fraction_by_symbol: Dict[str, float] = {}
         self.position_strategy_by_symbol: Dict[str, StrategySettings] = {}
-        self.pending_order_symbols: set[str] = set()
+        self.pending_order_symbols: Dict[str, float] = {}
         self.auto_close_last_trigger_time: Dict[str, pd.Timestamp] = {}
         self.auto_close_last_attempt_at: Dict[str, float] = {}
         self.last_auto_trade_check_at = 0.0
@@ -642,6 +646,7 @@ class _TradeEngine:
                 self._evaluate_auto_trade()
                 self._retry_auto_close_orders()
             self._load_one_pending_state()
+            self._expire_stale_pending_orders()
             time.sleep(COMMAND_POLL_TIMEOUT_SECONDS)
         self._stop_all_streams()
         self.order_request_queue.put((99, self.order_sequence, None))
@@ -688,7 +693,10 @@ class _TradeEngine:
                 break
             if not isinstance(result, _OrderExecutionResult):
                 continue
-            self.pending_order_symbols.discard(result.symbol)
+            self.pending_order_symbols.pop(result.symbol, None)
+            if result.auto_close and result.success:
+                self.auto_close_last_trigger_time.pop(result.symbol, None)
+                self.auto_close_last_attempt_at.pop(result.symbol, None)
             if result.success:
                 if result.interval in APP_INTERVAL_OPTIONS:
                     self.position_intervals[result.symbol] = str(result.interval)
@@ -724,6 +732,13 @@ class _TradeEngine:
                         fraction=result.fraction,
                     )
                 )
+
+    def _expire_stale_pending_orders(self) -> None:
+        now = time.time()
+        for symbol in list(self.pending_order_symbols):
+            if now - self.pending_order_symbols[symbol] > PENDING_ORDER_TIMEOUT_SECONDS:
+                self.pending_order_symbols.pop(symbol, None)
+                self.log(f"{symbol} pending order timed out after {PENDING_ORDER_TIMEOUT_SECONDS}s")
 
     def _apply_sync(self, command: EngineSyncCommand) -> None:
         creds_changed = (command.api_key != self.api_key) or (command.api_secret != self.api_secret)
@@ -765,6 +780,10 @@ class _TradeEngine:
         if not force and time.time() - self.last_position_refresh_at < POSITION_REFRESH_INTERVAL_SECONDS:
             return
         positions = self.client.get_open_positions()
+        # Guard against empty API response when we expect positions (transient API failure)
+        if not positions and self.open_positions:
+            self.last_position_refresh_at = time.time()
+            return
         self.open_positions = {position.symbol: position for position in positions}
         open_symbols = set(self.open_positions)
         self.filled_fraction_by_symbol = {
@@ -1095,7 +1114,7 @@ class _TradeEngine:
                 is_fresh_signal = (
                     signal_time is not None
                     and latest_bar_time is not None
-                    and pd.Timestamp(signal_time) == latest_bar_time
+                    and pd.Timestamp(signal_time).tz_localize(None) == pd.Timestamp(latest_bar_time).tz_localize(None)
                 )
                 if not is_fresh_signal:
                     favorable = current_price < signal_price if side == "long" else current_price > signal_price
@@ -1162,7 +1181,7 @@ class _TradeEngine:
                 )
             )
             return
-        self.pending_order_symbols.add(symbol)
+        self.pending_order_symbols[symbol] = time.time()
         self.emit(
             EngineOrderSubmittedEvent(
                 symbol=symbol,
@@ -1214,7 +1233,7 @@ class _TradeEngine:
                 )
             )
             return
-        self.pending_order_symbols.add(symbol)
+        self.pending_order_symbols[symbol] = time.time()
         self.emit(
             EngineOrderSubmittedEvent(
                 symbol=symbol,
