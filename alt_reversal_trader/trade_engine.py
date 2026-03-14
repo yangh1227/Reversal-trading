@@ -1073,8 +1073,6 @@ class _TradeEngine:
                     continue
             fraction = float(signal["fraction"])
             if open_position is not None:
-                # Additional entry (e.g. L2→L3): enter immediately on signal,
-                # no favorable-price gate.
                 position_side = "long" if float(open_position.amount) > 0 else "short"
                 if side != position_side:
                     continue
@@ -1085,6 +1083,24 @@ class _TradeEngine:
                 fraction = max(0.0, fraction - float(filled_fraction))
                 if fraction <= 1e-9:
                     continue
+                # Additional entry (e.g. L2→L3): enter immediately when the
+                # signal first appears (same bar).  On subsequent bars, fall
+                # back to the favorable-price gate to avoid chasing.
+                signal_time = signal.get("time")
+                latest_bar_time = (
+                    pd.Timestamp(latest_backtest.indicators["time"].iloc[-1])
+                    if not latest_backtest.indicators.empty
+                    else None
+                )
+                is_fresh_signal = (
+                    signal_time is not None
+                    and latest_bar_time is not None
+                    and pd.Timestamp(signal_time) == latest_bar_time
+                )
+                if not is_fresh_signal:
+                    favorable = current_price < signal_price if side == "long" else current_price > signal_price
+                    if not favorable:
+                        continue
             else:
                 # New entry: only enter at favorable price (counter-trend).
                 favorable = current_price < signal_price if side == "long" else current_price > signal_price
