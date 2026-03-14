@@ -3,6 +3,7 @@ from __future__ import annotations
 import faulthandler
 import os
 from datetime import datetime
+from importlib import import_module
 from pathlib import Path
 import platform
 import subprocess
@@ -117,16 +118,15 @@ def install_qt_message_logging() -> None:
     global _QT_MESSAGE_HANDLER_INSTALLED
     if _QT_MESSAGE_HANDLER_INSTALLED:
         return
-    try:
-        from PyQt5.QtCore import qInstallMessageHandler
-    except Exception:
+    q_install_message_handler = None
+    for module_name in ("PyQt5.QtCore", "PySide6.QtCore", "PyQt6.QtCore"):
         try:
-            from PySide6.QtCore import qInstallMessageHandler
+            q_install_message_handler = getattr(import_module(module_name), "qInstallMessageHandler")
+            break
         except Exception:
-            try:
-                from PyQt6.QtCore import qInstallMessageHandler
-            except Exception:
-                return
+            continue
+    if q_install_message_handler is None:
+        return
 
     def handler(mode, context, message):
         mode_code = int(mode) if not isinstance(mode, int) else mode
@@ -145,5 +145,5 @@ def install_qt_message_logging() -> None:
         else:
             log_runtime_event("Qt Message", body, open_notepad=False)
 
-    qInstallMessageHandler(handler)
+    q_install_message_handler(handler)
     _QT_MESSAGE_HANDLER_INSTALLED = True

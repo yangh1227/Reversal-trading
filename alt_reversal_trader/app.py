@@ -30,7 +30,7 @@ from .live_chart_utils import (
     preview_bar_matches_context as _preview_bar_matches_context,
     seed_two_minute_aggregate as _seed_two_minute_aggregate,
 )
-from .optimizer import OptimizationResult, optimization_sort_key, optimize_symbol_interval_results
+from .optimizer import OptimizationResult, optimization_sort_key, optimize_symbol_interval_results, parameter_value_range
 from .qt_compat import (
     EVENT_KEY_PRESS,
     HORIZONTAL,
@@ -1544,6 +1544,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.order_worker: Optional[OrderWorker] = None
         self.load_request_id = 0
         self.load_request_reset_view: Dict[int, bool] = {}
+        self.load_request_targets: Dict[int, Tuple[str, str]] = {}
         self.account_request_id = 0
         self.live_recalc_pending = False
         self.pending_account_refresh = False
@@ -1567,6 +1568,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.current_lightweight_preview_markers: List[Dict[str, object]] = []
         self.current_lightweight_fast_entry_markers: List[Dict[str, object]] = []
         self.current_lightweight_fast_exit_markers: List[Dict[str, object]] = []
+        self.suppress_positions_selection_load = False
         self._tracked_threads: set[QThread] = set()
         self.auto_close_enabled_symbols: set[str] = set()
         self.auto_close_monitor_histories: Dict[str, pd.DataFrame] = {}
@@ -1596,6 +1598,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.backtest_progress_phase = "idle"
         self.parameter_editors: Dict[str, object] = {}
         self.parameter_opt_boxes: Dict[str, QCheckBox] = {}
+        self.parameter_opt_hint_labels: Dict[str, QLabel] = {}
         self.chart_mode = "Lightweight"
         self.chart_transition_overlay: Optional[QWidget] = None
         self.chart_transition_effect: Optional[QGraphicsOpacityEffect] = None
@@ -1842,6 +1845,66 @@ class AltReversalTraderWindow(QMainWindow):
         if hasattr(self, "optimized_table"):
             self.update_optimized_table()
 
+    def _parameter_editor_current_value(self, spec) -> object:
+        editor = self.parameter_editors[spec.key]
+        if spec.kind == "bool":
+            return bool(editor.isChecked())
+        if spec.kind == "choice":
+            return editor.currentText()
+        if spec.kind == "int":
+            return int(editor.value())
+        return float(editor.value())
+
+    def _format_parameter_hint_value(self, spec, value: object) -> str:
+        if spec.kind == "bool":
+            return "ON" if bool(value) else "OFF"
+        if spec.kind == "int":
+            return str(int(value))
+        if spec.kind == "float":
+            step_value = spec.optimize_step if spec.optimize_step is not None else spec.step
+            if step_value is None:
+                return f"{float(value):.2f}"
+            step_text = str(step_value)
+            decimals = len(step_text.rstrip("0").split(".")[-1]) if "." in step_text else 0
+            return f"{float(value):.{decimals}f}"
+        return str(value)
+
+    def _parameter_opt_hint_text(self, spec) -> str:
+        span_pct = float(self.opt_span_spin.value()) if hasattr(self, "opt_span_spin") else self.settings.optimization_span_pct
+        steps = int(self.opt_steps_spin.value()) if hasattr(self, "opt_steps_spin") else self.settings.optimization_steps
+        values = parameter_value_range(spec, self._parameter_editor_current_value(spec), span_pct, steps, True)
+        if not values:
+            return "-"
+        if spec.kind == "bool":
+            return "OFF / ON"
+        if spec.kind == "choice":
+            if len(values) == 1:
+                return self._format_parameter_hint_value(spec, values[0])
+            return f"{self._format_parameter_hint_value(spec, values[0])} ~ {self._format_parameter_hint_value(spec, values[-1])}"
+        if len(values) == 1:
+            return self._format_parameter_hint_value(spec, values[0])
+        step_value = spec.optimize_step if spec.optimize_step is not None else spec.step
+        if step_value is None:
+            return f"{self._format_parameter_hint_value(spec, values[0])} ~ {self._format_parameter_hint_value(spec, values[-1])}"
+        step_text = self._format_parameter_hint_value(spec, step_value)
+        return (
+            f"{self._format_parameter_hint_value(spec, values[0])} ~ "
+            f"{self._format_parameter_hint_value(spec, values[-1])} / {step_text}"
+        )
+
+    def _refresh_parameter_opt_hint(self, spec) -> None:
+        label = self.parameter_opt_hint_labels.get(spec.key)
+        if label is None:
+            return
+        enabled = bool(self.parameter_opt_boxes.get(spec.key).isChecked()) if spec.key in self.parameter_opt_boxes else False
+        color = "#6b7280" if enabled else "#8a8f98"
+        label.setStyleSheet(f"color: {color}; font-size: 10px;")
+        label.setText(self._parameter_opt_hint_text(spec))
+
+    def _refresh_parameter_optimization_hints(self) -> None:
+        for spec in PARAMETER_SPECS:
+            self._refresh_parameter_opt_hint(spec)
+
     def _build_api_group(self) -> QGroupBox:
         group = QGroupBox("Binance API")
         layout = QFormLayout(group)
@@ -1937,6 +2000,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.opt_rank_mode_combo.currentIndexChanged.connect(lambda _index: self._refresh_optimization_rank_controls())
         self.opt_min_score_spin.valueChanged.connect(lambda _value: self.update_optimized_table())
         self.opt_min_return_spin.valueChanged.connect(lambda _value: self.update_optimized_table())
+        self.opt_span_spin.valueChanged.connect(lambda _value: self._refresh_parameter_optimization_hints())
+        self.opt_steps_spin.valueChanged.connect(lambda _value: self._refresh_parameter_optimization_hints())
         def _set_row_label(editor, label: str) -> None:
             field_label = layout.labelForField(editor)
             if field_label is not None:
@@ -1985,14 +2050,27 @@ class AltReversalTraderWindow(QMainWindow):
             editor = self._make_parameter_editor(spec)
             optimize_box = QCheckBox("Opt")
             optimize_box.setChecked(bool(self.settings.optimize_flags.get(spec.key, False)))
+            hint_label = QLabel()
+            hint_label.setWordWrap(True)
+            hint_label.setStyleSheet("color: #6b7280; font-size: 10px;")
             row_widget = QWidget()
             row_layout = QHBoxLayout(row_widget)
             row_layout.setContentsMargins(0, 0, 0, 0)
             row_layout.addWidget(editor)
             row_layout.addWidget(optimize_box)
+            row_layout.addWidget(hint_label, 1)
             forms[spec.group].addRow(spec.label, row_widget)
             self.parameter_editors[spec.key] = editor
             self.parameter_opt_boxes[spec.key] = optimize_box
+            self.parameter_opt_hint_labels[spec.key] = hint_label
+            if spec.kind == "bool":
+                editor.toggled.connect(lambda _checked, current_spec=spec: self._refresh_parameter_opt_hint(current_spec))
+            elif spec.kind == "choice":
+                editor.currentTextChanged.connect(lambda _text, current_spec=spec: self._refresh_parameter_opt_hint(current_spec))
+            else:
+                editor.valueChanged.connect(lambda _value, current_spec=spec: self._refresh_parameter_opt_hint(current_spec))
+            optimize_box.toggled.connect(lambda _checked, current_spec=spec: self._refresh_parameter_opt_hint(current_spec))
+            self._refresh_parameter_opt_hint(spec)
         return group
 
     def _make_parameter_editor(self, spec):
@@ -2462,6 +2540,7 @@ class AltReversalTraderWindow(QMainWindow):
         self._refresh_order_mode_ui()
         self._refresh_filter_controls()
         self._refresh_optimization_rank_controls()
+        self._refresh_parameter_optimization_hints()
 
     def collect_settings(self) -> AppSettings:
         strategy_payload: Dict[str, object] = {}
@@ -3363,6 +3442,89 @@ class AltReversalTraderWindow(QMainWindow):
         if exit_event is not None:
             self._maybe_trigger_auto_close(symbol, exit_event)
 
+    def _apply_closed_bar_confirmed_backtest(
+        self,
+        symbol: str,
+        history: Optional[pd.DataFrame],
+        chart_history: Optional[pd.DataFrame],
+    ) -> bool:
+        if (
+            symbol != self.current_symbol
+            or history is None
+            or history.empty
+            or chart_history is None
+            or chart_history.empty
+        ):
+            return False
+        strategy_settings = self._active_backtest_settings(symbol)
+        previous_backtest = self.current_backtest
+        previous_chart_indicators = self.current_chart_indicators
+        backtest_start_time = pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms")
+        try:
+            if (
+                previous_backtest is not None
+                and previous_backtest.settings == strategy_settings
+                and _backtest_matches_history(previous_backtest, history)
+            ):
+                backtest = previous_backtest
+            elif (
+                previous_backtest is not None
+                and previous_backtest.settings == strategy_settings
+                and _history_can_resume_backtest(previous_backtest, history)
+            ):
+                backtest = resume_backtest(
+                    history,
+                    previous_result=previous_backtest,
+                    settings=strategy_settings,
+                    fee_rate=self.settings.fee_rate,
+                    backtest_start_time=backtest_start_time,
+                )
+            else:
+                backtest = run_backtest(
+                    history,
+                    settings=strategy_settings,
+                    fee_rate=self.settings.fee_rate,
+                    backtest_start_time=backtest_start_time,
+                )
+            chart_indicators = _chart_indicators_from_backtest(backtest, chart_history)
+        except Exception:
+            return False
+        self.live_recalc_pending = False
+        self.current_backtest = backtest
+        self.current_chart_indicators = chart_indicators
+        self._sync_current_chart_snapshot(
+            symbol,
+            self.current_interval,
+            backtest=self.current_backtest,
+            chart_indicators=self.current_chart_indicators,
+        )
+        cache_key = self._symbol_interval_key(symbol, self.current_interval)
+        self.backtest_cache[cache_key] = self.current_backtest
+        self.chart_indicator_cache[cache_key] = self.current_chart_indicators
+        self.current_lightweight_preview_markers = []
+        self.current_lightweight_fast_entry_markers = []
+        self.current_lightweight_fast_exit_markers = []
+        applied_incrementally = self._apply_incremental_lightweight_backtest(
+            symbol,
+            previous_backtest,
+            previous_chart_indicators,
+            self.current_backtest,
+            self.current_chart_indicators,
+            chart_history,
+        )
+        if not applied_incrementally:
+            self.render_chart(
+                symbol,
+                self.current_backtest,
+                reset_view=False,
+                chart_indicators=self.current_chart_indicators,
+            )
+        self.update_summary(symbol, self.current_backtest, self._optimization_result(symbol, self.current_interval))
+        self._evaluate_backtest_auto_close(symbol, self.current_backtest)
+        if self.auto_trade_enabled and not self.open_positions and self.auto_trade_entry_pending_symbol is None:
+            QTimer.singleShot(0, self._run_auto_trade_cycle)
+        return True
+
     def _refresh_live_preview_markers(self, symbol: Optional[str]) -> None:
         if self.chart_mode != "Lightweight":
             return
@@ -3513,6 +3675,15 @@ class AltReversalTraderWindow(QMainWindow):
             window.__alt_lwc_view_range = {self.chart.id}.chart.timeScale().getVisibleLogicalRange();
             """
         )
+
+    def _clear_stashed_lightweight_range(self) -> None:
+        self.pending_lightweight_range_shift = 0
+        if self.chart is None:
+            return
+        try:
+            self.chart.run_script("window.__alt_lwc_view_range = null;")
+        except Exception:
+            pass
 
     def _restore_lightweight_range(self, symbol: str) -> None:
         if symbol != self.current_symbol or self.chart is None or self.equity_subchart is None:
@@ -4102,8 +4273,11 @@ class AltReversalTraderWindow(QMainWindow):
             self.current_interval,
         )
         self._mark_history_refreshed(symbol, time.time(), self.current_interval)
-        self._evaluate_closed_bar_auto_close(symbol, self._get_history_frame(symbol, self.current_interval))
-        self._schedule_live_backtest(symbol)
+        confirmed_history = self._get_history_frame(symbol, self.current_interval)
+        confirmed_chart_history = self._get_chart_history_frame(symbol, self.current_interval)
+        if not self._apply_closed_bar_confirmed_backtest(symbol, confirmed_history, confirmed_chart_history):
+            self._evaluate_closed_bar_auto_close(symbol, confirmed_history)
+            self._schedule_live_backtest(symbol)
 
     def _apply_live_lightweight_bar(self, symbol: str, bar: Dict[str, object]) -> None:
         if symbol != self.current_symbol or self.chart_mode != "Lightweight" or self.chart is None:
@@ -4134,12 +4308,19 @@ class AltReversalTraderWindow(QMainWindow):
         chart_history = self._get_chart_history_frame(symbol, self.current_interval)
         if history is None or chart_history is None:
             return
+        active_settings = self._active_backtest_settings(symbol)
+        if (
+            self.current_backtest is not None
+            and self.current_backtest.settings == active_settings
+            and _backtest_matches_history(self.current_backtest, history)
+        ):
+            return
         worker = LiveBacktestWorker(
             self.settings,
             symbol,
             history,
             chart_history,
-            self._active_backtest_settings(symbol),
+            active_settings,
             self.current_backtest,
         )
         worker.completed.connect(self._on_live_backtest_completed)
@@ -4153,6 +4334,12 @@ class AltReversalTraderWindow(QMainWindow):
         result = dict(payload)
         symbol = str(result["symbol"])
         if symbol != self.current_symbol:
+            return
+        current_history = self._get_history_frame(symbol, self.current_interval)
+        if _history_frame_signature(result.get("history")) != _history_frame_signature(current_history):
+            if self.live_recalc_pending:
+                self.live_recalc_pending = False
+                self._schedule_live_backtest(symbol)
             return
         perf = dict(result.get("perf") or {})
         self._log_perf_ms(f"{symbol} live worker backtest", float(perf.get("worker_backtest_ms", 0.0) or 0.0))
@@ -4394,20 +4581,6 @@ class AltReversalTraderWindow(QMainWindow):
             item.setData(USER_ROLE, position.symbol)
             self.positions_table.setItem(row, col, item)
 
-    def _refresh_position_status_label(self) -> None:
-        if self.current_symbol:
-            position = self.current_position_snapshot
-            if position is None:
-                self.position_label.setText("포지션: 없음")
-            else:
-                side = "LONG" if position.amount > 0 else "SHORT"
-                self.position_label.setText(
-                    f"포지션: {side} {abs(position.amount):.6f} @ {position.entry_price:.6f} | "
-                    f"UPnL {position.unrealized_pnl:.2f} | 수익률 {_position_return_pct(position):+.2f}%"
-                )
-        else:
-            self.position_label.setText("포지션: 종목 미선택")
-
     def _apply_live_position_price(self, symbol: str, mark_price: float) -> None:
         if mark_price <= 0:
             return
@@ -4461,43 +4634,50 @@ class AltReversalTraderWindow(QMainWindow):
     def update_positions_table(self) -> None:
         if not hasattr(self, "positions_table"):
             return
-        self.position_metric_widgets.clear()
-        self.position_action_widgets.clear()
-        self.position_close_buttons.clear()
-        self.positions_table.clearContents()
-        self.positions_table.setRowCount(len(self.open_positions))
-        for row, position in enumerate(self.open_positions):
-            self._populate_position_row(row, position)
-            button = QPushButton("청산")
-            button.clicked.connect(lambda _=False, symbol=position.symbol: self.close_position_for_symbol(symbol))
-            button.setText("청산")
-            button.setFixedWidth(54)
-            button.setMinimumHeight(24)
-            self._style_close_button(button)
+        previous_suppress = self.suppress_positions_selection_load
+        self.suppress_positions_selection_load = True
+        self.positions_table.blockSignals(True)
+        try:
+            self.position_metric_widgets.clear()
+            self.position_action_widgets.clear()
+            self.position_close_buttons.clear()
+            self.positions_table.clearContents()
+            self.positions_table.setRowCount(len(self.open_positions))
+            for row, position in enumerate(self.open_positions):
+                self._populate_position_row(row, position)
+                button = QPushButton("청산")
+                button.clicked.connect(lambda _=False, symbol=position.symbol: self.close_position_for_symbol(symbol))
+                button.setText("청산")
+                button.setFixedWidth(54)
+                button.setMinimumHeight(24)
+                self._style_close_button(button)
 
-            auto_button = QPushButton()
-            auto_button.setFixedWidth(124)
-            auto_button.setMinimumHeight(24)
-            self._set_auto_close_button_state(
-                auto_button,
-                position.symbol in self.auto_close_enabled_symbols or self.auto_trade_enabled,
-            )
-            auto_button.setEnabled(not self.auto_trade_enabled)
-            auto_button.toggled.connect(
-                lambda checked, symbol=position.symbol: self._toggle_auto_close_for_symbol(symbol, checked)
-            )
+                auto_button = QPushButton()
+                auto_button.setFixedWidth(124)
+                auto_button.setMinimumHeight(24)
+                self._set_auto_close_button_state(
+                    auto_button,
+                    position.symbol in self.auto_close_enabled_symbols or self.auto_trade_enabled,
+                )
+                auto_button.setEnabled(not self.auto_trade_enabled)
+                auto_button.toggled.connect(
+                    lambda checked, symbol=position.symbol: self._toggle_auto_close_for_symbol(symbol, checked)
+                )
 
-            action_widget = QWidget()
-            action_layout = QHBoxLayout(action_widget)
-            action_layout.setContentsMargins(4, 2, 4, 2)
-            action_layout.setSpacing(4)
-            action_layout.addWidget(button)
-            action_layout.addWidget(auto_button)
-            action_layout.addStretch(1)
+                action_widget = QWidget()
+                action_layout = QHBoxLayout(action_widget)
+                action_layout.setContentsMargins(4, 2, 4, 2)
+                action_layout.setSpacing(4)
+                action_layout.addWidget(button)
+                action_layout.addWidget(auto_button)
+                action_layout.addStretch(1)
 
-            self.positions_table.setCellWidget(row, 6, action_widget)
-            self.position_close_buttons.append(button)
-        self._set_position_close_buttons_enabled(self.order_worker is None or not self.order_worker.isRunning())
+                self.positions_table.setCellWidget(row, 6, action_widget)
+                self.position_close_buttons.append(button)
+            self._set_position_close_buttons_enabled(self.order_worker is None or not self.order_worker.isRunning())
+        finally:
+            self.positions_table.blockSignals(False)
+            self.suppress_positions_selection_load = previous_suppress
 
     def update_candidate_table(self) -> None:
         self.candidate_table.setUpdatesEnabled(False)
@@ -4888,6 +5068,8 @@ class AltReversalTraderWindow(QMainWindow):
                 self._request_symbol_load(symbol, interval)
 
     def on_positions_selection_changed(self) -> None:
+        if self.suppress_positions_selection_load or not self.positions_table.hasFocus():
+            return
         selected = self.positions_table.selectedItems()
         if selected:
             symbol, interval = self._item_symbol_interval(selected[0])
@@ -4906,6 +5088,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.symbol_load_started_at = started_at
         self._sync_settings()
         self._show_chart_transition_overlay()
+        self._clear_stashed_lightweight_range()
         self._stop_live_stream()
         self._stop_live_backtest_worker()
         self._stop_load_worker()
@@ -4947,7 +5130,8 @@ class AltReversalTraderWindow(QMainWindow):
         )
         worker_backtest = cached_backtest
         self.load_request_id += 1
-        self.load_request_reset_view[self.load_request_id] = cached_backtest is None
+        self.load_request_reset_view[self.load_request_id] = True
+        self.load_request_targets[self.load_request_id] = (symbol, target_interval)
         self.chart_range_bars_before = float("inf")
         if cached_backtest is not None:
             self.render_chart(
@@ -4987,15 +5171,23 @@ class AltReversalTraderWindow(QMainWindow):
         result = dict(payload)
         request_id = int(result["request_id"])
         symbol = str(result["symbol"])
-        if request_id != self.load_request_id or symbol != self.current_symbol:
+        expected_target = self.load_request_targets.get(request_id)
+        result_interval = str(result.get("interval", self.current_interval))
+        if (
+            request_id != self.load_request_id
+            or symbol != self.current_symbol
+            or expected_target != (symbol, result_interval)
+        ):
             self.load_request_reset_view.pop(request_id, None)
+            self.load_request_targets.pop(request_id, None)
             return
         perf = dict(result.get("perf") or {})
         self._log_perf_ms(f"{symbol} worker fetch", float(perf.get("worker_fetch_ms", 0.0) or 0.0))
         self._log_perf_ms(f"{symbol} worker chart", float(perf.get("worker_chart_ms", 0.0) or 0.0))
         self._log_perf_ms(f"{symbol} worker backtest", float(perf.get("worker_backtest_ms", 0.0) or 0.0))
         reset_view = self.load_request_reset_view.pop(request_id, True)
-        self.current_interval = str(result.get("interval", self.current_interval))
+        self.load_request_targets.pop(request_id, None)
+        self.current_interval = result_interval
         self._set_history_frame(symbol, result["history"], self.current_interval)
         refreshed_at = result.get("history_refreshed_at")
         if refreshed_at is not None:
@@ -5053,6 +5245,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.current_lightweight_markers = list(markers)
             self.current_lightweight_rendered_markers = list(markers)
             self.current_lightweight_preview_markers = []
+            self.current_lightweight_fast_entry_markers = []
             self.current_lightweight_fast_exit_markers = []
             self._update_entry_price_overlay()
             self._refresh_live_labels()
@@ -5074,6 +5267,7 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _on_symbol_load_failed(self, message: str) -> None:
         self.load_request_reset_view.pop(self.load_request_id, None)
+        self.load_request_targets.pop(self.load_request_id, None)
         self.symbol_load_started_at = 0.0
         self._hide_chart_transition_overlay()
         self.show_error(message)
@@ -5096,6 +5290,7 @@ class AltReversalTraderWindow(QMainWindow):
             return
         candle_df, indicators, equity_df, markers = self._build_chart_render_payload(snapshot)
         self.current_lightweight_preview_markers = []
+        self.current_lightweight_fast_entry_markers = []
         self.current_lightweight_fast_exit_markers = []
         self._render_lightweight_chart(
             symbol,
@@ -5332,288 +5527,6 @@ class AltReversalTraderWindow(QMainWindow):
             self._evaluate_backtest_auto_close(symbol, self.current_backtest)
         if refresh_account:
             self.refresh_account_info()
-
-    def _empty_chart_html(self) -> str:
-        return """
-        <html>
-          <head>
-            <style>
-              html, body {
-                margin: 0;
-                height: 100%;
-                background: #0f1419;
-                color: #dfe6eb;
-                font-family: Consolas, monospace;
-              }
-              .wrap {
-                height: 100%;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                opacity: 0.7;
-                font-size: 15px;
-              }
-            </style>
-          </head>
-          <body>
-            <div class="wrap">차트 대기 중</div>
-          </body>
-        </html>
-        """
-
-    def _plotly_chart_html(
-        self,
-        symbol: str,
-        candle_df: pd.DataFrame,
-        indicators: pd.DataFrame,
-        equity_df: pd.DataFrame,
-        trades,
-        range_start: Optional[pd.Timestamp],
-        range_end: Optional[pd.Timestamp],
-        reset_view: bool = True,
-    ) -> str:
-        fig = make_subplots(
-            rows=2,
-            cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.04,
-            row_heights=[0.74, 0.26],
-            specs=[[{"secondary_y": True}], [{}]],
-        )
-
-        fig.add_trace(
-            go.Candlestick(
-                x=candle_df["time"],
-                open=candle_df["open"],
-                high=candle_df["high"],
-                low=candle_df["low"],
-                close=candle_df["close"],
-                name=symbol,
-                increasing_line_color="#17c964",
-                increasing_fillcolor="#17c964",
-                decreasing_line_color="#f31260",
-                decreasing_fillcolor="#f31260",
-            ),
-            row=1,
-            col=1,
-            secondary_y=False,
-        )
-        if "volume" in candle_df.columns:
-            volume_colors = [
-                "rgba(23, 201, 100, 0.35)" if close_ >= open_ else "rgba(243, 18, 96, 0.35)"
-                for open_, close_ in zip(candle_df["open"], candle_df["close"])
-            ]
-            fig.add_trace(
-                go.Bar(
-                    x=candle_df["time"],
-                    y=candle_df["volume"],
-                    name="Volume",
-                    marker_color=volume_colors,
-                    opacity=0.35,
-                ),
-                row=1,
-                col=1,
-                secondary_y=True,
-            )
-        for column, name, color, width in (
-            ("supertrend", "Supertrend", "#00D8FF", 2),
-            ("zone2_line", "Zone 2", "#ff9100", 1),
-            ("zone3_line", "Zone 3", "#ff1744", 1),
-            ("ema_fast", "EMA Fast", "#00e5ff", 1),
-            ("ema_slow", "EMA Slow", "#ffd600", 1),
-        ):
-            fig.add_trace(
-                go.Scatter(
-                    x=indicators["time"],
-                    y=indicators[column],
-                    mode="lines",
-                    name=name,
-                    line={"color": color, "width": width},
-                ),
-                row=1,
-                col=1,
-                secondary_y=False,
-            )
-
-        latest_time = pd.Timestamp(candle_df["time"].iloc[-1]) if not candle_df.empty else None
-        plotted_trades = [trade for trade in trades if not _is_provisional_exit_trade(trade, latest_time)]
-        long_entries = [trade for trade in trades if trade.side == "long"]
-        short_entries = [trade for trade in trades if trade.side == "short"]
-        if long_entries:
-            fig.add_trace(
-                go.Scatter(
-                    x=[trade.entry_time for trade in long_entries],
-                    y=[trade.entry_price for trade in long_entries],
-                    mode="markers+text",
-                    name="Long Entry",
-                    text=[trade.zones for trade in long_entries],
-                    textposition="bottom center",
-                    marker={"symbol": "triangle-up", "size": 11, "color": "#17c964"},
-                ),
-                row=1,
-                col=1,
-                secondary_y=False,
-            )
-        if short_entries:
-            fig.add_trace(
-                go.Scatter(
-                    x=[trade.entry_time for trade in short_entries],
-                    y=[trade.entry_price for trade in short_entries],
-                    mode="markers+text",
-                    name="Short Entry",
-                    text=[trade.zones for trade in short_entries],
-                    textposition="top center",
-                    marker={"symbol": "triangle-down", "size": 11, "color": "#f31260"},
-                ),
-                row=1,
-                col=1,
-                secondary_y=False,
-            )
-        if plotted_trades:
-            fig.add_trace(
-                go.Scatter(
-                    x=[trade.exit_time for trade in plotted_trades],
-                    y=[trade.exit_price for trade in plotted_trades],
-                    mode="markers+text",
-                    name="Exit",
-                    text=[f"{trade.return_pct:+.1f}%" for trade in plotted_trades],
-                    textposition="middle right",
-                    marker={"symbol": "x", "size": 9, "color": "#f801e8"},
-                ),
-                row=1,
-                col=1,
-                secondary_y=False,
-            )
-
-        position = self.current_position_snapshot
-        if position is not None and position.symbol == self.current_symbol:
-            fig.add_hline(
-                y=position.entry_price,
-                line_color="#22f202",
-                line_width=1,
-                annotation_text="ENTRY",
-                annotation_position="top right",
-                row=1,
-                col=1,
-            )
-
-        fig.add_trace(
-            go.Scatter(
-                x=equity_df["time"],
-                y=equity_df["Equity"],
-                mode="lines",
-                name="Equity",
-                line={"color": "#6cf5a0", "width": 2},
-            ),
-            row=2,
-            col=1,
-        )
-
-        fig.update_layout(
-            paper_bgcolor="#0f1419",
-            plot_bgcolor="#0f1419",
-            font={"family": "Consolas, monospace", "color": "#dfe6eb", "size": 12},
-            height=max(self.chart_host.height(), 760),
-            autosize=True,
-            margin={"l": 48, "r": 36, "t": 36, "b": 36},
-            legend={
-                "orientation": "h",
-                "yanchor": "bottom",
-                "y": 1.01,
-                "xanchor": "left",
-                "x": 0.0,
-                "bgcolor": "rgba(0,0,0,0)",
-            },
-            xaxis_rangeslider_visible=False,
-            hovermode="x unified",
-        )
-        xaxis_options = {
-            "showgrid": True,
-            "gridcolor": "rgba(120, 130, 150, 0.14)",
-            "zeroline": False,
-        }
-        if range_start is not None and range_end is not None:
-            xaxis_options["range"] = [range_start, range_end]
-        fig.update_xaxes(**xaxis_options)
-        fig.update_yaxes(
-            showgrid=True,
-            gridcolor="rgba(120, 130, 150, 0.14)",
-            zeroline=False,
-            row=1,
-            col=1,
-            secondary_y=False,
-        )
-        fig.update_yaxes(
-            showgrid=False,
-            zeroline=False,
-            showticklabels=False,
-            row=1,
-            col=1,
-            secondary_y=True,
-        )
-        fig.update_yaxes(
-            showgrid=True,
-            gridcolor="rgba(120, 130, 150, 0.14)",
-            zeroline=False,
-            row=2,
-            col=1,
-        )
-
-        config = {
-            "displaylogo": False,
-            "responsive": True,
-            "scrollZoom": True,
-            "modeBarButtonsToRemove": ["lasso2d", "select2d", "autoScale2d"],
-        }
-        view_key = json.dumps(f"plotly_view::{symbol}::{self.current_interval or self.settings.kline_interval}")
-        default_from = json.dumps(range_start.isoformat() if range_start is not None else None)
-        default_to = json.dumps(range_end.isoformat() if range_end is not None else None)
-        reset_literal = "true" if reset_view else "false"
-        post_script = f"""
-        const gd = document.getElementById('{{plot_id}}');
-        const storageKey = {view_key};
-        const defaultFrom = {default_from};
-        const defaultTo = {default_to};
-        const shouldReset = {reset_literal};
-        const applyRange = (fromValue, toValue) => {{
-            if (!fromValue || !toValue) return;
-            Plotly.relayout(gd, {{
-                'xaxis.range': [fromValue, toValue],
-                'xaxis2.range': [fromValue, toValue]
-            }});
-        }};
-        const saveRange = (fromValue, toValue) => {{
-            if (!fromValue || !toValue) return;
-            localStorage.setItem(storageKey, JSON.stringify({{from: fromValue, to: toValue}}));
-        }};
-        gd.on('plotly_relayout', (eventData) => {{
-            const fromValue = eventData['xaxis.range[0]'] ?? eventData['xaxis2.range[0]'] ?? null;
-            const toValue = eventData['xaxis.range[1]'] ?? eventData['xaxis2.range[1]'] ?? null;
-            if (fromValue && toValue) {{
-                saveRange(fromValue, toValue);
-            }}
-        }});
-        if (shouldReset) {{
-            applyRange(defaultFrom, defaultTo);
-            saveRange(defaultFrom, defaultTo);
-        }} else {{
-            try {{
-                const saved = JSON.parse(localStorage.getItem(storageKey) || 'null');
-                if (saved && saved.from && saved.to) {{
-                    applyRange(saved.from, saved.to);
-                }}
-            }} catch (error) {{}}
-        }}
-        """
-        return pio.to_html(
-            fig,
-            full_html=True,
-            include_plotlyjs="directory",
-            config=config,
-            default_width="100%",
-            default_height=f"{max(self.chart_host.height(), 760)}px",
-            post_script=post_script,
-        )
 
     def update_summary(self, symbol: str, backtest: BacktestResult, optimization: Optional[OptimizationResult]) -> None:
         metrics = backtest.metrics

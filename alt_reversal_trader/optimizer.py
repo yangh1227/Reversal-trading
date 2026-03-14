@@ -221,7 +221,7 @@ def _numeric_range(spec: ParameterSpec, base_value, span_pct: float, steps: int)
     return _thin_values(values, min(max(steps, 1), len(values)), base_index)
 
 
-def _value_range(spec: ParameterSpec, base_value, span_pct: float, steps: int, enabled: bool) -> List:
+def parameter_value_range(spec: ParameterSpec, base_value, span_pct: float, steps: int, enabled: bool) -> List:
     if not enabled:
         return [base_value]
 
@@ -232,6 +232,10 @@ def _value_range(spec: ParameterSpec, base_value, span_pct: float, steps: int, e
         return _choice_range(spec, base_value, span_pct, steps)
 
     return _numeric_range(spec, base_value, span_pct, steps)
+
+
+def _value_range(spec: ParameterSpec, base_value, span_pct: float, steps: int, enabled: bool) -> List:
+    return parameter_value_range(spec, base_value, span_pct, steps, enabled)
 
 
 def _settings_are_valid(settings: StrategySettings) -> bool:

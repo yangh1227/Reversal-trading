@@ -1,38 +1,66 @@
 from __future__ import annotations
 
+from importlib import import_module
+
+
+def _load_pyqt5_bindings():
+    qtcore = import_module("PyQt5.QtCore")
+    qtgui = import_module("PyQt5.QtGui")
+    qtwebengine = import_module("PyQt5.QtWebEngineWidgets")
+    qtwidgets = import_module("PyQt5.QtWidgets")
+    return qtcore, qtgui, qtwebengine, qtwidgets
+
+
+def _load_pyqt6_bindings():
+    qtcore = import_module("PyQt6.QtCore")
+    qtgui = import_module("PyQt6.QtGui")
+    qtwebenginecore = import_module("PyQt6.QtWebEngineCore")
+    qtwebenginewidgets = import_module("PyQt6.QtWebEngineWidgets")
+    qtwidgets = import_module("PyQt6.QtWidgets")
+    return qtcore, qtgui, qtwebenginecore, qtwebenginewidgets, qtwidgets
+
+
 try:
-    from PyQt5.QtCore import QEvent, QPropertyAnimation, Qt, QThread, QTimer, QUrl, pyqtSignal as Signal
-    from PyQt5.QtGui import QBrush, QColor
-    from PyQt5.QtWebEngineWidgets import QWebEngineSettings, QWebEngineView
-    from PyQt5.QtWidgets import (
-        QAbstractItemView,
-        QApplication,
-        QCheckBox,
-        QComboBox as _QComboBox,
-        QDoubleSpinBox as _QDoubleSpinBox,
-        QFormLayout,
-        QGridLayout,
-        QGraphicsOpacityEffect,
-        QGroupBox,
-        QHBoxLayout,
-        QHeaderView,
-        QLabel,
-        QLineEdit,
-        QMainWindow,
-        QMessageBox,
-        QPlainTextEdit,
-        QProgressBar,
-        QPushButton,
-        QRadioButton,
-        QScrollArea,
-        QSpinBox as _QSpinBox,
-        QSplitter,
-        QTableWidget,
-        QTableWidgetItem,
-        QTabWidget,
-        QVBoxLayout,
-        QWidget,
-    )
+    _qtcore, _qtgui, _qtwebenginewidgets, _qtwidgets = _load_pyqt5_bindings()
+
+    QEvent = _qtcore.QEvent
+    QPropertyAnimation = _qtcore.QPropertyAnimation
+    Qt = _qtcore.Qt
+    QThread = _qtcore.QThread
+    QTimer = _qtcore.QTimer
+    QUrl = _qtcore.QUrl
+    Signal = _qtcore.pyqtSignal
+    QBrush = _qtgui.QBrush
+    QColor = _qtgui.QColor
+    QWebEngineSettings = _qtwebenginewidgets.QWebEngineSettings
+    QWebEngineView = _qtwebenginewidgets.QWebEngineView
+    QAbstractItemView = _qtwidgets.QAbstractItemView
+    QApplication = _qtwidgets.QApplication
+    QCheckBox = _qtwidgets.QCheckBox
+    _QComboBox = _qtwidgets.QComboBox
+    _QDoubleSpinBox = _qtwidgets.QDoubleSpinBox
+    QFormLayout = _qtwidgets.QFormLayout
+    QGridLayout = _qtwidgets.QGridLayout
+    QGraphicsOpacityEffect = _qtwidgets.QGraphicsOpacityEffect
+    QGroupBox = _qtwidgets.QGroupBox
+    QHBoxLayout = _qtwidgets.QHBoxLayout
+    QHeaderView = _qtwidgets.QHeaderView
+    QLabel = _qtwidgets.QLabel
+    QLineEdit = _qtwidgets.QLineEdit
+    QMainWindow = _qtwidgets.QMainWindow
+    QMessageBox = _qtwidgets.QMessageBox
+    QPlainTextEdit = _qtwidgets.QPlainTextEdit
+    QProgressBar = _qtwidgets.QProgressBar
+    QPushButton = _qtwidgets.QPushButton
+    QRadioButton = _qtwidgets.QRadioButton
+    QScrollArea = _qtwidgets.QScrollArea
+    _QSpinBox = _qtwidgets.QSpinBox
+    QSplitter = _qtwidgets.QSplitter
+    QTableWidget = _qtwidgets.QTableWidget
+    QTableWidgetItem = _qtwidgets.QTableWidgetItem
+    QTabWidget = _qtwidgets.QTabWidget
+    QVBoxLayout = _qtwidgets.QVBoxLayout
+    QWidget = _qtwidgets.QWidget
 
     QT_API = "PyQt5"
 
@@ -53,39 +81,46 @@ try:
     KEY_DOWN = Qt.Key_Down
 
 except ImportError:
-    from PyQt6.QtCore import QEvent, QPropertyAnimation, Qt, QThread, QTimer, QUrl, pyqtSignal as Signal
-    from PyQt6.QtGui import QBrush, QColor
-    from PyQt6.QtWebEngineCore import QWebEngineSettings
-    from PyQt6.QtWebEngineWidgets import QWebEngineView
-    from PyQt6.QtWidgets import (
-        QAbstractItemView,
-        QApplication,
-        QCheckBox,
-        QComboBox as _QComboBox,
-        QDoubleSpinBox as _QDoubleSpinBox,
-        QFormLayout,
-        QGridLayout,
-        QGraphicsOpacityEffect,
-        QGroupBox,
-        QHBoxLayout,
-        QHeaderView,
-        QLabel,
-        QLineEdit,
-        QMainWindow,
-        QMessageBox,
-        QPlainTextEdit,
-        QProgressBar,
-        QPushButton,
-        QRadioButton,
-        QScrollArea,
-        QSpinBox as _QSpinBox,
-        QSplitter,
-        QTableWidget,
-        QTableWidgetItem,
-        QTabWidget,
-        QVBoxLayout,
-        QWidget,
-    )
+    _qtcore, _qtgui, _qtwebenginecore, _qtwebenginewidgets, _qtwidgets = _load_pyqt6_bindings()
+
+    QEvent = _qtcore.QEvent
+    QPropertyAnimation = _qtcore.QPropertyAnimation
+    Qt = _qtcore.Qt
+    QThread = _qtcore.QThread
+    QTimer = _qtcore.QTimer
+    QUrl = _qtcore.QUrl
+    Signal = _qtcore.pyqtSignal
+    QBrush = _qtgui.QBrush
+    QColor = _qtgui.QColor
+    QWebEngineSettings = _qtwebenginecore.QWebEngineSettings
+    QWebEngineView = _qtwebenginewidgets.QWebEngineView
+    QAbstractItemView = _qtwidgets.QAbstractItemView
+    QApplication = _qtwidgets.QApplication
+    QCheckBox = _qtwidgets.QCheckBox
+    _QComboBox = _qtwidgets.QComboBox
+    _QDoubleSpinBox = _qtwidgets.QDoubleSpinBox
+    QFormLayout = _qtwidgets.QFormLayout
+    QGridLayout = _qtwidgets.QGridLayout
+    QGraphicsOpacityEffect = _qtwidgets.QGraphicsOpacityEffect
+    QGroupBox = _qtwidgets.QGroupBox
+    QHBoxLayout = _qtwidgets.QHBoxLayout
+    QHeaderView = _qtwidgets.QHeaderView
+    QLabel = _qtwidgets.QLabel
+    QLineEdit = _qtwidgets.QLineEdit
+    QMainWindow = _qtwidgets.QMainWindow
+    QMessageBox = _qtwidgets.QMessageBox
+    QPlainTextEdit = _qtwidgets.QPlainTextEdit
+    QProgressBar = _qtwidgets.QProgressBar
+    QPushButton = _qtwidgets.QPushButton
+    QRadioButton = _qtwidgets.QRadioButton
+    QScrollArea = _qtwidgets.QScrollArea
+    _QSpinBox = _qtwidgets.QSpinBox
+    QSplitter = _qtwidgets.QSplitter
+    QTableWidget = _qtwidgets.QTableWidget
+    QTableWidgetItem = _qtwidgets.QTableWidgetItem
+    QTabWidget = _qtwidgets.QTabWidget
+    QVBoxLayout = _qtwidgets.QVBoxLayout
+    QWidget = _qtwidgets.QWidget
 
     QT_API = "PyQt6"
 

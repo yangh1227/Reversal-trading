@@ -1,5 +1,6 @@
 import asyncio
 import html
+from importlib import import_module
 
 from .util import parse_event_message
 from lightweight_charts import abstract
@@ -9,25 +10,81 @@ try:
 except ImportError:
     wx = None
 
-try:
-    using_pyside6 = False
-    from PyQt5.QtWebEngineWidgets import QWebEngineView
-    from PyQt5.QtWebChannel import QWebChannel
-    from PyQt5.QtCore import QObject, pyqtSlot as Slot, QUrl, QTimer
-except ImportError:
-    using_pyside6 = True
+def _load_qt_web_bindings():
     try:
-        from PySide6.QtWebEngineWidgets import QWebEngineView
-        from PySide6.QtWebChannel import QWebChannel
-        from PySide6.QtCore import Qt, QObject, Slot, QUrl, QTimer
+        qtwebenginewidgets = import_module("PyQt5.QtWebEngineWidgets")
+        qtwebchannel = import_module("PyQt5.QtWebChannel")
+        qtcore = import_module("PyQt5.QtCore")
+        return {
+            "using_pyside6": False,
+            "Qt": None,
+            "QWebEngineView": qtwebenginewidgets.QWebEngineView,
+            "QWebChannel": qtwebchannel.QWebChannel,
+            "QObject": qtcore.QObject,
+            "Slot": qtcore.pyqtSlot,
+            "QUrl": qtcore.QUrl,
+            "QTimer": qtcore.QTimer,
+        }
     except ImportError:
-        try:
-            using_pyside6 = False
-            from PyQt6.QtWebEngineWidgets import QWebEngineView
-            from PyQt6.QtWebChannel import QWebChannel
-            from PyQt6.QtCore import QObject, pyqtSlot as Slot, QUrl, QTimer
-        except ImportError:
-            QWebEngineView = None
+        pass
+    try:
+        qtwebenginewidgets = import_module("PySide6.QtWebEngineWidgets")
+        qtwebchannel = import_module("PySide6.QtWebChannel")
+        qtcore = import_module("PySide6.QtCore")
+        return {
+            "using_pyside6": True,
+            "Qt": qtcore.Qt,
+            "QWebEngineView": qtwebenginewidgets.QWebEngineView,
+            "QWebChannel": qtwebchannel.QWebChannel,
+            "QObject": qtcore.QObject,
+            "Slot": qtcore.Slot,
+            "QUrl": qtcore.QUrl,
+            "QTimer": qtcore.QTimer,
+        }
+    except ImportError:
+        pass
+    try:
+        qtwebenginewidgets = import_module("PyQt6.QtWebEngineWidgets")
+        qtwebchannel = import_module("PyQt6.QtWebChannel")
+        qtcore = import_module("PyQt6.QtCore")
+        return {
+            "using_pyside6": False,
+            "Qt": None,
+            "QWebEngineView": qtwebenginewidgets.QWebEngineView,
+            "QWebChannel": qtwebchannel.QWebChannel,
+            "QObject": qtcore.QObject,
+            "Slot": qtcore.pyqtSlot,
+            "QUrl": qtcore.QUrl,
+            "QTimer": qtcore.QTimer,
+        }
+    except ImportError:
+        return None
+
+
+_qt_bindings = _load_qt_web_bindings()
+if _qt_bindings is None:
+    using_pyside6 = False
+    Qt = None
+    QWebEngineView = None
+    QWebChannel = None
+    QObject = object
+
+    def Slot(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
+    QUrl = None
+    QTimer = None
+else:
+    using_pyside6 = bool(_qt_bindings["using_pyside6"])
+    Qt = _qt_bindings["Qt"]
+    QWebEngineView = _qt_bindings["QWebEngineView"]
+    QWebChannel = _qt_bindings["QWebChannel"]
+    QObject = _qt_bindings["QObject"]
+    Slot = _qt_bindings["Slot"]
+    QUrl = _qt_bindings["QUrl"]
+    QTimer = _qt_bindings["QTimer"]
 
 
 if QWebEngineView:

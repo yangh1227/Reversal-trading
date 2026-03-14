@@ -1,4 +1,12 @@
 from .abstract import AbstractChart, Window
-from .chart import Chart
 from .widgets import JupyterChart
-from .polygon import PolygonChart
+
+try:
+    from .chart import Chart
+except ModuleNotFoundError:
+    Chart = None
+
+try:
+    from .polygon import PolygonChart
+except ModuleNotFoundError:
+    PolygonChart = None
