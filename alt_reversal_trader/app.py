@@ -1087,6 +1087,7 @@ class SymbolLoadWorker(QThread):
         chart_history: Optional[pd.DataFrame],
         existing_backtest: Optional[BacktestResult],
         history_last_refresh_at: Optional[float],
+        strategy_settings: Optional["StrategySettings"] = None,
     ) -> None:
         super().__init__()
         self.request_id = request_id
@@ -1097,6 +1098,7 @@ class SymbolLoadWorker(QThread):
         self.chart_history = chart_history
         self.existing_backtest = existing_backtest
         self.history_last_refresh_at = history_last_refresh_at
+        self.strategy_settings = strategy_settings or settings.strategy
 
     def run(self) -> None:
         try:
@@ -1182,22 +1184,23 @@ class SymbolLoadWorker(QThread):
             use_existing_backtest = (
                 self.existing_backtest is not None
                 and not history_updated
+                and self.existing_backtest.settings == self.strategy_settings
                 and _backtest_matches_history(self.existing_backtest, history)
             )
             if use_existing_backtest:
                 backtest = self.existing_backtest
-            elif _history_can_resume_backtest(self.existing_backtest, history):
+            elif _history_can_resume_backtest(self.existing_backtest, history) and self.existing_backtest.settings == self.strategy_settings:
                 backtest = resume_backtest(
                     history,
                     previous_result=self.existing_backtest,
-                    settings=self.settings.strategy,
+                    settings=self.strategy_settings,
                     fee_rate=self.settings.fee_rate,
                     backtest_start_time=backtest_start_time,
                 )
             else:
                 backtest = run_backtest(
                     history,
-                    settings=self.settings.strategy,
+                    settings=self.strategy_settings,
                     fee_rate=self.settings.fee_rate,
                     backtest_start_time=backtest_start_time,
                 )
@@ -5457,6 +5460,7 @@ class AltReversalTraderWindow(QMainWindow):
             cached_chart_history,
             worker_backtest,
             self._history_last_refresh_at(symbol, target_interval),
+            strategy_settings=initial_settings,
         )
         worker.loaded.connect(self._on_symbol_loaded)
         worker.failed.connect(self._on_symbol_load_failed)
