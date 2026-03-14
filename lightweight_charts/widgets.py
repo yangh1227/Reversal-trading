@@ -3,7 +3,7 @@ import html
 from importlib import import_module
 
 from .util import parse_event_message
-from lightweight_charts import abstract
+from . import abstract
 
 try:
     import wx.html2

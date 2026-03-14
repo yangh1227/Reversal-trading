@@ -11,7 +11,6 @@ from typing import Dict, List, Optional, Tuple
 import traceback
 
 import pandas as pd
-from lightweight_charts.widgets import QtChart
 import websocket
 
 from .binance_futures import (
@@ -22,6 +21,7 @@ from .binance_futures import (
     resample_ohlcv,
     resolve_base_interval,
 )
+from .chart_widgets import QtChart
 from .config import APP_INTERVAL_OPTIONS, CHART_ENGINE_OPTIONS, PARAMETER_SPECS, AppSettings, StrategySettings
 from .crash_logger import log_runtime_event
 from .live_chart_utils import (

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from importlib import import_module
+from typing import Any
 
 
 def _load_pyqt5_bindings():
@@ -64,7 +65,7 @@ try:
 
     QT_API = "PyQt5"
 
-    def app_exec(app: QApplication) -> int:
+    def app_exec(app: Any) -> int:
         return app.exec_()
 
     HORIZONTAL = Qt.Horizontal
@@ -124,7 +125,7 @@ except ImportError:
 
     QT_API = "PyQt6"
 
-    def app_exec(app: QApplication) -> int:
+    def app_exec(app: Any) -> int:
         return app.exec()
 
     HORIZONTAL = Qt.Orientation.Horizontal
