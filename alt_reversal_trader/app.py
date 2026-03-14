@@ -100,6 +100,7 @@ RECENT_SYMBOL_CACHE_LIMIT = 8
 FULL_HISTORY_REFRESH_COOLDOWN_SECONDS = 300.0
 PERFORMANCE_LOG_THRESHOLD_MS = 100.0
 AUTO_TRADE_INTERVAL_MS = 10_000
+AUTO_CLOSE_RETRY_INTERVAL_MS = 10_000
 _SNAPSHOT_KEEP = object()
 
 
@@ -1577,7 +1578,9 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_close_order_pending: set[str] = set()
         self.auto_close_queued_orders: Dict[str, Tuple[str, Optional[pd.Timestamp]]] = {}
         self.auto_close_last_trigger_time: Dict[str, pd.Timestamp] = {}
+        self.auto_close_last_attempt_at: Dict[str, float] = {}
         self.auto_trade_enabled = False
+        self.auto_close_retry_timer = QTimer(self)
         self.auto_trade_timer = QTimer(self)
         self.auto_trade_entry_pending_symbol: Optional[str] = None
         self.order_worker_symbol: Optional[str] = None
@@ -1630,6 +1633,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.price_label_timer.setInterval(250)
         self.price_label_timer.timeout.connect(self._refresh_live_labels)
         self.price_label_timer.start()
+        self.auto_close_retry_timer.setInterval(AUTO_CLOSE_RETRY_INTERVAL_MS)
+        self.auto_close_retry_timer.timeout.connect(self._run_auto_close_retry_cycle)
         self.auto_trade_timer.setInterval(AUTO_TRADE_INTERVAL_MS)
         self.auto_trade_timer.timeout.connect(self._run_auto_trade_cycle)
         self.chart_engine_combo.currentTextChanged.connect(self.on_chart_engine_changed)
@@ -2532,6 +2537,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.auto_close_order_pending.clear()
             self.auto_close_queued_orders.clear()
             self.auto_close_last_trigger_time.clear()
+            self.auto_close_last_attempt_at.clear()
             self._stop_all_auto_close_monitors()
             self._refresh_auto_close_monitors()
         if persist:
@@ -2581,6 +2587,41 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _is_auto_close_active_for_symbol(self, symbol: str) -> bool:
         return symbol in self._auto_close_managed_symbols()
+
+    def _refresh_auto_close_retry_timer(self) -> None:
+        should_run = (
+            bool(self._auto_close_managed_symbols())
+            and bool(self.settings.api_key)
+            and bool(self.settings.api_secret)
+        )
+        if should_run:
+            if not self.auto_close_retry_timer.isActive():
+                self.auto_close_retry_timer.start()
+            return
+        self.auto_close_retry_timer.stop()
+
+    def _auto_close_retry_allowed(self, symbol: str, bar_time: Optional[pd.Timestamp]) -> bool:
+        if bar_time is None:
+            return True
+        last_bar_time = self.auto_close_last_trigger_time.get(symbol)
+        if last_bar_time != bar_time:
+            return True
+        last_attempt = self.auto_close_last_attempt_at.get(symbol, 0.0)
+        return (time.time() - last_attempt) >= (AUTO_CLOSE_RETRY_INTERVAL_MS / 1000.0)
+
+    def _record_auto_close_attempt(self, symbol: str, bar_time: Optional[pd.Timestamp]) -> None:
+        self.auto_close_last_attempt_at[symbol] = time.time()
+        if bar_time is not None:
+            self.auto_close_last_trigger_time[symbol] = bar_time
+
+    def _run_auto_close_retry_cycle(self) -> None:
+        self._refresh_auto_close_retry_timer()
+        if not self.auto_close_retry_timer.isActive():
+            return
+        if self.account_worker is None or not self.account_worker.isRunning():
+            self.refresh_account_info()
+        self._refresh_auto_close_monitors()
+        self._flush_queued_auto_close_orders()
 
     def _eligible_auto_trade_results(self) -> List[OptimizationResult]:
         return list(self._ordered_optimized_results())
@@ -2634,6 +2675,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.auto_trade_timer.stop()
             self.auto_trade_entry_pending_symbol = None
             self._refresh_auto_close_monitors()
+        self._refresh_auto_close_retry_timer()
         self.update_positions_table()
         self._refresh_auto_trade_button_state()
 
@@ -3607,7 +3649,9 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_close_order_pending.discard(symbol)
         self.auto_close_queued_orders.pop(symbol, None)
         self.auto_close_last_trigger_time.pop(symbol, None)
+        self.auto_close_last_attempt_at.pop(symbol, None)
         self._stop_auto_close_monitor(symbol)
+        self._refresh_auto_close_retry_timer()
 
     def _stop_all_auto_close_monitors(self) -> None:
         symbols = set(self.auto_close_history_workers) | set(self.auto_close_signal_workers) | set(self.auto_close_stream_workers)
@@ -3616,6 +3660,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_close_monitor_histories.clear()
         self.auto_close_monitor_intervals.clear()
         self.auto_close_signal_pending.clear()
+        self._refresh_auto_close_retry_timer()
 
     def _start_auto_close_history_worker(self, symbol: str, interval: str) -> None:
         if not self._is_auto_close_active_for_symbol(symbol) or symbol == self.current_symbol:
@@ -3695,6 +3740,7 @@ class AltReversalTraderWindow(QMainWindow):
             self._refresh_auto_close_monitors()
             if symbol == self.current_symbol and self.current_backtest is not None:
                 self._evaluate_backtest_auto_close(symbol, self.current_backtest)
+            self._refresh_auto_close_retry_timer()
             return
         self.log(f"{symbol} 자동청산 비활성화")
         self._clear_auto_close_symbol(symbol)
@@ -3733,6 +3779,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.auto_close_monitor_intervals[symbol] = desired_interval
             self._start_auto_close_stream_worker(symbol, desired_interval)
             self._schedule_auto_close_signal(symbol)
+        self._refresh_auto_close_retry_timer()
 
     def _on_auto_close_history_completed(self, payload: object) -> None:
         result = dict(payload)
@@ -3818,7 +3865,7 @@ class AltReversalTraderWindow(QMainWindow):
         if symbol in self.auto_close_order_pending:
             return
         normalized_bar_time = pd.Timestamp(bar_time) if bar_time is not None else None
-        if normalized_bar_time is not None and self.auto_close_last_trigger_time.get(symbol) == normalized_bar_time:
+        if not self._auto_close_retry_allowed(symbol, normalized_bar_time):
             return
         if self.order_worker is not None and self.order_worker.isRunning():
             if symbol not in self.auto_close_queued_orders:
@@ -3828,8 +3875,7 @@ class AltReversalTraderWindow(QMainWindow):
         if self._submit_close_position(symbol, auto_close_reason=reason):
             self.auto_close_order_pending.add(symbol)
             self.auto_close_queued_orders.pop(symbol, None)
-            if normalized_bar_time is not None:
-                self.auto_close_last_trigger_time[symbol] = normalized_bar_time
+            self._record_auto_close_attempt(symbol, normalized_bar_time)
 
     def _flush_queued_auto_close_orders(self) -> None:
         if self.order_worker is not None and self.order_worker.isRunning():
@@ -3842,14 +3888,13 @@ class AltReversalTraderWindow(QMainWindow):
             if position is None:
                 self._clear_auto_close_symbol(symbol)
                 continue
-            if bar_time is not None and self.auto_close_last_trigger_time.get(symbol) == bar_time:
-                self.auto_close_queued_orders.pop(symbol, None)
+            normalized_bar_time = pd.Timestamp(bar_time) if bar_time is not None else None
+            if not self._auto_close_retry_allowed(symbol, normalized_bar_time):
                 continue
             if self._submit_close_position(symbol, auto_close_reason=reason):
                 self.auto_close_order_pending.add(symbol)
                 self.auto_close_queued_orders.pop(symbol, None)
-                if bar_time is not None:
-                    self.auto_close_last_trigger_time[symbol] = bar_time
+                self._record_auto_close_attempt(symbol, normalized_bar_time)
                 return
 
     def _stop_scan_worker(self) -> None:
@@ -5729,6 +5774,7 @@ class AltReversalTraderWindow(QMainWindow):
         self._clear_entry_price_overlay()
         self.log(message)
         self.auto_trade_entry_pending_symbol = None
+        self._refresh_auto_close_retry_timer()
         self._refresh_auto_trade_button_state()
         if self.pending_account_refresh:
             self.pending_account_refresh = False
@@ -5855,6 +5901,7 @@ class AltReversalTraderWindow(QMainWindow):
         order_symbol = self.order_worker_symbol or str(result.get("symbol", ""))
         if self.order_worker_is_auto_close and order_symbol:
             self.auto_close_order_pending.discard(order_symbol)
+            self.auto_close_last_attempt_at[order_symbol] = time.time()
         if not self.order_worker_is_auto_close and order_symbol:
             self._remember_position_interval(order_symbol, self.pending_open_order_interval)
         was_auto_trade = self.order_worker_is_auto_trade
@@ -5874,7 +5921,7 @@ class AltReversalTraderWindow(QMainWindow):
         was_auto_trade = self.order_worker_is_auto_trade
         if was_auto_close and order_symbol:
             self.auto_close_order_pending.discard(order_symbol)
-            self.auto_close_last_trigger_time.pop(order_symbol, None)
+            self.auto_close_last_attempt_at[order_symbol] = time.time()
         if was_auto_trade:
             self.auto_trade_entry_pending_symbol = None
         self.order_worker_symbol = None
@@ -5902,6 +5949,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.auto_refresh_timer.stop()
             self.live_update_timer.stop()
             self.optimized_table_timer.stop()
+            self.auto_close_retry_timer.stop()
             self.auto_trade_timer.stop()
             self._stop_scan_worker()
             self._stop_optimize_worker()
