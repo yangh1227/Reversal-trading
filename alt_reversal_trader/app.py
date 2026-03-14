@@ -655,6 +655,10 @@ def _position_return_pct(position: PositionSnapshot) -> float:
     return float(position.unrealized_pnl) / margin * 100.0
 
 
+def _position_notional_usdt(position: PositionSnapshot) -> float:
+    return abs(float(position.amount)) * float(position.entry_price)
+
+
 class KlineStreamWorker(QThread):
     kline = Signal(object)
     status = Signal(str)
@@ -2147,7 +2151,7 @@ class AltReversalTraderWindow(QMainWindow):
         group = QGroupBox("Open Positions")
         layout = QVBoxLayout(group)
         self.positions_table = QTableWidget(0, 7)
-        self.positions_table.setHorizontalHeaderLabels(["Symbol", "Side", "Amount", "Entry", "UPnL", "수익률", "Action"])
+        self.positions_table.setHorizontalHeaderLabels(["Symbol", "Side", "Amount USDT", "Entry", "UPnL", "수익률", "Action"])
         self.positions_table.setSelectionBehavior(SELECT_ROWS)
         self.positions_table.setSelectionMode(SINGLE_SELECTION)
         self.positions_table.setEditTriggers(NO_EDIT_TRIGGERS)
@@ -4590,6 +4594,7 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _position_display_values(self, position: PositionSnapshot) -> Tuple[List[str], float, float]:
         side = "LONG" if position.amount > 0 else "SHORT"
+        notional_usdt = _position_notional_usdt(position)
         entry_text = f"{position.entry_price:.8f}".rstrip("0").rstrip(".")
         upnl_value = float(position.unrealized_pnl)
         return_pct = _position_return_pct(position)
@@ -4597,7 +4602,7 @@ class AltReversalTraderWindow(QMainWindow):
             [
                 self._position_symbol_text(position.symbol),
                 side,
-                f"{abs(position.amount):.6f}",
+                f"{notional_usdt:.2f}",
                 entry_text,
                 f"{upnl_value:.2f}",
                 f"{return_pct:+.2f}%",
@@ -4622,12 +4627,13 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _position_status_html(self, position: PositionSnapshot) -> str:
         side = "LONG" if position.amount > 0 else "SHORT"
+        notional_usdt = _position_notional_usdt(position)
         upnl_value = float(position.unrealized_pnl)
         return_pct = _position_return_pct(position)
         upnl_color = self._pnl_color(upnl_value)
         return_color = self._pnl_color(return_pct)
         return (
-            f"<span style='color:#111827;'>포지션: {self._position_symbol_text(position.symbol)} {side} {abs(position.amount):.6f} @ {position.entry_price:.6f} | </span>"
+            f"<span style='color:#111827;'>포지션: {self._position_symbol_text(position.symbol)} {side} {notional_usdt:.2f} USDT @ {position.entry_price:.6f} | </span>"
             f"<span style='font-weight:700; color:{upnl_color};'>UPnL {upnl_value:.2f}</span> | "
             f"<span style='font-weight:700; color:{return_color};'>수익률 {return_pct:+.2f}%</span>"
         )
