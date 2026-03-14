@@ -2845,7 +2845,11 @@ class AltReversalTraderWindow(QMainWindow):
                 self.auto_trade_entry_pending_symbol = event.symbol
                 self.auto_trade_entry_pending_fraction = float(event.fraction)
                 if event.interval in APP_INTERVAL_OPTIONS:
-                    self._request_symbol_load(event.symbol, event.interval)
+                    self._request_symbol_load(
+                        event.symbol,
+                        event.interval,
+                        prefer_locked_position_settings=True,
+                    )
             self._on_order_completed({"symbol": event.symbol, "message": event.message})
             return
         if isinstance(event, EngineOrderFailedEvent):
@@ -4268,7 +4272,11 @@ class AltReversalTraderWindow(QMainWindow):
             symbol,
             desired_interval,
             history,
-            self._active_backtest_settings(symbol, desired_interval),
+            self._active_backtest_settings(
+                symbol,
+                desired_interval,
+                prefer_locked_position_settings=True,
+            ),
             self.backtest_cache.get(cache_key),
         )
         worker.completed.connect(self._on_auto_close_signal_completed)
