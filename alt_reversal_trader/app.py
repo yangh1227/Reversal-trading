@@ -1691,6 +1691,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_close_last_trigger_time: Dict[str, pd.Timestamp] = {}
         self.auto_close_last_attempt_at: Dict[str, float] = {}
         self.auto_trade_enabled = False
+        self.auto_trade_requested = False
         self.auto_close_retry_timer = QTimer(self)
         self.auto_trade_timer = QTimer(self)
         self.auto_trade_entry_pending_symbol: Optional[str] = None
@@ -2930,6 +2931,7 @@ class AltReversalTraderWindow(QMainWindow):
             return
         self.engine_failed = True
         self.auto_trade_enabled = False
+        self.auto_trade_requested = False
         self.engine_order_pending = False
         self.trade_engine_poll_timer.stop()
         if self.trade_engine is not None:
@@ -3084,22 +3086,17 @@ class AltReversalTraderWindow(QMainWindow):
         return random.choice(return_tied)
 
     def _toggle_auto_trade_mode(self, checked: bool) -> None:
-        if checked and not self.optimized_results:
-            self.log("자동매매 시작 전 후보 스캔 + 최적화를 먼저 완료하세요.")
-            self.auto_trade_enabled = False
+        self.auto_trade_requested = bool(checked)
+        if self.auto_trade_requested and not self._auto_trade_ready():
+            self.log("자동매매 예약됨: 최적화 완료 후 자동으로 시작합니다.")
+            self._sync_trade_engine_state()
+            self.update_positions_table()
             self._refresh_auto_trade_button_state()
             return
-        self.auto_trade_enabled = bool(checked)
-        if self.auto_trade_enabled:
-            self.log("자동매매 활성화")
-            self.refresh_account_info()
+        if self.auto_trade_requested:
+            self._enable_auto_trade_runtime()
         else:
-            self.log("자동매매 비활성화")
-            self.auto_trade_entry_pending_symbol = None
-            self.auto_trade_entry_pending_fraction = 0.0
-        self._refresh_auto_close_monitors()
-        self._sync_trade_engine_state()
-        self.update_positions_table()
+            self._disable_auto_trade_runtime()
         self._refresh_auto_trade_button_state()
 
     def _run_auto_trade_cycle(
@@ -3490,14 +3487,17 @@ class AltReversalTraderWindow(QMainWindow):
             """
         )
 
-    def _set_auto_trade_button_state(self, enabled: bool) -> None:
+    def _set_auto_trade_button_state(self, enabled: bool, pending: bool = False) -> None:
         if not hasattr(self, "auto_trade_button"):
             return
         button = self.auto_trade_button
         button.blockSignals(True)
         button.setCheckable(True)
         button.setChecked(enabled)
-        button.setText("자동매매 ON" if enabled else "자동매매 OFF")
+        if pending:
+            button.setText("자동매매 예약")
+        else:
+            button.setText("자동매매 ON" if enabled else "자동매매 OFF")
         button.setStyleSheet(
             """
             QPushButton {
@@ -3534,12 +3534,46 @@ class AltReversalTraderWindow(QMainWindow):
         )
         button.blockSignals(False)
 
+    def _auto_trade_ready(self) -> bool:
+        return bool(self.optimized_results) and bool(self.settings.api_key and self.settings.api_secret) and not self.engine_failed
+
+    def _enable_auto_trade_runtime(self) -> None:
+        if self.auto_trade_enabled:
+            return
+        self.auto_trade_enabled = True
+        self.log("자동매매 활성화")
+        self.refresh_account_info()
+        self._refresh_auto_close_monitors()
+        self._sync_trade_engine_state()
+        self.update_positions_table()
+
+    def _disable_auto_trade_runtime(self, *, log_message: bool = True) -> None:
+        if not self.auto_trade_enabled:
+            return
+        self.auto_trade_enabled = False
+        if log_message:
+            self.log("자동매매 비활성화")
+        self.auto_trade_entry_pending_symbol = None
+        self.auto_trade_entry_pending_fraction = 0.0
+        self._refresh_auto_close_monitors()
+        self._sync_trade_engine_state()
+        self.update_positions_table()
+
+    def _activate_requested_auto_trade_if_ready(self) -> None:
+        if not self.auto_trade_requested or self.auto_trade_enabled or not self._auto_trade_ready():
+            self._refresh_auto_trade_button_state()
+            return
+        self._enable_auto_trade_runtime()
+        self._refresh_auto_trade_button_state()
+
     def _refresh_auto_trade_button_state(self) -> None:
         if not hasattr(self, "auto_trade_button"):
             return
-        ready = bool(self.optimized_results) and bool(self.settings.api_key and self.settings.api_secret) and not self.engine_failed
-        self.auto_trade_button.setEnabled(bool(self.auto_trade_enabled) or (ready and not self._is_refresh_running()))
-        self._set_auto_trade_button_state(self.auto_trade_enabled)
+        available = bool(self.settings.api_key and self.settings.api_secret) and not self.engine_failed
+        requested = bool(self.auto_trade_requested or self.auto_trade_enabled)
+        pending = bool(self.auto_trade_requested and not self.auto_trade_enabled)
+        self.auto_trade_button.setEnabled(requested or available)
+        self._set_auto_trade_button_state(requested, pending=pending)
 
     def _style_close_button(self, button: QPushButton) -> None:
         button.setStyleSheet(
@@ -5564,6 +5598,7 @@ class AltReversalTraderWindow(QMainWindow):
         self._finish_backtest_progress()
         self._set_refresh_running(False)
         self._refresh_auto_trade_button_state()
+        self._activate_requested_auto_trade_if_ready()
         if self.auto_trade_enabled:
             QTimer.singleShot(0, self._run_auto_trade_cycle)
 
@@ -6260,7 +6295,8 @@ class AltReversalTraderWindow(QMainWindow):
         self._sync_settings()
         if not self.settings.api_key or not self.settings.api_secret:
             self._stop_account_worker()
-            if self.auto_trade_enabled:
+            if self.auto_trade_enabled or self.auto_trade_requested:
+                self.auto_trade_requested = False
                 self.auto_trade_enabled = False
                 self.auto_trade_timer.stop()
                 self.auto_trade_entry_pending_symbol = None

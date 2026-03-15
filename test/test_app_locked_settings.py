@@ -148,3 +148,37 @@ def test_optimization_completion_does_not_auto_select_first_result_row() -> None
     ) or ""
 
     assert "self.optimized_table.selectRow(0)" not in source_segment
+
+
+def test_auto_trade_toggle_uses_requested_reservation_state() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_toggle_auto_trade_mode"),
+    ) or ""
+
+    assert "self.auto_trade_requested = bool(checked)" in source_segment
+    assert "self._auto_trade_ready()" in source_segment
+    assert "self._enable_auto_trade_runtime()" in source_segment
+    assert "self._disable_auto_trade_runtime()" in source_segment
+    assert "if checked and not self.optimized_results" not in source_segment
+
+
+def test_auto_trade_button_refresh_does_not_require_optimized_results_to_enable() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_refresh_auto_trade_button_state"),
+    ) or ""
+
+    assert "available = bool(self.settings.api_key and self.settings.api_secret) and not self.engine_failed" in source_segment
+    assert "requested = bool(self.auto_trade_requested or self.auto_trade_enabled)" in source_segment
+    assert "self.auto_trade_button.setEnabled(requested or available)" in source_segment
+    assert "self.optimized_results" not in source_segment
+
+
+def test_optimization_completion_activates_requested_auto_trade() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("on_optimization_completed"),
+    ) or ""
+
+    assert "self._activate_requested_auto_trade_if_ready()" in source_segment
