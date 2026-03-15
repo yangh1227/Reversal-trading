@@ -106,6 +106,17 @@ def make_signal_backtest(
     )
 
 
+class FakeTickerClient:
+    def __init__(self, price_by_symbol: dict[str, float]) -> None:
+        self.price_by_symbol = dict(price_by_symbol)
+
+    def ticker_24h(self) -> dict[str, dict[str, float]]:
+        return {
+            symbol: {"lastPrice": price}
+            for symbol, price in self.price_by_symbol.items()
+        }
+
+
 def test_trade_engine_prefers_locked_strategy_for_open_positions() -> None:
     engine = _TradeEngine(mp.Queue(), mp.Queue())
     locked_settings = StrategySettings(atr_period=7)
@@ -238,7 +249,7 @@ def test_trade_engine_drops_symbol_after_auto_close_reports_no_open_position() -
 def test_trade_engine_enters_fresh_confirmed_new_signal_on_trigger_bar() -> None:
     engine = _TradeEngine(mp.Queue(), mp.Queue())
     engine.auto_trade_enabled = True
-    engine.client = object()
+    engine.client = FakeTickerClient({"TESTUSDT": 120.0})
     backtest = make_signal_backtest(zone=2, signal_time="2026-01-01 00:15:00")
     key = ("TESTUSDT", "1m")
     engine.watchlist[key] = EngineWatchlistItem(
@@ -271,7 +282,7 @@ def test_trade_engine_enters_fresh_confirmed_new_signal_on_trigger_bar() -> None
 def test_trade_engine_enters_fresh_confirmed_additional_signal_for_open_position() -> None:
     engine = _TradeEngine(mp.Queue(), mp.Queue())
     engine.auto_trade_enabled = True
-    engine.client = object()
+    engine.client = FakeTickerClient({"TESTUSDT": 120.0})
     backtest = make_signal_backtest(
         zone=3,
         signal_time="2026-01-01 00:20:00",
@@ -312,7 +323,7 @@ def test_trade_engine_enters_fresh_confirmed_additional_signal_for_open_position
 def test_trade_engine_skips_stale_confirmed_signal_without_matching_trigger_bar() -> None:
     engine = _TradeEngine(mp.Queue(), mp.Queue())
     engine.auto_trade_enabled = True
-    engine.client = object()
+    engine.client = FakeTickerClient({"TESTUSDT": 120.0})
     backtest = make_signal_backtest(
         zone=2,
         signal_time="2026-01-01 00:15:00",
@@ -342,3 +353,36 @@ def test_trade_engine_skips_stale_confirmed_signal_without_matching_trigger_bar(
     )
 
     assert submitted == []
+
+
+def test_trade_engine_enters_on_favorable_price_without_fresh_confirmed_trigger() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.auto_trade_enabled = True
+    engine.client = FakeTickerClient({"TESTUSDT": 95.0})
+    backtest = make_signal_backtest(
+        zone=2,
+        signal_time="2026-01-01 00:15:00",
+        latest_time="2026-01-01 00:16:00",
+    )
+    key = ("TESTUSDT", "1m")
+    engine.watchlist[key] = EngineWatchlistItem(
+        symbol="TESTUSDT",
+        interval="1m",
+        score=7.0,
+        return_pct=12.0,
+        strategy_settings=StrategySettings(),
+    )
+    engine.symbol_states[key] = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="1m",
+        strategy_settings=StrategySettings(),
+        backtest=backtest,
+    )
+    submitted: list[dict[str, object]] = []
+    engine._enqueue_open_order = lambda **kwargs: submitted.append(kwargs)
+
+    engine._evaluate_auto_trade()
+
+    assert len(submitted) == 1
+    assert submitted[0]["side"] == "BUY"
+    assert round(float(submitted[0]["fraction"]), 2) == 0.50

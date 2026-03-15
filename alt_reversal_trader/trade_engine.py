@@ -1135,20 +1135,23 @@ class _TradeEngine:
     ) -> None:
         if not self.auto_trade_enabled or self.client is None:
             return
-        if trigger_bar_time is None:
-            return
         trigger_symbol = str(trigger_symbol or "").upper()
         trigger_interval = str(trigger_interval or self.default_interval)
-        normalized_trigger_time = pd.Timestamp(trigger_bar_time).tz_localize(None)
+        normalized_trigger_time = (
+            pd.Timestamp(trigger_bar_time).tz_localize(None) if trigger_bar_time is not None else None
+        )
         eligible_items = list(self.watchlist.values())
         if not eligible_items:
+            return
+        try:
+            ticker_map = self.client.ticker_24h()
+        except Exception as exc:
+            self.log(f"Trade engine auto-trade ticker lookup failed: {exc}")
             return
         open_positions_by_symbol = dict(self.open_positions)
         candidates: List[Dict[str, object]] = []
         for item in eligible_items:
             if item.symbol in self.pending_order_symbols:
-                continue
-            if item.symbol != trigger_symbol or item.interval != trigger_interval:
                 continue
             open_position = open_positions_by_symbol.get(item.symbol)
             if open_positions_by_symbol and open_position is None:
@@ -1163,12 +1166,25 @@ class _TradeEngine:
             signal = _auto_trade_signal_from_backtest(latest_backtest)
             if signal is None:
                 continue
-            confirmed_entry = latest_confirmed_entry_event(latest_backtest, normalized_trigger_time)
-            if confirmed_entry is None:
+            ticker = ticker_map.get(item.symbol)
+            if not ticker:
                 continue
+            current_price = float(ticker.get("lastPrice", 0.0) or 0.0)
+            signal_price = float(signal["price"])
+            zone_prices = dict(signal.get("zone_prices") or {})
+            confirmed_entry = (
+                latest_confirmed_entry_event(latest_backtest, normalized_trigger_time)
+                if normalized_trigger_time is not None
+                and item.symbol == trigger_symbol
+                and item.interval == trigger_interval
+                else None
+            )
             side = str(signal["side"])
-            if str(confirmed_entry["side"]) != side or int(confirmed_entry["zone"]) != int(signal["zone"]):
-                continue
+            has_fresh_confirmed_entry = (
+                confirmed_entry is not None
+                and str(confirmed_entry["side"]) == side
+                and int(confirmed_entry["zone"]) == int(signal["zone"])
+            )
             # Skip entry when the backtest's exit condition is already active for
             # this direction: the auto-close would fire immediately, causing a
             # wasteful enter→close→re-enter cycle on the same bar.
@@ -1203,11 +1219,25 @@ class _TradeEngine:
                 fraction = max(0.0, fraction - float(filled_fraction))
                 if fraction <= 1e-9:
                     continue
+                if not has_fresh_confirmed_entry:
+                    favorable_fraction = _zone_favorable_fraction(
+                        side, current_price, signal_price, zone_prices, float(filled_fraction),
+                    )
+                    if favorable_fraction <= 1e-9:
+                        continue
+                    fraction = min(fraction, favorable_fraction)
                 # Additional entry (e.g. L2→L3): enter immediately when the
                 # signal first appears (same bar).  On subsequent bars, use
                 # zone-level favorable price checks so that each zone enters
                 # independently at its own price threshold.
-                
+            else:
+                if not has_fresh_confirmed_entry:
+                    favorable_fraction = _zone_favorable_fraction(
+                        side, current_price, signal_price, zone_prices, 0.0,
+                    )
+                    if favorable_fraction <= 1e-9:
+                        continue
+                    fraction = min(fraction, favorable_fraction)
             candidates.append(
                 {
                     "symbol": item.symbol,

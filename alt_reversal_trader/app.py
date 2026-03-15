@@ -675,6 +675,29 @@ def _signal_fraction_for_zone(zone: int) -> float:
     return signal_fraction_for_zone(zone)
 
 
+def _zone_favorable_fraction(
+    side: str,
+    current_price: float,
+    signal_price: float,
+    zone_prices: Dict[int, float],
+    filled_fraction: float,
+) -> float:
+    for z in (3, 2):
+        zp = zone_prices.get(z)
+        if zp is None or zp <= 0:
+            continue
+        favorable = current_price < zp if side == "long" else current_price > zp
+        if favorable:
+            zone_fraction = signal_fraction_for_zone(z)
+            remaining = max(0.0, zone_fraction - filled_fraction)
+            if remaining > 1e-9:
+                return remaining
+    favorable = current_price < signal_price if side == "long" else current_price > signal_price
+    if favorable:
+        return max(0.0, signal_fraction_for_zone(1) - filled_fraction)
+    return 0.0
+
+
 def _auto_trade_signal_from_backtest(backtest: BacktestResult) -> Optional[Dict[str, object]]:
     cursor = backtest.cursor
     if cursor is None or abs(float(cursor.position_qty)) < 1e-12:
@@ -685,10 +708,18 @@ def _auto_trade_signal_from_backtest(backtest: BacktestResult) -> Optional[Dict[
     signal_time = cursor.last_entry_signal_time or cursor.entry_time
     if side not in {"long", "short"} or zone not in {1, 2, 3} or price <= 0 or signal_time is None:
         return None
+    zone_prices: Dict[int, float] = {}
+    indicators = backtest.indicators
+    if not indicators.empty:
+        latest = indicators.iloc[-1]
+        for z, col in ((2, "zone2_line"), (3, "zone3_line")):
+            if col in latest.index and pd.notna(latest[col]):
+                zone_prices[z] = float(latest[col])
     return {
         "side": side,
         "zone": zone,
         "price": price,
+        "zone_prices": zone_prices,
         "time": pd.Timestamp(signal_time),
         "fraction": _signal_fraction_for_zone(zone),
     }
@@ -3089,8 +3120,6 @@ class AltReversalTraderWindow(QMainWindow):
             return
         if not self.auto_trade_enabled:
             return
-        if trigger_bar_time is None:
-            return
         if self._is_refresh_running():
             return
         if self._is_order_pending():
@@ -3106,21 +3135,21 @@ class AltReversalTraderWindow(QMainWindow):
         self._refresh_auto_close_monitors()
         trigger_symbol = str(trigger_symbol or "").upper()
         trigger_interval = str(trigger_interval or self.current_interval or self.settings.kline_interval)
-        normalized_trigger_time = pd.Timestamp(trigger_bar_time).tz_localize(None)
+        normalized_trigger_time = (
+            pd.Timestamp(trigger_bar_time).tz_localize(None) if trigger_bar_time is not None else None
+        )
         open_positions_by_symbol = {position.symbol: position for position in self.open_positions}
         eligible_results = self._eligible_auto_trade_results()
         if not eligible_results:
             return
         try:
-            ticker_map = {}
+            ticker_map = self.public_client.ticker_24h()
         except Exception as exc:
             self.log(f"자동매매 시세 조회 실패: {exc}")
             return
         candidates: List[Dict[str, object]] = []
         for result in eligible_results:
             interval = result.best_interval or self.settings.kline_interval
-            if result.symbol != trigger_symbol or interval != trigger_interval:
-                continue
             open_position = open_positions_by_symbol.get(result.symbol)
             if open_positions_by_symbol and open_position is None:
                 continue
@@ -3128,12 +3157,25 @@ class AltReversalTraderWindow(QMainWindow):
             signal = _auto_trade_signal_from_backtest(latest_backtest)
             if signal is None:
                 continue
-            confirmed_entry = latest_confirmed_entry_event(latest_backtest, normalized_trigger_time)
-            if confirmed_entry is None:
+            ticker = ticker_map.get(result.symbol)
+            if not ticker:
                 continue
+            current_price = float(ticker.get("lastPrice", 0.0) or 0.0)
+            signal_price = float(signal["price"])
+            zone_prices = dict(signal.get("zone_prices") or {})
+            confirmed_entry = (
+                latest_confirmed_entry_event(latest_backtest, normalized_trigger_time)
+                if normalized_trigger_time is not None
+                and result.symbol == trigger_symbol
+                and interval == trigger_interval
+                else None
+            )
             side = str(signal["side"])
-            if str(confirmed_entry["side"]) != side or int(confirmed_entry["zone"]) != int(signal["zone"]):
-                continue
+            has_fresh_confirmed_entry = (
+                confirmed_entry is not None
+                and str(confirmed_entry["side"]) == side
+                and int(confirmed_entry["zone"]) == int(signal["zone"])
+            )
             fraction = float(signal["fraction"])
             if open_position is not None:
                 position_side = "long" if float(open_position.amount) > 0 else "short"
@@ -3146,6 +3188,21 @@ class AltReversalTraderWindow(QMainWindow):
                 fraction = max(0.0, fraction - float(filled_fraction))
                 if fraction <= 1e-9:
                     continue
+                if not has_fresh_confirmed_entry:
+                    favorable_fraction = _zone_favorable_fraction(
+                        side, current_price, signal_price, zone_prices, float(filled_fraction),
+                    )
+                    if favorable_fraction <= 1e-9:
+                        continue
+                    fraction = min(fraction, favorable_fraction)
+            else:
+                if not has_fresh_confirmed_entry:
+                    favorable_fraction = _zone_favorable_fraction(
+                        side, current_price, signal_price, zone_prices, 0.0,
+                    )
+                    if favorable_fraction <= 1e-9:
+                        continue
+                    fraction = min(fraction, favorable_fraction)
             candidates.append(
                 {
                     "symbol": result.symbol,
@@ -3155,7 +3212,11 @@ class AltReversalTraderWindow(QMainWindow):
                     "return_pct": float(latest_backtest.metrics.total_return_pct),
                     "fraction": float(fraction),
                     "zone": int(signal["zone"]),
-                    "signal_time": pd.Timestamp(confirmed_entry["bar_time"]),
+                    "signal_time": (
+                        pd.Timestamp(confirmed_entry["bar_time"])
+                        if confirmed_entry is not None
+                        else pd.Timestamp(signal["time"])
+                    ),
                 }
             )
         chosen = self._pick_auto_trade_candidate(candidates)
