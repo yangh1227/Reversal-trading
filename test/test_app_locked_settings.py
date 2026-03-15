@@ -182,3 +182,12 @@ def test_optimization_completion_activates_requested_auto_trade() -> None:
     ) or ""
 
     assert "self._activate_requested_auto_trade_if_ready()" in source_segment
+
+
+def test_lightweight_indicator_lines_disable_crosshair_markers() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_init_lightweight_chart"),
+    ) or ""
+
+    assert source_segment.count("crosshair_marker=False") >= 6

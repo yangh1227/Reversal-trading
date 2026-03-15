@@ -2442,6 +2442,7 @@ class AltReversalTraderWindow(QMainWindow):
             width=2,
             price_line=False,
             price_label=False,
+            crosshair_marker=False,
         )
         self.supertrend_line = self.chart.create_line(
             "Supertrend",
@@ -2449,6 +2450,7 @@ class AltReversalTraderWindow(QMainWindow):
             width=2,
             price_line=False,
             price_label=False,
+            crosshair_marker=False,
         )
         self.zone2_line = self.chart.create_line(
             "Zone 2",
@@ -2456,6 +2458,7 @@ class AltReversalTraderWindow(QMainWindow):
             width=1,
             price_line=False,
             price_label=False,
+            crosshair_marker=False,
         )
         self.zone3_line = self.chart.create_line(
             "Zone 3",
@@ -2463,6 +2466,7 @@ class AltReversalTraderWindow(QMainWindow):
             width=1,
             price_line=False,
             price_label=False,
+            crosshair_marker=False,
         )
         self.ema_fast_line = self.chart.create_line(
             "EMA Fast",
@@ -2470,6 +2474,7 @@ class AltReversalTraderWindow(QMainWindow):
             width=1,
             price_line=False,
             price_label=False,
+            crosshair_marker=False,
         )
         self.ema_slow_line = self.chart.create_line(
             "EMA Slow",
@@ -2477,6 +2482,7 @@ class AltReversalTraderWindow(QMainWindow):
             width=1,
             price_line=False,
             price_label=False,
+            crosshair_marker=False,
         )
         self.chart.events.range_change += self._on_lightweight_range_change
         self._init_lightweight_bar_close_overlay()

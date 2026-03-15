@@ -728,12 +728,25 @@ class AbstractChart(Candlestick, Pane):
     def create_line(
             self, name: str = '', color: str = 'rgba(214, 237, 255, 0.6)',
             style: LINE_STYLE = 'solid', width: int = 2,
-            price_line: bool = True, price_label: bool = True, price_scale_id: Optional[str] = None
+            price_line: bool = True, price_label: bool = True, price_scale_id: Optional[str] = None,
+            crosshair_marker: bool = True,
     ) -> Line:
         """
         Creates and returns a Line object.
         """
-        self._lines.append(Line(self, name, color, style, width, price_line, price_label, price_scale_id))
+        self._lines.append(
+            Line(
+                self,
+                name,
+                color,
+                style,
+                width,
+                price_line,
+                price_label,
+                price_scale_id,
+                crosshair_marker=crosshair_marker,
+            )
+        )
         return self._lines[-1]
 
     def create_histogram(
