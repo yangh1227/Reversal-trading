@@ -4746,6 +4746,13 @@ class AltReversalTraderWindow(QMainWindow):
         bar = dict(payload)
         if bar.get("symbol") != self.current_symbol:
             return
+        # If there's a pending closed bar waiting on the timer, flush it
+        # first so its confirmed backtest is not lost when the next
+        # (unclosed) bar overwrites live_pending_bar.
+        pending = self.live_pending_bar
+        if pending is not None and bool(pending.get("closed")):
+            self.live_update_timer.stop()
+            self._flush_live_update()
         self.live_pending_bar = bar
         if not bool(bar.get("closed")):
             self._flush_live_update()
