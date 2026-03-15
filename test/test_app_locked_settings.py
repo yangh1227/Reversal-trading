@@ -119,3 +119,23 @@ def test_preview_and_fast_markers_use_unified_signal_text() -> None:
     assert "_auto_close_reason_text(reason)" not in ast.get_source_segment(
         source, _window_method_node("_build_fast_exit_markers")
     )
+
+
+def test_closed_bar_markers_use_confirmed_entry_helper() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_evaluate_closed_bar_auto_close"),
+    ) or ""
+
+    assert "latest_confirmed_entry_event(self.current_backtest, latest_time)" in source_segment
+
+
+def test_closed_bar_backtest_schedules_auto_trade_with_trigger_bar_time() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_apply_closed_bar_confirmed_backtest"),
+    ) or ""
+
+    assert "trigger_symbol=symbol" in source_segment
+    assert "trigger_interval=self.current_interval" in source_segment
+    assert "trigger_bar_time=confirmed_bar_time" in source_segment

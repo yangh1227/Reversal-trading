@@ -4,7 +4,7 @@ import pandas as pd
 
 from alt_reversal_trader.binance_futures import PositionSnapshot
 from alt_reversal_trader.config import StrategySettings
-from alt_reversal_trader.strategy import run_backtest
+from alt_reversal_trader.strategy import BacktestCursor, BacktestResult, StrategyMetrics, run_backtest
 from alt_reversal_trader.trade_engine import EngineWatchlistItem, _EngineSymbolState, _OrderExecutionResult, _TradeEngine
 
 
@@ -36,6 +36,73 @@ def make_position(symbol: str = "TESTUSDT") -> PositionSnapshot:
         mark_price=101.0,
         unrealized_pnl=1.0,
         leverage=3,
+    )
+
+
+def make_signal_backtest(
+    *,
+    side: str = "long",
+    zone: int = 3,
+    signal_time: str = "2026-01-01 00:10:00",
+    latest_time: str | None = None,
+    entry_time: str | None = None,
+    price: float = 100.0,
+) -> BacktestResult:
+    signal_timestamp = pd.Timestamp(signal_time)
+    latest_timestamp = pd.Timestamp(latest_time or signal_time)
+    entry_timestamp = pd.Timestamp(entry_time or signal_time)
+    label = f"{side[0].upper()}{zone}"
+    position_qty = 1.0 if side == "long" else -1.0
+    cursor = BacktestCursor(
+        processed_bars=1,
+        last_time=latest_timestamp,
+        equity=1000.0,
+        position_qty=position_qty,
+        avg_entry_price=price,
+        entry_side=side,
+        entry_time=entry_timestamp,
+        entry_price=price,
+        zone_events=(label,),
+        zone_event_times=((signal_timestamp, label),),
+        gross_profit=0.0,
+        gross_loss=0.0,
+        trade_count=0,
+        win_count=0,
+        long_zone_used=(zone >= 1, zone >= 2, zone >= 3) if side == "long" else (False, False, False),
+        short_zone_used=(zone >= 1, zone >= 2, zone >= 3) if side == "short" else (False, False, False),
+        last_long_zone=zone if side == "long" else 0,
+        last_short_zone=zone if side == "short" else 0,
+        last_entry_signal_time=signal_timestamp,
+        last_entry_signal_price=price,
+        last_entry_signal_side=side,
+        last_entry_signal_zone=zone,
+        last_equity_value=1000.0,
+    )
+    indicators = pd.DataFrame(
+        {
+            "time": [latest_timestamp],
+            "open": [price],
+            "high": [price + 1.0],
+            "low": [price - 1.0],
+            "close": [price],
+            "volume": [1000.0],
+            "zone2_line": [price - 1.0 if side == "long" else price + 1.0],
+            "zone3_line": [price - 2.0 if side == "long" else price + 2.0],
+            "trend_to_long": [False],
+            "trend_to_short": [False],
+            "final_bull": [False],
+            "final_bear": [False],
+        }
+    )
+    return BacktestResult(
+        settings=StrategySettings(),
+        metrics=StrategyMetrics(1.0, 1.0, 0.0, 1, 100.0, 1.0),
+        trades=[],
+        open_entry_events=((signal_timestamp, label),),
+        indicators=indicators,
+        latest_state={},
+        equity_curve=pd.Series([1000.0], index=[latest_timestamp]),
+        cursor=cursor,
     )
 
 
@@ -166,3 +233,112 @@ def test_trade_engine_drops_symbol_after_auto_close_reports_no_open_position() -
     assert "TESTUSDT" not in engine.filled_fraction_by_symbol
     assert "TESTUSDT" not in engine.auto_close_last_trigger_time
     assert "TESTUSDT" not in engine.auto_close_last_attempt_at
+
+
+def test_trade_engine_enters_fresh_confirmed_new_signal_on_trigger_bar() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.auto_trade_enabled = True
+    engine.client = object()
+    backtest = make_signal_backtest(zone=2, signal_time="2026-01-01 00:15:00")
+    key = ("TESTUSDT", "1m")
+    engine.watchlist[key] = EngineWatchlistItem(
+        symbol="TESTUSDT",
+        interval="1m",
+        score=7.0,
+        return_pct=12.0,
+        strategy_settings=StrategySettings(),
+    )
+    engine.symbol_states[key] = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="1m",
+        strategy_settings=StrategySettings(),
+        backtest=backtest,
+    )
+    submitted: list[dict[str, object]] = []
+    engine._enqueue_open_order = lambda **kwargs: submitted.append(kwargs)
+
+    engine._evaluate_auto_trade(
+        trigger_symbol="TESTUSDT",
+        trigger_interval="1m",
+        trigger_bar_time=pd.Timestamp("2026-01-01 00:15:00"),
+    )
+
+    assert len(submitted) == 1
+    assert submitted[0]["side"] == "BUY"
+    assert round(float(submitted[0]["fraction"]), 2) == 0.50
+
+
+def test_trade_engine_enters_fresh_confirmed_additional_signal_for_open_position() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.auto_trade_enabled = True
+    engine.client = object()
+    backtest = make_signal_backtest(
+        zone=3,
+        signal_time="2026-01-01 00:20:00",
+        entry_time="2026-01-01 00:10:00",
+    )
+    key = ("TESTUSDT", "1m")
+    engine.watchlist[key] = EngineWatchlistItem(
+        symbol="TESTUSDT",
+        interval="1m",
+        score=7.0,
+        return_pct=12.0,
+        strategy_settings=StrategySettings(),
+    )
+    engine.symbol_states[key] = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="1m",
+        strategy_settings=StrategySettings(),
+        backtest=backtest,
+    )
+    engine.open_positions["TESTUSDT"] = make_position()
+    engine.position_intervals["TESTUSDT"] = "1m"
+    engine.filled_fraction_by_symbol["TESTUSDT"] = 0.5
+    engine.auto_trade_cursor_entry_time["TESTUSDT"] = pd.Timestamp("2026-01-01 00:10:00")
+    submitted: list[dict[str, object]] = []
+    engine._enqueue_open_order = lambda **kwargs: submitted.append(kwargs)
+
+    engine._evaluate_auto_trade(
+        trigger_symbol="TESTUSDT",
+        trigger_interval="1m",
+        trigger_bar_time=pd.Timestamp("2026-01-01 00:20:00"),
+    )
+
+    assert len(submitted) == 1
+    assert submitted[0]["side"] == "BUY"
+    assert round(float(submitted[0]["fraction"]), 2) == 0.49
+
+
+def test_trade_engine_skips_stale_confirmed_signal_without_matching_trigger_bar() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.auto_trade_enabled = True
+    engine.client = object()
+    backtest = make_signal_backtest(
+        zone=2,
+        signal_time="2026-01-01 00:15:00",
+        latest_time="2026-01-01 00:16:00",
+    )
+    key = ("TESTUSDT", "1m")
+    engine.watchlist[key] = EngineWatchlistItem(
+        symbol="TESTUSDT",
+        interval="1m",
+        score=7.0,
+        return_pct=12.0,
+        strategy_settings=StrategySettings(),
+    )
+    engine.symbol_states[key] = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="1m",
+        strategy_settings=StrategySettings(),
+        backtest=backtest,
+    )
+    submitted: list[dict[str, object]] = []
+    engine._enqueue_open_order = lambda **kwargs: submitted.append(kwargs)
+
+    engine._evaluate_auto_trade(
+        trigger_symbol="TESTUSDT",
+        trigger_interval="1m",
+        trigger_bar_time=pd.Timestamp("2026-01-01 00:16:00"),
+    )
+
+    assert submitted == []

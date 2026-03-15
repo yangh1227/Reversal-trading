@@ -17,6 +17,9 @@ from alt_reversal_trader.optimizer import (
 )
 from alt_reversal_trader.strategy import StrategyMetrics
 from alt_reversal_trader.strategy import (
+    BacktestCursor,
+    BacktestResult,
+    latest_confirmed_entry_event,
     incremental_signal_fraction_for_entry,
     resume_backtest,
     run_backtest,
@@ -42,6 +45,61 @@ def make_sample_ohlcv(rows: int = 500) -> pd.DataFrame:
             "close": close,
             "volume": volume,
         }
+    )
+
+
+def make_confirmed_entry_backtest(
+    *,
+    open_entry_events: tuple[tuple[pd.Timestamp, str], ...],
+    cursor_signal_time: str | None,
+    cursor_signal_side: str,
+    cursor_signal_zone: int,
+) -> BacktestResult:
+    latest_time = pd.Timestamp("2026-01-01 00:10:00")
+    cursor = BacktestCursor(
+        processed_bars=1,
+        last_time=latest_time,
+        equity=1000.0,
+        position_qty=1.0,
+        avg_entry_price=100.0,
+        entry_side="long",
+        entry_time=latest_time,
+        entry_price=100.0,
+        zone_events=("L1",),
+        zone_event_times=open_entry_events,
+        gross_profit=0.0,
+        gross_loss=0.0,
+        trade_count=0,
+        win_count=0,
+        long_zone_used=(True, False, False),
+        short_zone_used=(False, False, False),
+        last_long_zone=1,
+        last_short_zone=0,
+        last_entry_signal_time=None if cursor_signal_time is None else pd.Timestamp(cursor_signal_time),
+        last_entry_signal_price=100.0,
+        last_entry_signal_side=cursor_signal_side,
+        last_entry_signal_zone=cursor_signal_zone,
+        last_equity_value=1000.0,
+    )
+    indicators = pd.DataFrame(
+        {
+            "time": [latest_time],
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [100.0],
+            "volume": [1000.0],
+        }
+    )
+    return BacktestResult(
+        settings=StrategySettings(),
+        metrics=StrategyMetrics(0.0, 0.0, 0.0, 0, 0.0, 0.0),
+        trades=[],
+        open_entry_events=open_entry_events,
+        indicators=indicators,
+        latest_state={},
+        equity_curve=pd.Series([1000.0], index=[latest_time]),
+        cursor=cursor,
     )
 
 
@@ -102,6 +160,40 @@ def test_signal_fraction_targets_use_total_position_sizes() -> None:
     assert round(incremental_signal_fraction_for_entry(2, 0), 2) == 0.50
     assert round(incremental_signal_fraction_for_entry(2, 1), 2) == 0.17
     assert round(incremental_signal_fraction_for_entry(3, 2), 2) == 0.49
+
+
+def test_latest_confirmed_entry_event_prefers_open_entry_events() -> None:
+    backtest = make_confirmed_entry_backtest(
+        open_entry_events=((pd.Timestamp("2026-01-01 00:10:00"), "S3"),),
+        cursor_signal_time="2026-01-01 00:10:00",
+        cursor_signal_side="long",
+        cursor_signal_zone=1,
+    )
+
+    event = latest_confirmed_entry_event(backtest, pd.Timestamp("2026-01-01 00:10:00"))
+
+    assert event == {
+        "side": "short",
+        "zone": 3,
+        "bar_time": pd.Timestamp("2026-01-01 00:10:00"),
+    }
+
+
+def test_latest_confirmed_entry_event_falls_back_to_cursor_signal() -> None:
+    backtest = make_confirmed_entry_backtest(
+        open_entry_events=(),
+        cursor_signal_time="2026-01-01 00:10:00",
+        cursor_signal_side="short",
+        cursor_signal_zone=2,
+    )
+
+    event = latest_confirmed_entry_event(backtest, pd.Timestamp("2026-01-01 00:10:00"))
+
+    assert event == {
+        "side": "short",
+        "zone": 2,
+        "bar_time": pd.Timestamp("2026-01-01 00:10:00"),
+    }
 
 
 def test_parameter_grid_filters_invalid_combinations() -> None:

@@ -77,6 +77,7 @@ from .strategy import (
     compact_indicator_frame,
     evaluate_latest_state,
     estimate_warmup_bars,
+    latest_confirmed_entry_event,
     prepare_ohlcv,
     resume_backtest,
     run_backtest,
@@ -3076,11 +3077,19 @@ class AltReversalTraderWindow(QMainWindow):
         self.update_positions_table()
         self._refresh_auto_trade_button_state()
 
-    def _run_auto_trade_cycle(self) -> None:
+    def _run_auto_trade_cycle(
+        self,
+        *,
+        trigger_symbol: Optional[str] = None,
+        trigger_interval: Optional[str] = None,
+        trigger_bar_time: Optional[pd.Timestamp] = None,
+    ) -> None:
         if self._trade_engine_alive():
             self._sync_trade_engine_state()
             return
         if not self.auto_trade_enabled:
+            return
+        if trigger_bar_time is None:
             return
         if self._is_refresh_running():
             return
@@ -3095,17 +3104,23 @@ class AltReversalTraderWindow(QMainWindow):
             else:
                 return
         self._refresh_auto_close_monitors()
+        trigger_symbol = str(trigger_symbol or "").upper()
+        trigger_interval = str(trigger_interval or self.current_interval or self.settings.kline_interval)
+        normalized_trigger_time = pd.Timestamp(trigger_bar_time).tz_localize(None)
         open_positions_by_symbol = {position.symbol: position for position in self.open_positions}
         eligible_results = self._eligible_auto_trade_results()
         if not eligible_results:
             return
         try:
-            ticker_map = self.public_client.ticker_24h()
+            ticker_map = {}
         except Exception as exc:
             self.log(f"자동매매 시세 조회 실패: {exc}")
             return
         candidates: List[Dict[str, object]] = []
         for result in eligible_results:
+            interval = result.best_interval or self.settings.kline_interval
+            if result.symbol != trigger_symbol or interval != trigger_interval:
+                continue
             open_position = open_positions_by_symbol.get(result.symbol)
             if open_positions_by_symbol and open_position is None:
                 continue
@@ -3113,14 +3128,11 @@ class AltReversalTraderWindow(QMainWindow):
             signal = _auto_trade_signal_from_backtest(latest_backtest)
             if signal is None:
                 continue
-            ticker = ticker_map.get(result.symbol)
-            if not ticker:
+            confirmed_entry = latest_confirmed_entry_event(latest_backtest, normalized_trigger_time)
+            if confirmed_entry is None:
                 continue
-            current_price = float(ticker.get("lastPrice", 0.0) or 0.0)
-            signal_price = float(signal["price"])
             side = str(signal["side"])
-            favorable = current_price < signal_price if side == "long" else current_price > signal_price
-            if not favorable:
+            if str(confirmed_entry["side"]) != side or int(confirmed_entry["zone"]) != int(signal["zone"]):
                 continue
             fraction = float(signal["fraction"])
             if open_position is not None:
@@ -3137,15 +3149,13 @@ class AltReversalTraderWindow(QMainWindow):
             candidates.append(
                 {
                     "symbol": result.symbol,
-                    "interval": result.best_interval or self.settings.kline_interval,
+                    "interval": interval,
                     "side": "BUY" if side == "long" else "SELL",
                     "score": float(result.score),
                     "return_pct": float(latest_backtest.metrics.total_return_pct),
                     "fraction": float(fraction),
-                    "signal_price": signal_price,
-                    "current_price": current_price,
                     "zone": int(signal["zone"]),
-                    "signal_time": pd.Timestamp(signal["time"]),
+                    "signal_time": pd.Timestamp(confirmed_entry["bar_time"]),
                 }
             )
         chosen = self._pick_auto_trade_candidate(candidates)
@@ -3825,9 +3835,7 @@ class AltReversalTraderWindow(QMainWindow):
             cursor=self.current_backtest.cursor.indicator_cursor,
         )
         latest_time = pd.Timestamp(history["time"].iloc[-1])
-        entry_event = _confirmed_entry_event_from_cursor(
-            self.current_backtest.cursor, latest_time
-        )
+        entry_event = latest_confirmed_entry_event(self.current_backtest, latest_time)
         exit_event = _confirmed_exit_event_from_state(position_qty, latest_state, latest_time)
         next_fast_entry_markers = self._build_fast_entry_markers(entry_event)
         next_fast_exit_markers = self._build_fast_exit_markers(exit_event)
@@ -3927,8 +3935,16 @@ class AltReversalTraderWindow(QMainWindow):
             )
         self.update_summary(symbol, self.current_backtest, self._optimization_result(symbol, self.current_interval))
         self._evaluate_backtest_auto_close(symbol, self.current_backtest)
-        if self.auto_trade_enabled and not self.open_positions and self.auto_trade_entry_pending_symbol is None:
-            QTimer.singleShot(0, self._run_auto_trade_cycle)
+        if self.auto_trade_enabled and self.auto_trade_entry_pending_symbol is None:
+            confirmed_bar_time = pd.Timestamp(history["time"].iloc[-1])
+            QTimer.singleShot(
+                0,
+                lambda: self._run_auto_trade_cycle(
+                    trigger_symbol=symbol,
+                    trigger_interval=self.current_interval,
+                    trigger_bar_time=confirmed_bar_time,
+                ),
+            )
         return True
 
     def _refresh_live_preview_markers(self, symbol: Optional[str]) -> None:
@@ -4916,8 +4932,22 @@ class AltReversalTraderWindow(QMainWindow):
         self._evaluate_closed_bar_auto_close(
             symbol, self._get_history_frame(symbol, self.current_interval)
         )
-        if self.auto_trade_enabled and not self.open_positions and self.auto_trade_entry_pending_symbol is None:
-            QTimer.singleShot(0, self._run_auto_trade_cycle)
+        if self.auto_trade_enabled and self.auto_trade_entry_pending_symbol is None:
+            confirmed_history = self._get_history_frame(symbol, self.current_interval)
+            confirmed_bar_time = (
+                pd.Timestamp(confirmed_history["time"].iloc[-1])
+                if confirmed_history is not None and not confirmed_history.empty
+                else None
+            )
+            if confirmed_bar_time is not None:
+                QTimer.singleShot(
+                    0,
+                    lambda: self._run_auto_trade_cycle(
+                        trigger_symbol=symbol,
+                        trigger_interval=self.current_interval,
+                        trigger_bar_time=confirmed_bar_time,
+                    ),
+                )
         if self.live_recalc_pending:
             self.live_recalc_pending = False
             self._schedule_live_backtest(symbol)

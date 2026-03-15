@@ -163,6 +163,64 @@ def _open_entry_events_from_cursor(cursor: Optional[BacktestCursor]) -> Tuple[Tu
     return tuple((pd.Timestamp(time_value), str(label)) for time_value, label in cursor.zone_event_times)
 
 
+def _normalize_event_timestamp(value: object) -> Optional[pd.Timestamp]:
+    if value is None:
+        return None
+    return pd.Timestamp(value).tz_localize(None)
+
+
+def _entry_event_from_label(event_label: object, event_time: object) -> Optional[Dict[str, object]]:
+    label_text = str(event_label or "").strip().upper()
+    if len(label_text) < 2 or label_text[0] not in {"L", "S"}:
+        return None
+    try:
+        zone = int(label_text[1:])
+    except ValueError:
+        return None
+    if zone not in {1, 2, 3}:
+        return None
+    normalized_time = _normalize_event_timestamp(event_time)
+    if normalized_time is None:
+        return None
+    return {
+        "side": "long" if label_text[0] == "L" else "short",
+        "zone": zone,
+        "bar_time": normalized_time,
+    }
+
+
+def latest_confirmed_entry_event(
+    backtest: Optional["BacktestResult"],
+    confirmed_bar_time: Optional[pd.Timestamp | str],
+) -> Optional[Dict[str, object]]:
+    if backtest is None:
+        return None
+    normalized_bar_time = _normalize_event_timestamp(confirmed_bar_time)
+    if normalized_bar_time is None:
+        return None
+    for event_time, event_label in reversed(list(getattr(backtest, "open_entry_events", ()) or ())):
+        if _normalize_event_timestamp(event_time) != normalized_bar_time:
+            continue
+        event = _entry_event_from_label(event_label, event_time)
+        if event is not None:
+            return event
+    cursor = backtest.cursor
+    if cursor is None:
+        return None
+    signal_time = _normalize_event_timestamp(getattr(cursor, "last_entry_signal_time", None))
+    if signal_time != normalized_bar_time:
+        return None
+    side = str(getattr(cursor, "last_entry_signal_side", "") or "").lower()
+    zone = int(getattr(cursor, "last_entry_signal_zone", 0) or 0)
+    if side not in {"long", "short"} or zone not in {1, 2, 3}:
+        return None
+    return {
+        "side": side,
+        "zone": zone,
+        "bar_time": normalized_bar_time,
+    }
+
+
 def compact_indicator_frame(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
     selected = [column for column in columns if column in df.columns]
     if not selected:

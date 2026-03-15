@@ -20,6 +20,7 @@ from .live_chart_utils import seed_two_minute_aggregate as _seed_two_minute_aggr
 from .strategy import (
     BacktestResult,
     estimate_warmup_bars,
+    latest_confirmed_entry_event,
     prepare_ohlcv,
     resume_backtest,
     run_backtest,
@@ -1003,7 +1004,11 @@ class _TradeEngine:
             )
         self._emit_signal_event(state)
         self._evaluate_backtest_auto_close(state)
-        self._evaluate_auto_trade()
+        self._evaluate_auto_trade(
+            trigger_symbol=symbol,
+            trigger_interval=interval,
+            trigger_bar_time=pd.Timestamp(bar["time"]),
+        )
 
     def _emit_signal_event(self, state: _EngineSymbolState) -> None:
         if state.backtest is None:
@@ -1121,21 +1126,29 @@ class _TradeEngine:
         return_tied = [item for item in score_tied if float(item["return_pct"]) == best_return]
         return random.choice(return_tied)
 
-    def _evaluate_auto_trade(self) -> None:
+    def _evaluate_auto_trade(
+        self,
+        *,
+        trigger_symbol: Optional[str] = None,
+        trigger_interval: Optional[str] = None,
+        trigger_bar_time: Optional[pd.Timestamp] = None,
+    ) -> None:
         if not self.auto_trade_enabled or self.client is None:
             return
+        if trigger_bar_time is None:
+            return
+        trigger_symbol = str(trigger_symbol or "").upper()
+        trigger_interval = str(trigger_interval or self.default_interval)
+        normalized_trigger_time = pd.Timestamp(trigger_bar_time).tz_localize(None)
         eligible_items = list(self.watchlist.values())
         if not eligible_items:
-            return
-        try:
-            ticker_map = self.client.ticker_24h()
-        except Exception as exc:
-            self.log(f"Trade engine auto-trade ticker lookup failed: {exc}")
             return
         open_positions_by_symbol = dict(self.open_positions)
         candidates: List[Dict[str, object]] = []
         for item in eligible_items:
             if item.symbol in self.pending_order_symbols:
+                continue
+            if item.symbol != trigger_symbol or item.interval != trigger_interval:
                 continue
             open_position = open_positions_by_symbol.get(item.symbol)
             if open_positions_by_symbol and open_position is None:
@@ -1150,12 +1163,12 @@ class _TradeEngine:
             signal = _auto_trade_signal_from_backtest(latest_backtest)
             if signal is None:
                 continue
-            ticker = ticker_map.get(item.symbol)
-            if not ticker:
+            confirmed_entry = latest_confirmed_entry_event(latest_backtest, normalized_trigger_time)
+            if confirmed_entry is None:
                 continue
-            current_price = float(ticker.get("lastPrice", 0.0) or 0.0)
-            signal_price = float(signal["price"])
             side = str(signal["side"])
+            if str(confirmed_entry["side"]) != side or int(confirmed_entry["zone"]) != int(signal["zone"]):
+                continue
             # Skip entry when the backtest's exit condition is already active for
             # this direction: the auto-close would fire immediately, causing a
             # wasteful enter→close→re-enter cycle on the same bar.
@@ -1170,7 +1183,6 @@ class _TradeEngine:
                 ):
                     continue
             fraction = float(signal["fraction"])
-            zone_prices = dict(signal.get("zone_prices") or {})
             if open_position is not None:
                 position_side = "long" if float(open_position.amount) > 0 else "short"
                 if side != position_side:
@@ -1195,32 +1207,7 @@ class _TradeEngine:
                 # signal first appears (same bar).  On subsequent bars, use
                 # zone-level favorable price checks so that each zone enters
                 # independently at its own price threshold.
-                signal_time = signal.get("time")
-                latest_bar_time = (
-                    pd.Timestamp(latest_backtest.indicators["time"].iloc[-1])
-                    if not latest_backtest.indicators.empty
-                    else None
-                )
-                is_fresh_signal = (
-                    signal_time is not None
-                    and latest_bar_time is not None
-                    and pd.Timestamp(signal_time).tz_localize(None) == pd.Timestamp(latest_bar_time).tz_localize(None)
-                )
-                if not is_fresh_signal:
-                    favorable_fraction = _zone_favorable_fraction(
-                        side, current_price, signal_price, zone_prices, float(filled_fraction),
-                    )
-                    if favorable_fraction <= 1e-9:
-                        continue
-                    fraction = min(fraction, favorable_fraction)
-            else:
-                # New entry: enter at favorable price per zone level.
-                favorable_fraction = _zone_favorable_fraction(
-                    side, current_price, signal_price, zone_prices, 0.0,
-                )
-                if favorable_fraction <= 1e-9:
-                    continue
-                fraction = min(fraction, favorable_fraction)
+                
             candidates.append(
                 {
                     "symbol": item.symbol,
