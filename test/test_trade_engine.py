@@ -5,7 +5,7 @@ import pandas as pd
 from alt_reversal_trader.binance_futures import PositionSnapshot
 from alt_reversal_trader.config import StrategySettings
 from alt_reversal_trader.strategy import run_backtest
-from alt_reversal_trader.trade_engine import EngineWatchlistItem, _EngineSymbolState, _TradeEngine
+from alt_reversal_trader.trade_engine import EngineWatchlistItem, _EngineSymbolState, _OrderExecutionResult, _TradeEngine
 
 
 def make_sample_ohlcv(rows: int = 500) -> pd.DataFrame:
@@ -137,3 +137,32 @@ def test_trade_engine_rebuilds_changed_state_from_cached_history_without_refetch
     assert state.loading is False
     assert state.backtest is not None
     assert state.backtest.settings == new_settings
+
+
+def test_trade_engine_drops_symbol_after_auto_close_reports_no_open_position() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.open_positions["TESTUSDT"] = make_position()
+    engine.filled_fraction_by_symbol["TESTUSDT"] = 0.5
+    engine.auto_close_last_trigger_time["TESTUSDT"] = pd.Timestamp("2026-01-01 00:00:00")
+    engine.auto_close_last_attempt_at["TESTUSDT"] = 123.0
+    engine.order_result_queue.put(
+        _OrderExecutionResult(
+            symbol="TESTUSDT",
+            success=True,
+            message="TESTUSDT close skipped: no open position",
+            auto_close=True,
+            auto_trade=False,
+            interval="1m",
+            fraction=0.0,
+            strategy_settings=None,
+            no_open_position=True,
+        )
+    )
+    engine._refresh_positions = lambda force=False: None
+
+    engine._drain_order_results()
+
+    assert "TESTUSDT" not in engine.open_positions
+    assert "TESTUSDT" not in engine.filled_fraction_by_symbol
+    assert "TESTUSDT" not in engine.auto_close_last_trigger_time
+    assert "TESTUSDT" not in engine.auto_close_last_attempt_at

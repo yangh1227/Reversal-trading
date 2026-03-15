@@ -174,6 +174,7 @@ class _OrderExecutionResult:
     interval: Optional[str]
     fraction: float
     strategy_settings: Optional[StrategySettings]
+    no_open_position: bool = False
 
 
 def _interval_to_ms(interval: str) -> int:
@@ -298,13 +299,55 @@ def _auto_trade_signal_from_backtest(backtest: BacktestResult) -> Optional[Dict[
     signal_time = cursor.last_entry_signal_time or cursor.entry_time
     if side not in {"long", "short"} or zone not in {1, 2, 3} or price <= 0 or signal_time is None:
         return None
+    # Extract per-zone price thresholds from the latest indicator bar so
+    # that _evaluate_auto_trade can perform zone-level favorable checks.
+    zone_prices: Dict[int, float] = {}
+    indicators = backtest.indicators
+    if not indicators.empty:
+        latest = indicators.iloc[-1]
+        for z, col in ((2, "zone2_line"), (3, "zone3_line")):
+            if col in latest.index and pd.notna(latest[col]):
+                zone_prices[z] = float(latest[col])
     return {
         "side": side,
         "zone": zone,
         "price": price,
+        "zone_prices": zone_prices,
         "time": pd.Timestamp(signal_time),
         "fraction": signal_fraction_for_zone(zone),
+        "cursor_entry_time": pd.Timestamp(cursor.entry_time) if cursor.entry_time is not None else None,
     }
+
+
+def _zone_favorable_fraction(
+    side: str,
+    current_price: float,
+    signal_price: float,
+    zone_prices: Dict[int, float],
+    filled_fraction: float,
+) -> float:
+    """Return the enterable fraction based on per-zone favorable price checks.
+
+    Checks zone thresholds from highest (3) to lowest (2).  When the current
+    price is favorable for a zone whose target fraction exceeds what has
+    already been filled, the remaining portion for that zone is returned.
+    Falls back to ``signal_price`` when no zone-level prices are available.
+    """
+    for z in (3, 2):
+        zp = zone_prices.get(z)
+        if zp is None or zp <= 0:
+            continue
+        favorable = current_price < zp if side == "long" else current_price > zp
+        if favorable:
+            zone_fraction = signal_fraction_for_zone(z)
+            remaining = max(0.0, zone_fraction - filled_fraction)
+            if remaining > 1e-9:
+                return remaining
+    # Fallback: use the signal price (covers zone 1 or missing zone lines).
+    favorable = current_price < signal_price if side == "long" else current_price > signal_price
+    if favorable:
+        return max(0.0, signal_fraction_for_zone(1) - filled_fraction)
+    return 0.0
 
 
 def _inferred_auto_trade_fraction(backtest: BacktestResult, position: Optional[PositionSnapshot]) -> float:
@@ -475,9 +518,10 @@ class _OrderExecutor(threading.Thread):
                 client = BinanceFuturesClient(request.api_key, request.api_secret)
                 if request.side is None:
                     result = client.close_position(request.symbol)
+                    no_open_position = result is None
                     message = (
                         f"{request.symbol} close skipped: no open position"
-                        if result is None
+                        if no_open_position
                         else f"{request.symbol} close completed: orderId={result.get('orderId')}"
                     )
                     payload = _OrderExecutionResult(
@@ -489,6 +533,7 @@ class _OrderExecutor(threading.Thread):
                         interval=request.interval,
                         fraction=float(request.fraction or 0.0),
                         strategy_settings=request.strategy_settings,
+                        no_open_position=no_open_position,
                     )
                 else:
                     if request.margin is not None:
@@ -513,6 +558,7 @@ class _OrderExecutor(threading.Thread):
                         interval=request.interval,
                         fraction=float(request.fraction or 0.0),
                         strategy_settings=request.strategy_settings,
+                        no_open_position=False,
                     )
                 self.result_queue.put(payload)
             except Exception:
@@ -525,6 +571,7 @@ class _OrderExecutor(threading.Thread):
                     interval=request.interval,
                     fraction=float(request.fraction or 0.0),
                     strategy_settings=request.strategy_settings,
+                    no_open_position=False,
                 )
                 try:
                     self.result_queue.put(payload)
@@ -614,6 +661,7 @@ class _TradeEngine:
         self.streams: Dict[Tuple[str, str], Tuple[_EngineKlineStream, threading.Event]] = {}
         self.open_positions: Dict[str, PositionSnapshot] = {}
         self.filled_fraction_by_symbol: Dict[str, float] = {}
+        self.auto_trade_cursor_entry_time: Dict[str, pd.Timestamp] = {}
         self.position_strategy_by_symbol: Dict[str, StrategySettings] = {}
         self.pending_order_symbols: Dict[str, float] = {}
         self.auto_close_last_trigger_time: Dict[str, pd.Timestamp] = {}
@@ -636,8 +684,8 @@ class _TradeEngine:
         self.emit(EngineHealthEvent("ready", "trade engine started"))
         while not self.stop_event.is_set():
             self._drain_commands()
-            self._drain_internal_events()
             self._drain_order_results()
+            self._drain_internal_events()
             now = time.time()
             if self.api_key and self.api_secret and now - self.last_position_refresh_at >= POSITION_REFRESH_INTERVAL_SECONDS:
                 self._refresh_positions()
@@ -694,6 +742,10 @@ class _TradeEngine:
             if not isinstance(result, _OrderExecutionResult):
                 continue
             self.pending_order_symbols.pop(result.symbol, None)
+            if result.no_open_position:
+                self.open_positions.pop(result.symbol, None)
+                self.filled_fraction_by_symbol.pop(result.symbol, None)
+                self.auto_trade_cursor_entry_time.pop(result.symbol, None)
             if result.auto_close and result.success:
                 self.auto_close_last_trigger_time.pop(result.symbol, None)
                 self.auto_close_last_attempt_at.pop(result.symbol, None)
@@ -770,6 +822,7 @@ class _TradeEngine:
             self.client = None
             self.open_positions.clear()
             self.filled_fraction_by_symbol.clear()
+            self.auto_trade_cursor_entry_time.clear()
         self._ensure_active_states()
 
     def _refresh_positions(self, force: bool = False) -> None:
@@ -789,6 +842,11 @@ class _TradeEngine:
         self.filled_fraction_by_symbol = {
             symbol: fraction
             for symbol, fraction in self.filled_fraction_by_symbol.items()
+            if symbol in open_symbols
+        }
+        self.auto_trade_cursor_entry_time = {
+            symbol: t
+            for symbol, t in self.auto_trade_cursor_entry_time.items()
             if symbol in open_symbols
         }
         for symbol in list(self.position_strategy_by_symbol):
@@ -1006,6 +1064,27 @@ class _TradeEngine:
             self.auto_close_last_trigger_time[symbol] = bar_time
         self._enqueue_close_order(symbol, reason, auto_close=True)
 
+    def _trigger_reentry_auto_close(self, symbol: str, position_side: str, backtest: BacktestResult) -> None:
+        """Trigger auto-close when the backtest closed and re-entered (close→reopen).
+
+        Scans backtest trades for the most recent non-end_of_test exit matching
+        *position_side* and uses its reason to trigger auto-close for the real
+        exchange position.
+        """
+        if symbol in self.pending_order_symbols:
+            return
+        for trade in reversed(backtest.trades):
+            if str(trade.reason) == "end_of_test":
+                continue
+            if str(trade.side).lower() == position_side:
+                exit_event = {
+                    "side": position_side,
+                    "reason": str(trade.reason),
+                    "bar_time": pd.Timestamp(trade.exit_time),
+                }
+                self._maybe_trigger_auto_close(symbol, exit_event)
+                return
+
     def _retry_auto_close_orders(self) -> None:
         for symbol in sorted(self._managed_auto_close_symbols()):
             if symbol in self.pending_order_symbols:
@@ -1045,8 +1124,6 @@ class _TradeEngine:
     def _evaluate_auto_trade(self) -> None:
         if not self.auto_trade_enabled or self.client is None:
             return
-        if self.pending_order_symbols:
-            return
         eligible_items = list(self.watchlist.values())
         if not eligible_items:
             return
@@ -1058,6 +1135,8 @@ class _TradeEngine:
         open_positions_by_symbol = dict(self.open_positions)
         candidates: List[Dict[str, object]] = []
         for item in eligible_items:
+            if item.symbol in self.pending_order_symbols:
+                continue
             open_position = open_positions_by_symbol.get(item.symbol)
             if open_positions_by_symbol and open_position is None:
                 continue
@@ -1091,10 +1170,20 @@ class _TradeEngine:
                 ):
                     continue
             fraction = float(signal["fraction"])
+            zone_prices = dict(signal.get("zone_prices") or {})
             if open_position is not None:
                 position_side = "long" if float(open_position.amount) > 0 else "short"
                 if side != position_side:
                     continue
+                # Detect close→reopen: the backtest closed the position and
+                # re-entered, but the real exchange position hasn't been closed
+                # yet.  Skip entry and let auto-close handle the old position.
+                cursor_entry_time = signal.get("cursor_entry_time")
+                remembered = self.auto_trade_cursor_entry_time.get(item.symbol)
+                if remembered is not None and cursor_entry_time is not None:
+                    if pd.Timestamp(remembered).tz_localize(None) != pd.Timestamp(cursor_entry_time).tz_localize(None):
+                        self._trigger_reentry_auto_close(item.symbol, position_side, latest_backtest)
+                        continue
                 filled_fraction = self.filled_fraction_by_symbol.get(
                     item.symbol,
                     _inferred_auto_trade_fraction(latest_backtest, open_position),
@@ -1103,8 +1192,9 @@ class _TradeEngine:
                 if fraction <= 1e-9:
                     continue
                 # Additional entry (e.g. L2→L3): enter immediately when the
-                # signal first appears (same bar).  On subsequent bars, fall
-                # back to the favorable-price gate to avoid chasing.
+                # signal first appears (same bar).  On subsequent bars, use
+                # zone-level favorable price checks so that each zone enters
+                # independently at its own price threshold.
                 signal_time = signal.get("time")
                 latest_bar_time = (
                     pd.Timestamp(latest_backtest.indicators["time"].iloc[-1])
@@ -1117,14 +1207,20 @@ class _TradeEngine:
                     and pd.Timestamp(signal_time).tz_localize(None) == pd.Timestamp(latest_bar_time).tz_localize(None)
                 )
                 if not is_fresh_signal:
-                    favorable = current_price < signal_price if side == "long" else current_price > signal_price
-                    if not favorable:
+                    favorable_fraction = _zone_favorable_fraction(
+                        side, current_price, signal_price, zone_prices, float(filled_fraction),
+                    )
+                    if favorable_fraction <= 1e-9:
                         continue
+                    fraction = min(fraction, favorable_fraction)
             else:
-                # New entry: only enter at favorable price (counter-trend).
-                favorable = current_price < signal_price if side == "long" else current_price > signal_price
-                if not favorable:
+                # New entry: enter at favorable price per zone level.
+                favorable_fraction = _zone_favorable_fraction(
+                    side, current_price, signal_price, zone_prices, 0.0,
+                )
+                if favorable_fraction <= 1e-9:
                     continue
+                fraction = min(fraction, favorable_fraction)
             candidates.append(
                 {
                     "symbol": item.symbol,
@@ -1134,13 +1230,21 @@ class _TradeEngine:
                     "return_pct": float(latest_backtest.metrics.total_return_pct),
                     "fraction": float(fraction),
                     "strategy_settings": item.strategy_settings,
+                    "cursor_entry_time": signal.get("cursor_entry_time"),
                 }
             )
         chosen = self._pick_auto_trade_candidate(candidates)
         if chosen is None:
             return
+        # Remember the cursor entry_time on first entry so we can detect
+        # close→reopen cycles on subsequent evaluations.
+        symbol = str(chosen["symbol"])
+        if symbol not in self.auto_trade_cursor_entry_time:
+            cet = chosen.get("cursor_entry_time")
+            if cet is not None:
+                self.auto_trade_cursor_entry_time[symbol] = pd.Timestamp(cet)
         self._enqueue_open_order(
-            symbol=str(chosen["symbol"]),
+            symbol=symbol,
             interval=str(chosen["interval"]),
             side=str(chosen["side"]),
             fraction=float(chosen["fraction"]),

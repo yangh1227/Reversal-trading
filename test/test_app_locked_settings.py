@@ -92,3 +92,30 @@ def test_showing_optimized_chart_depends_on_current_backtest_settings() -> None:
     assert "self.current_backtest is None" in source_segment
     assert "self.current_backtest.settings == optimization.best_backtest.settings" in source_segment
     assert "self.current_chart_prefers_locked_position_settings" not in source_segment
+
+
+def test_close_selected_position_requires_confirmation() -> None:
+    method = _window_method_node("close_selected_position")
+    source_segment = ast.get_source_segment(APP_PATH.read_text(encoding="utf-8"), method) or ""
+
+    assert "QMessageBox.question" in source_segment
+    assert "전체청산 확인" in source_segment
+    assert "포지션을 전체청산할까요?" in source_segment
+
+
+def test_live_order_close_button_uses_total_close_label() -> None:
+    source = APP_PATH.read_text(encoding="utf-8")
+
+    assert 'QPushButton("전체청산")' in source
+    assert 'setFixedWidth(156)' in source
+
+
+def test_preview_and_fast_markers_use_unified_signal_text() -> None:
+    source = APP_PATH.read_text(encoding="utf-8")
+
+    assert '"text": "예상청산신호"' in source
+    assert '예상진입신호' in source
+    assert '"opposite_signal": "예상청산신호"' in source
+    assert "_auto_close_reason_text(reason)" not in ast.get_source_segment(
+        source, _window_method_node("_build_fast_exit_markers")
+    )

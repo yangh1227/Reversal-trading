@@ -3,11 +3,12 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import os
 from pathlib import Path
+import sys
 from typing import Any, Dict, List, Sequence
 import json
 
 
-APP_CONFIG_PATH = Path("alt_reversal_trader_config.json")
+APP_CONFIG_FILENAME = "alt_reversal_trader_config.json"
 APP_INTERVAL_OPTIONS = ("1m", "2m", "3m", "5m", "15m")
 CHART_ENGINE_OPTIONS = ("Lightweight",)
 OPTIMIZATION_RANK_MODE_OPTIONS = ("score", "return")
@@ -26,6 +27,38 @@ QIP_SENSITIVITY_OPTIONS = (
 )
 
 
+def _app_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def _user_config_dir() -> Path:
+    appdata = os.environ.get("APPDATA", "").strip()
+    if appdata:
+        return Path(appdata).resolve() / "AltReversalTrader"
+    return Path.home().resolve() / ".alt_reversal_trader"
+
+
+def default_config_path() -> Path:
+    return _user_config_dir() / APP_CONFIG_FILENAME
+
+
+APP_CONFIG_PATH = default_config_path()
+
+
+def _load_path_candidates(path: Path) -> List[Path]:
+    candidates = [path]
+    legacy_candidates = [
+        _app_base_dir() / path.name,
+        Path.cwd() / path.name,
+    ]
+    for legacy_path in legacy_candidates:
+        if legacy_path not in candidates:
+            candidates.append(legacy_path)
+    return candidates
+
+
 def default_optimize_process_count() -> int:
     cpu_count = os.cpu_count() or 2
     return max(1, min(4, cpu_count - 1))
@@ -34,16 +67,16 @@ def default_optimize_process_count() -> int:
 @dataclass(frozen=True)
 class StrategySettings:
     atr_period: int = 10
-    factor: float = 3.0
-    zone_sensitivity: float = 1.0
-    sensitivity_mode: str = "5-Normal"
+    factor: float = 17.0
+    zone_sensitivity: float = 8.0
+    sensitivity_mode: str = "10-Ultra Broad Max"
     zz_len_raw: int = 5
     atr_mult_raw: float = 1.5
     use_volume: bool = True
     use_rsi_div: bool = True
-    use_macd_div: bool = False
+    use_macd_div: bool = True
     use_ema_conf: bool = True
-    min_score: int = 2
+    min_score: int = 3
     qip_rsi_len: int = 14
     vol_ma_len: int = 20
     qip_ema_fast: int = 21
@@ -51,7 +84,7 @@ class StrategySettings:
     qip_use_rsi_zone: bool = True
     qip_rsi_bull_max: int = 40
     qip_rsi_bear_min: int = 60
-    qtp_sensitivity: int = 60
+    qtp_sensitivity: int = 10
     qtp_ema_fast_len: int = 20
     qtp_ema_slow_len: int = 50
     qtp_use_trend: bool = True
@@ -67,7 +100,7 @@ class StrategySettings:
     qtp_rsi_bear_min: int = 70
     use_qip: bool = True
     use_qtp: bool = True
-    beast_mode: bool = False
+    beast_mode: bool = True
     entry_size_pct: float = 10.0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -79,28 +112,28 @@ class AppSettings:
     api_key: str = ""
     api_secret: str = ""
     chart_engine: str = "Lightweight"
-    leverage: int = 3
+    leverage: int = 2
     order_mode: str = "compound"
     simple_order_amount: float = 50.0
     fee_rate: float = 0.0005
-    history_days: int = 5
+    history_days: int = 3
     kline_interval: str = "1m"
-    daily_volatility_min: float = 25.0
-    quote_volume_min: float = 1_000_000.0
-    use_rsi_filter: bool = True
+    daily_volatility_min: float = 20.0
+    quote_volume_min: float = 10_000_000.0
+    use_rsi_filter: bool = False
     rsi_length: int = 14
     rsi_lower: float = 40.0
     rsi_upper: float = 60.0
-    use_atr_4h_filter: bool = True
+    use_atr_4h_filter: bool = False
     atr_4h_min_pct: float = 10.0
     optimization_span_pct: float = 20.0
     optimization_steps: int = 5
     optimization_rank_mode: str = "score"
-    optimization_min_score: float = 0.0
+    optimization_min_score: float = 70.0
     optimization_min_return_pct: float = 0.0
-    max_grid_combinations: int = 729
+    max_grid_combinations: int = 300
     scan_workers: int = 4
-    optimize_processes: int = field(default_factory=default_optimize_process_count)
+    optimize_processes: int = 8
     optimize_timeframe: bool = True
     strategy: StrategySettings = field(default_factory=StrategySettings)
     optimize_flags: Dict[str, bool] = field(default_factory=dict)
@@ -188,15 +221,25 @@ class AppSettings:
         return settings
 
     @classmethod
-    def load(cls, path: Path = APP_CONFIG_PATH) -> "AppSettings":
-        if not path.exists():
-            return cls()
-        with path.open("r", encoding="utf-8") as file:
-            return cls.from_dict(json.load(file))
+    def load(cls, path: Path | None = None) -> "AppSettings":
+        resolved_path = Path(path) if path is not None else default_config_path()
+        for candidate in _load_path_candidates(resolved_path):
+            if not candidate.exists():
+                continue
+            with candidate.open("r", encoding="utf-8") as file:
+                settings = cls.from_dict(json.load(file))
+            if candidate != resolved_path:
+                settings.save(resolved_path)
+            return settings
+        return cls()
 
-    def save(self, path: Path = APP_CONFIG_PATH) -> None:
-        with path.open("w", encoding="utf-8") as file:
+    def save(self, path: Path | None = None) -> None:
+        resolved_path = Path(path) if path is not None else default_config_path()
+        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = resolved_path.with_suffix(resolved_path.suffix + ".tmp")
+        with temp_path.open("w", encoding="utf-8") as file:
             json.dump(self.to_dict(), file, ensure_ascii=False, indent=2)
+        temp_path.replace(resolved_path)
 
 
 @dataclass(frozen=True)
@@ -255,4 +298,41 @@ PARAMETER_SPECS: List[ParameterSpec] = [
     ParameterSpec("beast_mode", "Beast Mode", "switches", "bool", optimize_priority=10),
 ]
 
-DEFAULT_OPTIMIZE_FLAGS: Dict[str, bool] = {spec.key: spec.optimize_default for spec in PARAMETER_SPECS}
+DEFAULT_OPTIMIZE_FLAGS: Dict[str, bool] = {
+    "atr_period": True,
+    "factor": True,
+    "zone_sensitivity": True,
+    "entry_size_pct": False,
+    "sensitivity_mode": True,
+    "zz_len_raw": True,
+    "atr_mult_raw": True,
+    "use_volume": True,
+    "use_rsi_div": True,
+    "use_macd_div": True,
+    "use_ema_conf": True,
+    "min_score": True,
+    "qip_rsi_len": True,
+    "vol_ma_len": True,
+    "qip_ema_fast": True,
+    "qip_ema_slow": True,
+    "qip_use_rsi_zone": True,
+    "qip_rsi_bull_max": True,
+    "qip_rsi_bear_min": True,
+    "qtp_sensitivity": True,
+    "qtp_ema_fast_len": True,
+    "qtp_ema_slow_len": True,
+    "qtp_use_trend": True,
+    "qtp_rsi_len": True,
+    "qtp_stoch_len": True,
+    "qtp_atr_len": True,
+    "qtp_dev_lookback": True,
+    "qtp_vol_len": True,
+    "qtp_min_pvt_left": True,
+    "qtp_max_pvt_left": True,
+    "qtp_use_rsi_zone": True,
+    "qtp_rsi_bull_max": True,
+    "qtp_rsi_bear_min": True,
+    "use_qip": True,
+    "use_qtp": True,
+    "beast_mode": True,
+}

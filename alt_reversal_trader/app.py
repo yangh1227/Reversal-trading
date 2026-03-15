@@ -488,7 +488,7 @@ def _auto_close_reason_text(reason: str) -> str:
     labels = {
         "trend_to_long": "추세 전환 LONG",
         "trend_to_short": "추세 전환 SHORT",
-        "opposite_signal": "반대 신호",
+        "opposite_signal": "예상청산신호",
     }
     return labels.get(reason, reason)
 
@@ -1891,11 +1891,11 @@ class AltReversalTraderWindow(QMainWindow):
 
         simple_layout.addLayout(simple_amount_row)
         simple_layout.addLayout(simple_button_row)
-        self.close_position_button = QPushButton("포지션 청산")
+        self.close_position_button = QPushButton("전체청산")
         self.close_position_button.clicked.connect(self.close_selected_position)
-        self.close_position_button.setText("청산")
-        self.close_position_button.setFixedWidth(88)
-        self.close_position_button.setToolTip("선택 종목 포지션 청산")
+        self.close_position_button.setText("전체청산")
+        self.close_position_button.setFixedWidth(156)
+        self.close_position_button.setToolTip("현재 선택 종목 포지션 전체 청산")
         close_row = QHBoxLayout()
         close_row.addStretch(1)
         close_row.addWidget(self.close_position_button)
@@ -3725,7 +3725,7 @@ class AltReversalTraderWindow(QMainWindow):
                     "position": "above" if side == "long" else "below",
                     "shape": "circle",
                     "color": "#ff9f1a",
-                    "text": f"청산예상 {_auto_close_reason_text(reason)}",
+                    "text": "예상청산신호",
                 }
             )
         entry_signal = _preview_entry_signal(self.current_backtest.cursor, latest_state, self.current_backtest.settings)
@@ -3737,7 +3737,7 @@ class AltReversalTraderWindow(QMainWindow):
                     "position": "below" if side == "long" else "above",
                     "shape": "arrow_up" if side == "long" else "arrow_down",
                     "color": "#ffb020",
-                    "text": f"진입예상 {side[0].upper()}{zone}",
+                    "text": f"{side[0].upper()}{zone} 예상진입신호",
                 }
             )
         return preview_markers
@@ -3756,7 +3756,7 @@ class AltReversalTraderWindow(QMainWindow):
                 "position": "above" if side == "long" else "below",
                 "shape": "circle",
                 "color": "#f801e8",
-                "text": _auto_close_reason_text(reason),
+                "text": "예상청산신호",
             }
         ]
 
@@ -3774,7 +3774,7 @@ class AltReversalTraderWindow(QMainWindow):
                 "position": "below" if side == "long" else "above",
                 "shape": "arrow_up" if side == "long" else "arrow_down",
                 "color": "#17c964" if side == "long" else "#f31260",
-                "text": f"{side[0].upper()}{zone}",
+                "text": f"{side[0].upper()}{zone} 예상진입신호",
             }
         ]
 
@@ -6369,6 +6369,21 @@ class AltReversalTraderWindow(QMainWindow):
     def close_selected_position(self) -> None:
         if not self.current_symbol:
             self.show_warning("종목을 먼저 선택하세요.")
+            return
+        yes_button = getattr(QMessageBox, "Yes", None)
+        no_button = getattr(QMessageBox, "No", None)
+        if yes_button is None or no_button is None:
+            standard_button = getattr(QMessageBox, "StandardButton", None)
+            yes_button = standard_button.Yes
+            no_button = standard_button.No
+        answer = QMessageBox.question(
+            self,
+            "전체청산 확인",
+            f"{self.current_symbol} 포지션을 전체청산할까요?",
+            yes_button | no_button,
+            no_button,
+        )
+        if answer != yes_button:
             return
         self.close_position_for_symbol(self.current_symbol)
 
