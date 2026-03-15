@@ -18,6 +18,7 @@ from .config import APP_INTERVAL_OPTIONS, StrategySettings
 from .live_chart_utils import merge_live_bar as _merge_live_bar
 from .live_chart_utils import seed_two_minute_aggregate as _seed_two_minute_aggregate
 from .strategy import (
+    active_entry_price_by_zone,
     BacktestResult,
     estimate_warmup_bars,
     latest_confirmed_entry_event,
@@ -300,20 +301,11 @@ def _auto_trade_signal_from_backtest(backtest: BacktestResult) -> Optional[Dict[
     signal_time = cursor.last_entry_signal_time or cursor.entry_time
     if side not in {"long", "short"} or zone not in {1, 2, 3} or price <= 0 or signal_time is None:
         return None
-    # Extract per-zone price thresholds from the latest indicator bar so
-    # that _evaluate_auto_trade can perform zone-level favorable checks.
-    zone_prices: Dict[int, float] = {}
-    indicators = backtest.indicators
-    if not indicators.empty:
-        latest = indicators.iloc[-1]
-        for z, col in ((2, "zone2_line"), (3, "zone3_line")):
-            if col in latest.index and pd.notna(latest[col]):
-                zone_prices[z] = float(latest[col])
     return {
         "side": side,
         "zone": zone,
         "price": price,
-        "zone_prices": zone_prices,
+        "zone_prices": active_entry_price_by_zone(backtest),
         "time": pd.Timestamp(signal_time),
         "fraction": signal_fraction_for_zone(zone),
         "cursor_entry_time": pd.Timestamp(cursor.entry_time) if cursor.entry_time is not None else None,
@@ -327,13 +319,7 @@ def _zone_favorable_fraction(
     zone_prices: Dict[int, float],
     filled_fraction: float,
 ) -> float:
-    """Return the enterable fraction based on per-zone favorable price checks.
-
-    Checks zone thresholds from highest (3) to lowest (2).  When the current
-    price is favorable for a zone whose target fraction exceeds what has
-    already been filled, the remaining portion for that zone is returned.
-    Falls back to ``signal_price`` when no zone-level prices are available.
-    """
+    """Return the enterable fraction based on confirmed entry prices by zone."""
     for z in (3, 2):
         zp = zone_prices.get(z)
         if zp is None or zp <= 0:

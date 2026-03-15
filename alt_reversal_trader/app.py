@@ -72,6 +72,7 @@ from .qt_compat import (
     Signal,
 )
 from .strategy import (
+    active_entry_price_by_zone,
     CHART_INDICATOR_COLUMNS,
     BacktestResult,
     compact_indicator_frame,
@@ -708,18 +709,11 @@ def _auto_trade_signal_from_backtest(backtest: BacktestResult) -> Optional[Dict[
     signal_time = cursor.last_entry_signal_time or cursor.entry_time
     if side not in {"long", "short"} or zone not in {1, 2, 3} or price <= 0 or signal_time is None:
         return None
-    zone_prices: Dict[int, float] = {}
-    indicators = backtest.indicators
-    if not indicators.empty:
-        latest = indicators.iloc[-1]
-        for z, col in ((2, "zone2_line"), (3, "zone3_line")):
-            if col in latest.index and pd.notna(latest[col]):
-                zone_prices[z] = float(latest[col])
     return {
         "side": side,
         "zone": zone,
         "price": price,
-        "zone_prices": zone_prices,
+        "zone_prices": active_entry_price_by_zone(backtest),
         "time": pd.Timestamp(signal_time),
         "fraction": _signal_fraction_for_zone(zone),
     }

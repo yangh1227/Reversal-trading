@@ -106,6 +106,68 @@ def make_signal_backtest(
     )
 
 
+def make_stale_multi_zone_backtest() -> BacktestResult:
+    indicators = pd.DataFrame(
+        {
+            "time": [
+                pd.Timestamp("2026-01-01 00:10:00"),
+                pd.Timestamp("2026-01-01 00:20:00"),
+                pd.Timestamp("2026-01-01 00:30:00"),
+            ],
+            "open": [100.0, 120.0, 110.0],
+            "high": [101.0, 121.0, 111.0],
+            "low": [99.0, 119.0, 109.0],
+            "close": [100.0, 120.0, 110.0],
+            "volume": [1000.0, 1000.0, 1000.0],
+            "trend_to_long": [False, False, False],
+            "trend_to_short": [False, False, False],
+            "final_bull": [False, False, False],
+            "final_bear": [False, False, False],
+        }
+    )
+    cursor = BacktestCursor(
+        processed_bars=3,
+        last_time=pd.Timestamp("2026-01-01 00:30:00"),
+        equity=1000.0,
+        position_qty=-1.0,
+        avg_entry_price=110.0,
+        entry_side="short",
+        entry_time=pd.Timestamp("2026-01-01 00:10:00"),
+        entry_price=100.0,
+        zone_events=("S2", "S3"),
+        zone_event_times=(
+            (pd.Timestamp("2026-01-01 00:10:00"), "S2"),
+            (pd.Timestamp("2026-01-01 00:20:00"), "S3"),
+        ),
+        gross_profit=0.0,
+        gross_loss=0.0,
+        trade_count=0,
+        win_count=0,
+        long_zone_used=(False, False, False),
+        short_zone_used=(False, True, True),
+        last_long_zone=0,
+        last_short_zone=3,
+        last_entry_signal_time=pd.Timestamp("2026-01-01 00:20:00"),
+        last_entry_signal_price=120.0,
+        last_entry_signal_side="short",
+        last_entry_signal_zone=3,
+        last_equity_value=1000.0,
+    )
+    return BacktestResult(
+        settings=StrategySettings(),
+        metrics=StrategyMetrics(1.0, 1.0, 0.0, 1, 100.0, 1.0),
+        trades=[],
+        open_entry_events=(
+            (pd.Timestamp("2026-01-01 00:10:00"), "S2"),
+            (pd.Timestamp("2026-01-01 00:20:00"), "S3"),
+        ),
+        indicators=indicators,
+        latest_state={},
+        equity_curve=pd.Series([1000.0], index=[pd.Timestamp("2026-01-01 00:30:00")]),
+        cursor=cursor,
+    )
+
+
 class FakeTickerClient:
     def __init__(self, price_by_symbol: dict[str, float]) -> None:
         self.price_by_symbol = dict(price_by_symbol)
@@ -385,4 +447,33 @@ def test_trade_engine_enters_on_favorable_price_without_fresh_confirmed_trigger(
 
     assert len(submitted) == 1
     assert submitted[0]["side"] == "BUY"
+    assert round(float(submitted[0]["fraction"]), 2) == 0.50
+
+
+def test_trade_engine_limits_stale_short_entry_to_s2_when_price_is_between_s2_and_s3() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.auto_trade_enabled = True
+    engine.client = FakeTickerClient({"TESTUSDT": 110.0})
+    backtest = make_stale_multi_zone_backtest()
+    key = ("TESTUSDT", "1m")
+    engine.watchlist[key] = EngineWatchlistItem(
+        symbol="TESTUSDT",
+        interval="1m",
+        score=7.0,
+        return_pct=12.0,
+        strategy_settings=StrategySettings(),
+    )
+    engine.symbol_states[key] = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="1m",
+        strategy_settings=StrategySettings(),
+        backtest=backtest,
+    )
+    submitted: list[dict[str, object]] = []
+    engine._enqueue_open_order = lambda **kwargs: submitted.append(kwargs)
+
+    engine._evaluate_auto_trade()
+
+    assert len(submitted) == 1
+    assert submitted[0]["side"] == "SELL"
     assert round(float(submitted[0]["fraction"]), 2) == 0.50

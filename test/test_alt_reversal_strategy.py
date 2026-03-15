@@ -17,6 +17,7 @@ from alt_reversal_trader.optimizer import (
 )
 from alt_reversal_trader.strategy import StrategyMetrics
 from alt_reversal_trader.strategy import (
+    active_entry_price_by_zone,
     BacktestCursor,
     BacktestResult,
     latest_confirmed_entry_event,
@@ -99,6 +100,64 @@ def make_confirmed_entry_backtest(
         indicators=indicators,
         latest_state={},
         equity_curve=pd.Series([1000.0], index=[latest_time]),
+        cursor=cursor,
+    )
+
+
+def make_open_entry_price_backtest() -> BacktestResult:
+    indicators = pd.DataFrame(
+        {
+            "time": [
+                pd.Timestamp("2026-01-01 00:10:00"),
+                pd.Timestamp("2026-01-01 00:20:00"),
+                pd.Timestamp("2026-01-01 00:30:00"),
+            ],
+            "open": [100.0, 120.0, 110.0],
+            "high": [101.0, 121.0, 111.0],
+            "low": [99.0, 119.0, 109.0],
+            "close": [100.0, 120.0, 110.0],
+            "volume": [1000.0, 1000.0, 1000.0],
+        }
+    )
+    cursor = BacktestCursor(
+        processed_bars=3,
+        last_time=pd.Timestamp("2026-01-01 00:30:00"),
+        equity=1000.0,
+        position_qty=-1.0,
+        avg_entry_price=110.0,
+        entry_side="short",
+        entry_time=pd.Timestamp("2026-01-01 00:10:00"),
+        entry_price=100.0,
+        zone_events=("S2", "S3"),
+        zone_event_times=(
+            (pd.Timestamp("2026-01-01 00:10:00"), "S2"),
+            (pd.Timestamp("2026-01-01 00:20:00"), "S3"),
+        ),
+        gross_profit=0.0,
+        gross_loss=0.0,
+        trade_count=0,
+        win_count=0,
+        long_zone_used=(False, False, False),
+        short_zone_used=(False, True, True),
+        last_long_zone=0,
+        last_short_zone=3,
+        last_entry_signal_time=pd.Timestamp("2026-01-01 00:20:00"),
+        last_entry_signal_price=120.0,
+        last_entry_signal_side="short",
+        last_entry_signal_zone=3,
+        last_equity_value=1000.0,
+    )
+    return BacktestResult(
+        settings=StrategySettings(),
+        metrics=StrategyMetrics(0.0, 0.0, 0.0, 0, 0.0, 0.0),
+        trades=[],
+        open_entry_events=(
+            (pd.Timestamp("2026-01-01 00:10:00"), "S2"),
+            (pd.Timestamp("2026-01-01 00:20:00"), "S3"),
+        ),
+        indicators=indicators,
+        latest_state={},
+        equity_curve=pd.Series([1000.0], index=[pd.Timestamp("2026-01-01 00:30:00")]),
         cursor=cursor,
     )
 
@@ -194,6 +253,14 @@ def test_latest_confirmed_entry_event_falls_back_to_cursor_signal() -> None:
         "zone": 2,
         "bar_time": pd.Timestamp("2026-01-01 00:10:00"),
     }
+
+
+def test_active_entry_price_by_zone_uses_confirmed_entry_bar_prices() -> None:
+    backtest = make_open_entry_price_backtest()
+
+    prices = active_entry_price_by_zone(backtest)
+
+    assert prices == {2: 100.0, 3: 120.0}
 
 
 def test_parameter_grid_filters_invalid_combinations() -> None:

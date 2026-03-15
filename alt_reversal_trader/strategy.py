@@ -221,6 +221,54 @@ def latest_confirmed_entry_event(
     }
 
 
+def active_entry_price_by_zone(backtest: Optional["BacktestResult"]) -> Dict[int, float]:
+    if backtest is None:
+        return {}
+    cursor = backtest.cursor
+    if cursor is None or abs(float(cursor.position_qty)) < POSITION_EPSILON:
+        return {}
+    active_side = str(cursor.entry_side or ("long" if float(cursor.position_qty) > 0 else "short")).lower()
+    if active_side not in {"long", "short"}:
+        return {}
+    close_by_time: Dict[pd.Timestamp, float] = {}
+    indicators = backtest.indicators
+    if not indicators.empty and {"time", "close"}.issubset(indicators.columns):
+        for row in indicators.loc[:, ["time", "close"]].itertuples(index=False):
+            normalized_time = _normalize_event_timestamp(row.time)
+            if normalized_time is None or pd.isna(row.close):
+                continue
+            close_by_time[normalized_time] = float(row.close)
+    zone_prices: Dict[int, float] = {}
+    for event_time, event_label in list(getattr(backtest, "open_entry_events", ()) or ()):
+        event = _entry_event_from_label(event_label, event_time)
+        if event is None or str(event["side"]) != active_side:
+            continue
+        event_price = close_by_time.get(pd.Timestamp(event["bar_time"]))
+        if event_price is None:
+            signal_time = _normalize_event_timestamp(getattr(cursor, "last_entry_signal_time", None))
+            signal_side = str(getattr(cursor, "last_entry_signal_side", "") or "").lower()
+            signal_zone = int(getattr(cursor, "last_entry_signal_zone", 0) or 0)
+            signal_price = float(getattr(cursor, "last_entry_signal_price", 0.0) or 0.0)
+            if (
+                signal_time == pd.Timestamp(event["bar_time"])
+                and signal_side == active_side
+                and signal_zone == int(event["zone"])
+                and signal_price > 0
+            ):
+                event_price = signal_price
+        if event_price is None or event_price <= 0:
+            continue
+        zone_prices[int(event["zone"])] = float(event_price)
+    if zone_prices:
+        return zone_prices
+    signal_zone = int(getattr(cursor, "last_entry_signal_zone", 0) or 0)
+    signal_price = float(getattr(cursor, "last_entry_signal_price", 0.0) or 0.0)
+    signal_side = str(getattr(cursor, "last_entry_signal_side", "") or "").lower()
+    if signal_side == active_side and signal_zone in {1, 2, 3} and signal_price > 0:
+        return {signal_zone: signal_price}
+    return {}
+
+
 def compact_indicator_frame(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
     selected = [column for column in columns if column in df.columns]
     if not selected:
