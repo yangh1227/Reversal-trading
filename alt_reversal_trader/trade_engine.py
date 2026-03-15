@@ -36,6 +36,7 @@ COMMAND_POLL_TIMEOUT_SECONDS = 0.25
 STREAM_RECONNECT_DELAY_SECONDS = 2.0
 BACKTEST_WARMUP_BAR_FLOOR = 1_500
 PENDING_ORDER_TIMEOUT_SECONDS = 30.0
+STREAM_PRICE_EVAL_MIN_INTERVAL_SECONDS = 0.2
 
 
 @dataclass(frozen=True)
@@ -378,6 +379,11 @@ class _EngineKlineStream(threading.Thread):
     def _emit_bar(self, bar: Dict[str, object]) -> None:
         self.event_queue.put(("bar", self.symbol, self.interval, bar))
 
+    def _emit_price(self, bar: Dict[str, object]) -> None:
+        self.event_queue.put(
+            ("price", self.symbol, self.interval, pd.Timestamp(bar["time"]), float(bar["close"]))
+        )
+
     def _initialize_aggregate_seed(self) -> None:
         if self.interval != "2m":
             return
@@ -469,6 +475,7 @@ class _EngineKlineStream(threading.Thread):
                         "quote_volume": float(kline.get("q", 0.0) or 0.0),
                         "closed": bool(kline.get("x", False)),
                     }
+                    self._emit_price(bar)
                     transformed = self._transform_bar(bar)
                     if transformed is not None and bool(transformed.get("closed")):
                         self._emit_bar(transformed)
@@ -653,6 +660,8 @@ class _TradeEngine:
         self.pending_order_symbols: Dict[str, float] = {}
         self.auto_close_last_trigger_time: Dict[str, pd.Timestamp] = {}
         self.auto_close_last_attempt_at: Dict[str, float] = {}
+        self.latest_stream_price_by_symbol: Dict[str, float] = {}
+        self.last_stream_price_eval_at: Dict[Tuple[str, str], float] = {}
         self.last_auto_trade_check_at = 0.0
         self.last_position_refresh_at = 0.0
         self.order_sequence = 0
@@ -719,6 +728,9 @@ class _TradeEngine:
             elif event_type == "bar":
                 _event_type, symbol, interval, bar = payload
                 self._handle_closed_bar(symbol, interval, bar)
+            elif event_type == "price":
+                _event_type, symbol, interval, bar_time, price = payload
+                self._handle_price_update(symbol, interval, pd.Timestamp(bar_time), float(price))
 
     def _drain_order_results(self) -> None:
         while True:
@@ -996,6 +1008,26 @@ class _TradeEngine:
             trigger_bar_time=pd.Timestamp(bar["time"]),
         )
 
+    def _handle_price_update(
+        self,
+        symbol: str,
+        interval: str,
+        bar_time: pd.Timestamp,
+        price: float,
+    ) -> None:
+        if price <= 0:
+            return
+        self.latest_stream_price_by_symbol[str(symbol)] = float(price)
+        if not self.auto_trade_enabled:
+            return
+        key = (str(symbol), str(interval))
+        now = time.time()
+        last_eval = float(self.last_stream_price_eval_at.get(key, 0.0))
+        if now - last_eval < STREAM_PRICE_EVAL_MIN_INTERVAL_SECONDS:
+            return
+        self.last_stream_price_eval_at[key] = now
+        self._evaluate_auto_trade(trigger_symbol=symbol, trigger_interval=interval)
+
     def _emit_signal_event(self, state: _EngineSymbolState) -> None:
         if state.backtest is None:
             return
@@ -1122,22 +1154,40 @@ class _TradeEngine:
         if not self.auto_trade_enabled or self.client is None:
             return
         trigger_symbol = str(trigger_symbol or "").upper()
-        trigger_interval = str(trigger_interval or self.default_interval)
+        trigger_interval = str(trigger_interval or "")
         normalized_trigger_time = (
             pd.Timestamp(trigger_bar_time).tz_localize(None) if trigger_bar_time is not None else None
         )
         eligible_items = list(self.watchlist.values())
         if not eligible_items:
             return
-        try:
-            ticker_map = self.client.ticker_24h()
-        except Exception as exc:
-            self.log(f"Trade engine auto-trade ticker lookup failed: {exc}")
-            return
+        ticker_map: Optional[Dict[str, Dict[str, object]]] = None
+
+        def current_price_for(symbol: str) -> Optional[float]:
+            live_price = float(self.latest_stream_price_by_symbol.get(symbol, 0.0) or 0.0)
+            if live_price > 0:
+                return live_price
+            nonlocal ticker_map
+            if ticker_map is None:
+                try:
+                    ticker_map = self.client.ticker_24h()
+                except Exception as exc:
+                    self.log(f"Trade engine auto-trade ticker lookup failed: {exc}")
+                    ticker_map = {}
+            ticker = ticker_map.get(symbol) if ticker_map is not None else None
+            if not ticker:
+                return None
+            current_price = float(ticker.get("lastPrice", 0.0) or 0.0)
+            return current_price if current_price > 0 else None
+
         open_positions_by_symbol = dict(self.open_positions)
         candidates: List[Dict[str, object]] = []
         for item in eligible_items:
             if item.symbol in self.pending_order_symbols:
+                continue
+            if trigger_symbol and item.symbol != trigger_symbol:
+                continue
+            if trigger_interval and item.interval != trigger_interval:
                 continue
             open_position = open_positions_by_symbol.get(item.symbol)
             if open_positions_by_symbol and open_position is None:
@@ -1152,10 +1202,9 @@ class _TradeEngine:
             signal = _auto_trade_signal_from_backtest(latest_backtest)
             if signal is None:
                 continue
-            ticker = ticker_map.get(item.symbol)
-            if not ticker:
+            current_price = current_price_for(item.symbol)
+            if current_price is None:
                 continue
-            current_price = float(ticker.get("lastPrice", 0.0) or 0.0)
             signal_price = float(signal["price"])
             zone_prices = dict(signal.get("zone_prices") or {})
             confirmed_entry = (

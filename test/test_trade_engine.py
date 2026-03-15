@@ -477,3 +477,23 @@ def test_trade_engine_limits_stale_short_entry_to_s2_when_price_is_between_s2_an
     assert len(submitted) == 1
     assert submitted[0]["side"] == "SELL"
     assert round(float(submitted[0]["fraction"]), 2) == 0.50
+
+
+def test_trade_engine_price_update_triggers_symbol_scoped_auto_trade_eval() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.auto_trade_enabled = True
+    calls: list[dict[str, object]] = []
+    original = engine._evaluate_auto_trade
+    engine._evaluate_auto_trade = lambda **kwargs: calls.append(kwargs)
+
+    engine._handle_price_update(
+        "TESTUSDT",
+        "1m",
+        pd.Timestamp("2026-01-01 00:10:00"),
+        101.5,
+    )
+
+    engine._evaluate_auto_trade = original
+
+    assert engine.latest_stream_price_by_symbol["TESTUSDT"] == 101.5
+    assert calls == [{"trigger_symbol": "TESTUSDT", "trigger_interval": "1m"}]
