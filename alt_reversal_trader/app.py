@@ -5560,8 +5560,6 @@ class AltReversalTraderWindow(QMainWindow):
         self.log(f"최적화 완료: {len(self.optimized_results)}개 케이스")
         if not preserved_refresh:
             self._flush_optimized_table()
-        if not preserved_refresh and self.optimized_table.rowCount() > 0:
-            self.optimized_table.selectRow(0)
         self._refresh_auto_close_monitors()
         self._finish_backtest_progress()
         self._set_refresh_running(False)

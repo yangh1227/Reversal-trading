@@ -139,3 +139,12 @@ def test_closed_bar_backtest_schedules_auto_trade_with_trigger_bar_time() -> Non
     assert "trigger_symbol=symbol" in source_segment
     assert "trigger_interval=self.current_interval" in source_segment
     assert "trigger_bar_time=confirmed_bar_time" in source_segment
+
+
+def test_optimization_completion_does_not_auto_select_first_result_row() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("on_optimization_completed"),
+    ) or ""
+
+    assert "self.optimized_table.selectRow(0)" not in source_segment
