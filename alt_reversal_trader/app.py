@@ -1636,7 +1636,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.pending_history_cache: Dict[Tuple[str, str], pd.DataFrame] = {}
         self.preserve_lists_during_refresh = False
         self.open_positions: List[PositionSnapshot] = []
-        self.position_strategy_by_symbol: Dict[str, StrategySettings] = {}
+        self.position_strategy_by_symbol: Dict[str, StrategySettings] = dict(self.settings.position_strategy_settings)
         self.current_position_snapshot: Optional[PositionSnapshot] = None
         self.current_symbol: Optional[str] = None
         self.current_interval = self.settings.kline_interval
@@ -2917,6 +2917,7 @@ class AltReversalTraderWindow(QMainWindow):
                     auto_trade_enabled=bool(self.auto_trade_enabled),
                     auto_close_enabled_symbols=tuple(sorted(self.auto_close_enabled_symbols)),
                     position_intervals=dict(self.settings.position_intervals),
+                    position_strategy_settings=dict(self.settings.position_strategy_settings),
                     watchlist=self._trade_engine_watchlist_items(),
                 )
             )
@@ -2978,7 +2979,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.order_worker_is_auto_trade = bool(event.auto_trade)
             self.pending_open_order_interval = event.interval
             if event.strategy_settings is not None:
-                self.position_strategy_by_symbol[event.symbol] = event.strategy_settings
+                self._remember_position_strategy_settings(event.symbol, event.strategy_settings)
             if event.auto_trade:
                 self.auto_trade_entry_pending_symbol = event.symbol
                 self.auto_trade_entry_pending_at = time.time()
@@ -3400,12 +3401,33 @@ class AltReversalTraderWindow(QMainWindow):
         if persist:
             self._persist_position_intervals()
 
+    def _remember_position_strategy_settings(
+        self,
+        symbol: str,
+        strategy_settings: Optional[StrategySettings],
+        persist: bool = True,
+    ) -> None:
+        if not symbol or strategy_settings is None:
+            return
+        if self.position_strategy_by_symbol.get(symbol) == strategy_settings and self.settings.position_strategy_settings.get(symbol) == strategy_settings:
+            return
+        self.position_strategy_by_symbol[symbol] = strategy_settings
+        self.settings.position_strategy_settings[symbol] = strategy_settings
+        if persist:
+            self._persist_position_intervals()
+
     def _forget_closed_position_intervals(self, open_symbols: set[str], persist: bool = True) -> None:
         removed = False
         for symbol in list(self.settings.position_intervals):
             if symbol in open_symbols:
                 continue
             self.settings.position_intervals.pop(symbol, None)
+            removed = True
+        for symbol in list(self.settings.position_strategy_settings):
+            if symbol in open_symbols:
+                continue
+            self.settings.position_strategy_settings.pop(symbol, None)
+            self.position_strategy_by_symbol.pop(symbol, None)
             removed = True
         if removed and persist:
             self._persist_position_intervals()
@@ -3414,12 +3436,20 @@ class AltReversalTraderWindow(QMainWindow):
         changed = False
         for symbol in sorted(open_symbols):
             if self.settings.position_intervals.get(symbol) in APP_INTERVAL_OPTIONS:
+                interval = self.settings.position_intervals[symbol]
+            else:
+                optimization = self._optimization_result(symbol)
+                interval = (optimization.best_interval or self.settings.kline_interval) if optimization else self.settings.kline_interval
+                if interval in APP_INTERVAL_OPTIONS:
+                    self.settings.position_intervals[symbol] = interval
+                    changed = True
+            if symbol in self.settings.position_strategy_settings:
+                self.position_strategy_by_symbol[symbol] = self.settings.position_strategy_settings[symbol]
                 continue
-            optimization = self._optimization_result(symbol)
-            interval = (optimization.best_interval or self.settings.kline_interval) if optimization else self.settings.kline_interval
-            if interval not in APP_INTERVAL_OPTIONS:
-                continue
-            self.settings.position_intervals[symbol] = interval
+            optimization = self._optimization_result(symbol, interval if interval in APP_INTERVAL_OPTIONS else None)
+            strategy_settings = optimization.best_backtest.settings if optimization else self.settings.strategy
+            self.settings.position_strategy_settings[symbol] = strategy_settings
+            self.position_strategy_by_symbol[symbol] = strategy_settings
             changed = True
         if changed:
             self._persist_position_intervals()

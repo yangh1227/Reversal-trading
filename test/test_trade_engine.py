@@ -5,7 +5,13 @@ import pandas as pd
 from alt_reversal_trader.binance_futures import PositionSnapshot
 from alt_reversal_trader.config import StrategySettings
 from alt_reversal_trader.strategy import BacktestCursor, BacktestResult, StrategyMetrics, run_backtest
-from alt_reversal_trader.trade_engine import EngineWatchlistItem, _EngineSymbolState, _OrderExecutionResult, _TradeEngine
+from alt_reversal_trader.trade_engine import (
+    EngineSyncCommand,
+    EngineWatchlistItem,
+    _EngineSymbolState,
+    _OrderExecutionResult,
+    _TradeEngine,
+)
 
 
 def make_sample_ohlcv(rows: int = 500) -> pd.DataFrame:
@@ -198,6 +204,32 @@ def test_trade_engine_prefers_locked_strategy_for_open_positions() -> None:
     engine.open_positions.clear()
 
     assert engine._settings_for_key("TESTUSDT", "1m") == watchlist_settings
+
+
+def test_trade_engine_sync_restores_locked_position_strategies() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    locked_settings = StrategySettings(atr_period=7)
+
+    engine._apply_sync(
+        EngineSyncCommand(
+            api_key="",
+            api_secret="",
+            leverage=3,
+            fee_rate=0.0005,
+            history_days=3,
+            default_interval="1m",
+            default_strategy_settings=StrategySettings(),
+            optimization_rank_mode="score",
+            auto_trade_enabled=False,
+            auto_close_enabled_symbols=(),
+            position_intervals={"TESTUSDT": "1m"},
+            position_strategy_settings={"TESTUSDT": locked_settings},
+            watchlist=(),
+        )
+    )
+
+    assert engine.position_intervals["TESTUSDT"] == "1m"
+    assert engine.position_strategy_by_symbol["TESTUSDT"] == locked_settings
 
 
 def test_trade_engine_keeps_locked_position_strategy_when_watchlist_updates() -> None:

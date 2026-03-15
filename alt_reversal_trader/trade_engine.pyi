@@ -26,6 +26,7 @@ class EngineSyncCommand:
     auto_trade_enabled: bool
     auto_close_enabled_symbols: Tuple[str, ...]
     position_intervals: Dict[str, str]
+    position_strategy_settings: Dict[str, StrategySettings]
     watchlist: Tuple[EngineWatchlistItem, ...]
 
 

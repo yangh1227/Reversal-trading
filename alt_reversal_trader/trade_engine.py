@@ -61,6 +61,7 @@ class EngineSyncCommand:
     auto_trade_enabled: bool
     auto_close_enabled_symbols: Tuple[str, ...]
     position_intervals: Dict[str, str]
+    position_strategy_settings: Dict[str, StrategySettings]
     watchlist: Tuple[EngineWatchlistItem, ...]
 
 
@@ -807,6 +808,11 @@ class _TradeEngine:
             str(symbol): str(interval)
             for symbol, interval in dict(command.position_intervals).items()
             if str(interval) in APP_INTERVAL_OPTIONS
+        }
+        self.position_strategy_by_symbol = {
+            str(symbol): settings
+            for symbol, settings in dict(command.position_strategy_settings).items()
+            if isinstance(settings, StrategySettings)
         }
         self.watchlist = {
             (item.symbol, item.interval): item

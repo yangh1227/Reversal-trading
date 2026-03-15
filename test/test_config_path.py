@@ -122,6 +122,21 @@ class TestConfigPath(unittest.TestCase):
             self.assertEqual(migrated_payload["order_mode"], "simple")
             self.assertEqual(migrated_payload["simple_order_amount"], 88.5)
 
+    def test_position_strategy_settings_round_trip_through_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / self.config.APP_CONFIG_FILENAME
+            locked_settings = self.config.StrategySettings(atr_period=7, factor=3.5)
+            settings = self.config.AppSettings(
+                position_intervals={"BTCUSDT": "5m"},
+                position_strategy_settings={"BTCUSDT": locked_settings},
+            )
+
+            settings.save(config_path)
+            loaded = self.config.AppSettings.load(config_path)
+
+            self.assertEqual(loaded.position_intervals["BTCUSDT"], "5m")
+            self.assertEqual(loaded.position_strategy_settings["BTCUSDT"], locked_settings)
+
 
 if __name__ == "__main__":
     unittest.main()

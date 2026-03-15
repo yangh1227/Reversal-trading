@@ -107,6 +107,25 @@ class StrategySettings:
         return asdict(self)
 
 
+def _normalize_position_strategy_settings(
+    payload: Dict[str, Any] | None,
+) -> Dict[str, StrategySettings]:
+    normalized: Dict[str, StrategySettings] = {}
+    for symbol, raw_settings in dict(payload or {}).items():
+        symbol_text = str(symbol or "").strip()
+        if not symbol_text:
+            continue
+        if isinstance(raw_settings, StrategySettings):
+            normalized[symbol_text] = raw_settings
+            continue
+        if not isinstance(raw_settings, dict):
+            continue
+        normalized[symbol_text] = StrategySettings(
+            **{k: v for k, v in raw_settings.items() if k in StrategySettings.__dataclass_fields__}
+        )
+    return normalized
+
+
 @dataclass
 class AppSettings:
     api_key: str = ""
@@ -138,6 +157,7 @@ class AppSettings:
     strategy: StrategySettings = field(default_factory=StrategySettings)
     optimize_flags: Dict[str, bool] = field(default_factory=dict)
     position_intervals: Dict[str, str] = field(default_factory=dict)
+    position_strategy_settings: Dict[str, StrategySettings] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.chart_engine = CHART_ENGINE_OPTIONS[0]
@@ -158,6 +178,7 @@ class AppSettings:
             for symbol, interval in dict(self.position_intervals).items()
             if str(interval) in APP_INTERVAL_OPTIONS
         }
+        self.position_strategy_settings = _normalize_position_strategy_settings(self.position_strategy_settings)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -190,6 +211,10 @@ class AppSettings:
             "strategy": self.strategy.to_dict(),
             "optimize_flags": dict(self.optimize_flags),
             "position_intervals": dict(self.position_intervals),
+            "position_strategy_settings": {
+                symbol: settings.to_dict()
+                for symbol, settings in self.position_strategy_settings.items()
+            },
         }
 
     @classmethod
@@ -198,6 +223,7 @@ class AppSettings:
         strategy_payload = payload.pop("strategy", {}) or {}
         optimize_flags = payload.pop("optimize_flags", {}) or {}
         position_intervals = payload.pop("position_intervals", {}) or {}
+        position_strategy_settings = payload.pop("position_strategy_settings", {}) or {}
         simple_order_amount = payload.pop("simple_order_amount", None)
         legacy_simple_long = payload.pop("simple_long_order_amount", None)
         legacy_simple_short = payload.pop("simple_short_order_amount", None)
@@ -218,6 +244,7 @@ class AppSettings:
             for symbol, interval in dict(position_intervals).items()
             if str(interval) in APP_INTERVAL_OPTIONS
         }
+        settings.position_strategy_settings = _normalize_position_strategy_settings(position_strategy_settings)
         return settings
 
     @classmethod
