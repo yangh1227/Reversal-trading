@@ -1812,6 +1812,11 @@ class AltReversalTraderWindow(QMainWindow):
         self.bar_close_countdown_label.setStyleSheet("color: #d63b53; font-weight: 700; font-size: 12px;")
         balance_layout.addSpacing(12)
         balance_layout.addWidget(self.bar_close_countdown_label)
+        self.optimization_chart_notice_label = QLabel("")
+        self.optimization_chart_notice_label.setStyleSheet("color: #f59e0b; font-weight: 700; font-size: 12px;")
+        self.optimization_chart_notice_label.hide()
+        balance_layout.addSpacing(12)
+        balance_layout.addWidget(self.optimization_chart_notice_label)
         balance_layout.addStretch(1)
         self._set_balance_label_status("API 미입력")
         self.chart_host = QWidget()
@@ -2448,6 +2453,7 @@ class AltReversalTraderWindow(QMainWindow):
         )
         self.chart.events.range_change += self._on_lightweight_range_change
         self._init_lightweight_bar_close_overlay()
+        self._init_lightweight_optimization_overlay()
 
     def _init_lightweight_bar_close_overlay(self) -> None:
         if self.chart is None:
@@ -2562,6 +2568,102 @@ class AltReversalTraderWindow(QMainWindow):
             f"""
             if ({self.chart.id}.updateBarCloseCountdown) {{
                 {self.chart.id}.updateBarCloseCountdown({json.dumps(countdown)}, {float(price)});
+            }}
+            """
+        )
+
+    def _init_lightweight_optimization_overlay(self) -> None:
+        if self.chart is None:
+            return
+        self.chart.run_script(
+            f"""
+            (() => {{
+                const handler = {self.chart.id};
+                if (!handler || handler.optimizationBadge) {{
+                    return;
+                }}
+                const label = document.createElement("div");
+                Object.assign(label.style, {{
+                    position: "absolute",
+                    left: "12px",
+                    top: "10px",
+                    display: "none",
+                    color: "#facc15",
+                    fontFamily: "Consolas, monospace",
+                    fontSize: "12px",
+                    fontWeight: "700",
+                    letterSpacing: "0.03em",
+                    textShadow: "0 1px 6px rgba(0, 0, 0, 0.65)",
+                    zIndex: "4200",
+                    pointerEvents: "none",
+                    whiteSpace: "nowrap",
+                }});
+                handler.div.appendChild(label);
+                handler.optimizationBadge = label;
+                handler.setOptimizationBadge = (text) => {{
+                    if (!handler.optimizationBadge) {{
+                        return;
+                    }}
+                    const nextText = String(text || "").trim();
+                    handler.optimizationBadge.textContent = nextText;
+                    handler.optimizationBadge.style.display = nextText ? "block" : "none";
+                }};
+                handler.hideOptimizationBadge = () => {{
+                    if (!handler.optimizationBadge) {{
+                        return;
+                    }}
+                    handler.optimizationBadge.textContent = "";
+                    handler.optimizationBadge.style.display = "none";
+                }};
+            }})();
+            """
+        )
+
+    def _showing_optimized_chart(self, symbol: Optional[str] = None, interval: Optional[str] = None) -> bool:
+        target_symbol = str(symbol or self.current_symbol or "").strip()
+        target_interval = interval if interval in APP_INTERVAL_OPTIONS else self.current_interval
+        if not target_symbol or target_interval not in APP_INTERVAL_OPTIONS:
+            return False
+        if target_symbol != self.current_symbol or target_interval != self.current_interval:
+            return False
+        if self.current_backtest is None:
+            return False
+        optimization = self._optimization_result(target_symbol, target_interval)
+        if optimization is None:
+            return False
+        optimized_interval = optimization.best_interval or self.settings.kline_interval
+        if optimized_interval != target_interval:
+            return False
+        return self.current_backtest.settings == optimization.best_backtest.settings
+
+    def _set_optimization_chart_notice_text(self, visible: bool) -> None:
+        if not hasattr(self, "optimization_chart_notice_label"):
+            return
+        if visible:
+            self.optimization_chart_notice_label.setText("최적화 차트 표시중")
+            self.optimization_chart_notice_label.show()
+            return
+        self.optimization_chart_notice_label.setText("")
+        self.optimization_chart_notice_label.hide()
+
+    def _set_lightweight_optimization_overlay(self, symbol: Optional[str] = None, interval: Optional[str] = None) -> None:
+        showing_optimized_chart = self._showing_optimized_chart(symbol, interval)
+        self._set_optimization_chart_notice_text(showing_optimized_chart)
+        if self.chart_mode != "Lightweight" or self.chart is None:
+            return
+        if showing_optimized_chart:
+            self.chart.run_script(
+                f"""
+                if ({self.chart.id}.setOptimizationBadge) {{
+                    {self.chart.id}.setOptimizationBadge({json.dumps("최적화 차트 표시중")});
+                }}
+                """
+            )
+            return
+        self.chart.run_script(
+            f"""
+            if ({self.chart.id}.hideOptimizationBadge) {{
+                {self.chart.id}.hideOptimizationBadge();
             }}
             """
         )
@@ -5692,6 +5794,7 @@ class AltReversalTraderWindow(QMainWindow):
             self._update_entry_price_overlay()
             self._refresh_live_labels()
             self._refresh_live_preview_markers(symbol)
+            self._set_lightweight_optimization_overlay(symbol, self.current_interval)
             self._schedule_chart_transition_reveal(symbol, delay_ms=120)
         self._log_perf(f"{symbol} worker apply", apply_started_at)
         if self.symbol_load_started_at > 0:
@@ -5767,6 +5870,7 @@ class AltReversalTraderWindow(QMainWindow):
         self._update_entry_price_overlay()
         self._refresh_live_labels()
         self._refresh_live_preview_markers(symbol)
+        self._set_lightweight_optimization_overlay(symbol, self.current_interval)
 
     def _render_lightweight_chart(
         self,
