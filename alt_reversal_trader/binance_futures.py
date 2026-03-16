@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 import requests
 
+from .interprocess_rate_limit import wait_for_request_slot
 from .strategy import rsi_last_value
 
 
@@ -224,9 +225,6 @@ def _round_down(value: float, step: float) -> float:
 
 
 class BinanceFuturesClient:
-    _request_gate_lock = threading.Lock()
-    _next_request_at = 0.0
-
     def __init__(self, api_key: str = "", api_secret: str = "", base_url: str = FAPI_BASE_URL) -> None:
         self.api_key = api_key.strip()
         self.api_secret = api_secret.strip()
@@ -236,13 +234,7 @@ class BinanceFuturesClient:
 
     @classmethod
     def _wait_for_request_slot(cls) -> None:
-        with cls._request_gate_lock:
-            now = time.monotonic()
-            delay = max(0.0, cls._next_request_at - now)
-            if delay > 0:
-                time.sleep(delay)
-                now = time.monotonic()
-            cls._next_request_at = now + REQUEST_MIN_INTERVAL_SECONDS
+        wait_for_request_slot("binance_futures", REQUEST_MIN_INTERVAL_SECONDS)
 
     def _cached(self, key: str, ttl_seconds: float) -> Any:
         with self._cache_lock:

@@ -1,9 +1,13 @@
 import unittest
+from pathlib import Path
 import pandas as pd
 from lightweight_charts import Chart
 import asyncio
 
 from util import BARS, Tester
+
+
+DRAWINGS_PATH = Path(__file__).resolve().parent / "drawings.json"
 
 
 
@@ -32,7 +36,7 @@ class TestReturns(Tester):
         self.chart.set(BARS)
         self.chart.topbar.textbox('symbol', 'SYM', align='right')
         self.chart.toolbox.save_drawings_under(self.chart.topbar['symbol'])
-        self.chart.toolbox.import_drawings("drawings.json")
+        self.chart.toolbox.import_drawings(str(DRAWINGS_PATH))
         self.chart.toolbox.load_drawings("SYM")
         asyncio.run(main())
 

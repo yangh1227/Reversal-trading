@@ -228,3 +228,68 @@ def test_run_auto_refresh_logs_use_configured_minutes() -> None:
 
     assert 'f"자동 {self.auto_refresh_minutes}분 갱신 시점이지만 이전 작업이 아직 실행 중이라 건너뜁니다."' in source_segment
     assert 'f"자동 {self.auto_refresh_minutes}분 갱신 시작"' in source_segment
+
+
+def test_run_scan_and_optimize_defaults_to_preserve_existing() -> None:
+    method = _window_method_node("run_scan_and_optimize")
+
+    assert method.args.defaults
+    default = method.args.defaults[-1]
+    assert isinstance(default, ast.Constant)
+    assert default.value is True
+
+
+def test_window_init_keeps_refresh_preserve_flag_as_idle_false() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("__init__"),
+    ) or ""
+
+    assert "self.preserve_lists_during_refresh = False" in source_segment
+    assert "bool(preserve_existing)" not in source_segment
+
+
+def test_run_scan_and_optimize_does_not_clear_live_results_before_refresh() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("run_scan_and_optimize"),
+    ) or ""
+
+    assert "self.preserve_lists_during_refresh = bool(preserve_existing)" in source_segment
+    assert "self.optimized_results = {}" not in source_segment
+    assert "self.history_cache = {}" not in source_segment
+    assert "self.backtest_cache = {}" not in source_segment
+    assert "self.current_symbol = None" not in source_segment
+
+
+def test_optimization_result_buffers_pending_backtests_when_preserving_lists() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("on_optimization_result"),
+    ) or ""
+
+    assert "self.pending_backtest_cache[cache_key] = optimization.best_backtest" in source_segment
+    assert "self.pending_chart_indicator_cache[cache_key] = _chart_indicators_from_backtest(optimization.best_backtest)" in source_segment
+
+
+def test_optimization_completion_swaps_pending_results_atomically() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("on_optimization_completed"),
+    ) or ""
+
+    assert "self.optimized_results = dict(self.pending_optimized_results)" in source_segment
+    assert "self.backtest_cache.update(self.pending_backtest_cache)" in source_segment
+    assert "self.chart_indicator_cache.update(self.pending_chart_indicator_cache)" in source_segment
+    assert "self.history_cache.update(self.pending_history_cache)" in source_segment
+
+
+def test_fallback_auto_trade_cycle_uses_shared_runtime_evaluator() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_run_auto_trade_cycle"),
+    ) or ""
+
+    assert "evaluate_auto_trade_candidate(" in source_segment
+    assert "pick_auto_trade_candidate(" in source_segment
+    assert "self._pick_auto_trade_candidate(" not in source_segment

@@ -1,10 +1,12 @@
 import unittest
+from pathlib import Path
 import pandas as pd
 
 from lightweight_charts import Chart
 
 
-BARS = pd.read_csv('../examples/1_setting_data/ohlcv.csv')
+_EXAMPLES_DIR = Path(__file__).resolve().parent.parent / "examples" / "1_setting_data"
+BARS = pd.read_csv(_EXAMPLES_DIR / "ohlcv.csv")
 
 
 
@@ -14,7 +16,6 @@ class Tester(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.chart.exit()
-
 
 
 

@@ -153,7 +153,7 @@ class AppSettings:
     optimization_min_return_pct: float = 0.0
     max_grid_combinations: int = 300
     scan_workers: int = 4
-    optimize_processes: int = 8
+    optimize_processes: int = field(default_factory=default_optimize_process_count)
     optimize_timeframe: bool = True
     strategy: StrategySettings = field(default_factory=StrategySettings)
     optimize_flags: Dict[str, bool] = field(default_factory=dict)

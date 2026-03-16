@@ -4,7 +4,6 @@ from dataclasses import dataclass
 import json
 import multiprocessing as mp
 from queue import Empty, PriorityQueue, Queue
-import random
 import threading
 import time
 import traceback
@@ -13,14 +12,19 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import websocket
 
+from .auto_trade_runtime import (
+    auto_trade_signal_from_backtest as _auto_trade_signal_from_backtest,
+    evaluate_auto_trade_candidate,
+    history_can_resume_backtest as _history_can_resume_backtest,
+    inferred_auto_trade_fraction as _inferred_auto_trade_fraction,
+    pick_auto_trade_candidate,
+)
 from .binance_futures import BinanceFuturesClient, PositionSnapshot, resolve_base_interval
 from .config import APP_INTERVAL_OPTIONS, StrategySettings
 from .live_chart_utils import merge_live_bar as _merge_live_bar
 from .live_chart_utils import seed_two_minute_aggregate as _seed_two_minute_aggregate
 from .live_chart_utils import transform_two_minute_bar as _transform_two_minute_bar
 from .strategy import (
-    active_auto_trade_signal as strategy_active_auto_trade_signal,
-    active_entry_price_by_zone,
     BacktestResult,
     estimate_warmup_bars,
     latest_confirmed_entry_event,
@@ -33,12 +37,15 @@ from .strategy import (
 
 AUTO_TRADE_RECHECK_INTERVAL_SECONDS = 1.0
 AUTO_CLOSE_RETRY_INTERVAL_SECONDS = 10.0
-POSITION_REFRESH_INTERVAL_SECONDS = 5.0
+POSITION_REFRESH_INTERVAL_SECONDS = 1.0
 COMMAND_POLL_TIMEOUT_SECONDS = 0.25
 STREAM_RECONNECT_DELAY_SECONDS = 2.0
 BACKTEST_WARMUP_BAR_FLOOR = 1_500
 PENDING_ORDER_TIMEOUT_SECONDS = 30.0
 STREAM_PRICE_EVAL_MIN_INTERVAL_SECONDS = 0.2
+STREAM_STALE_SECONDS = 3.0
+STREAM_FORCE_RELOAD_SECONDS = 10.0
+STALE_SYMBOL_EVAL_INTERVAL_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -151,8 +158,16 @@ class _EngineSymbolState:
     return_pct: float = 0.0
     history: Optional[pd.DataFrame] = None
     backtest: Optional[BacktestResult] = None
+    loaded_strategy_settings: Optional[StrategySettings] = None
     loading: bool = False
+    needs_reload: bool = False
+    force_history_refetch: bool = False
     pending_closed_bar: Optional[Dict[str, object]] = None
+    priority_class: str = "watchlist"
+    last_stream_payload_at: float = 0.0
+    last_price_update_at: float = 0.0
+    stale_since: float = 0.0
+    reload_requested_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -233,14 +248,6 @@ def _history_fetch_start_time_ms(history_days: int, interval: str, strategy_sett
     return _backtest_start_time_ms(history_days) - warmup_bars * interval_ms
 
 
-def _history_can_resume_backtest(backtest: Optional[BacktestResult], history: Optional[pd.DataFrame]) -> bool:
-    if backtest is None or history is None or history.empty or backtest.indicators.empty or backtest.cursor is None:
-        return False
-    history_times = pd.to_datetime(history["time"])
-    backtest_last_time = pd.Timestamp(backtest.indicators["time"].iloc[-1])
-    return bool((history_times == backtest_last_time).any()) and pd.Timestamp(history_times.iloc[-1]) > backtest_last_time
-
-
 def _is_provisional_exit_trade(trade, latest_time: Optional[pd.Timestamp]) -> bool:
     if latest_time is None:
         return False
@@ -318,115 +325,85 @@ def _auto_close_reason(position: Optional[PositionSnapshot], exit_event: Optiona
     return reason
 
 
-def _auto_trade_signal_from_backtest(backtest: BacktestResult) -> Optional[Dict[str, object]]:
-    return strategy_active_auto_trade_signal(backtest)
-
-
-def _zone_favorable_fraction(
-    side: str,
-    current_price: float,
-    signal_price: float,
-    zone_prices: Dict[int, float],
-    filled_fraction: float,
-) -> float:
-    """Return the enterable fraction based on confirmed entry prices by zone."""
-    for z in (3, 2):
-        zp = zone_prices.get(z)
-        if zp is None or zp <= 0:
-            continue
-        favorable = current_price < zp if side == "long" else current_price > zp
-        if favorable:
-            zone_fraction = signal_fraction_for_zone(z)
-            remaining = max(0.0, zone_fraction - filled_fraction)
-            if remaining > 1e-9:
-                return remaining
-    # Fallback: use the signal price (covers zone 1 or missing zone lines).
-    favorable = current_price < signal_price if side == "long" else current_price > signal_price
-    if favorable:
-        return max(0.0, signal_fraction_for_zone(1) - filled_fraction)
-    return 0.0
-
-
-def _inferred_auto_trade_fraction(backtest: BacktestResult, position: Optional[PositionSnapshot]) -> float:
-    cursor = backtest.cursor
-    if cursor is None or position is None or abs(float(position.amount)) < 1e-12:
-        return 0.0
-    side = "long" if float(position.amount) > 0 else "short"
-    zone = 0
-    signal_side = str(cursor.last_entry_signal_side or "").lower()
-    signal_zone = int(cursor.last_entry_signal_zone or 0)
-    if signal_side == side and signal_zone in {1, 2, 3}:
-        zone = signal_zone
-    fallback_zone = int(cursor.last_long_zone if side == "long" else cursor.last_short_zone)
-    if fallback_zone in {1, 2, 3}:
-        zone = max(zone, fallback_zone)
-    return signal_fraction_for_zone(zone) if zone in {1, 2, 3} else 0.0
-
-
-class _EngineKlineStream(threading.Thread):
+class _EngineMultiplexKlineStream(threading.Thread):
     def __init__(
         self,
-        symbol: str,
-        interval: str,
+        base_interval: str,
+        targets_by_symbol: Dict[str, Tuple[str, ...]],
         event_queue: Queue,
         stop_event: threading.Event,
-        seed_history: Optional[pd.DataFrame] = None,
+        seed_history_by_symbol: Optional[Dict[str, pd.DataFrame]] = None,
     ) -> None:
         super().__init__(daemon=True)
-        self.symbol = symbol.upper()
-        self.interval = interval
-        self.stream_interval = resolve_base_interval(interval)
+        self.base_interval = str(base_interval)
+        self.targets_by_symbol = {
+            str(symbol).upper(): tuple(sorted({str(interval) for interval in intervals}))
+            for symbol, intervals in dict(targets_by_symbol).items()
+            if intervals
+        }
         self.event_queue = event_queue
         self.stop_event = stop_event
         self.socket = None
-        self.aggregate_bar: Optional[Dict[str, object]] = None
-        self.seed_history = prepare_ohlcv(seed_history.copy()) if seed_history is not None and not seed_history.empty else None
+        self.seed_history_by_symbol = {
+            str(symbol).upper(): prepare_ohlcv(history.copy())
+            for symbol, history in dict(seed_history_by_symbol or {}).items()
+            if history is not None and not history.empty
+        }
+        self.aggregate_bars: Dict[Tuple[str, str], Optional[Dict[str, object]]] = {}
 
     def _emit_log(self, message: str) -> None:
         self.event_queue.put(("log", message))
 
     def _emit_bar(self, bar: Dict[str, object]) -> None:
-        self.event_queue.put(("bar", self.symbol, self.interval, bar))
+        self.event_queue.put(("bar", str(bar["symbol"]).upper(), str(bar["interval"]), bar))
 
-    def _emit_price(self, bar: Dict[str, object]) -> None:
+    def _emit_price(self, bar: Dict[str, object], interval: str) -> None:
         self.event_queue.put(
-            ("price", self.symbol, self.interval, pd.Timestamp(bar["time"]), float(bar["close"]))
+            ("price", str(bar["symbol"]).upper(), str(interval), pd.Timestamp(bar["time"]), float(bar["close"]))
         )
 
-    def _initialize_aggregate_seed(self) -> None:
-        if self.interval != "2m":
-            return
-        recent_history = self.seed_history
-        if recent_history is None:
-            try:
-                recent_history = BinanceFuturesClient().historical_ohlcv_recent(self.symbol, self.stream_interval, bars=2)
-            except Exception:
-                recent_history = None
-        self.aggregate_bar = _seed_two_minute_aggregate(recent_history, self.symbol, self.interval)
-        self.seed_history = None
+    def _initialize_aggregate_seed(self, symbol: str, interval: str) -> Optional[Dict[str, object]]:
+        if interval != "2m":
+            return None
+        seed_history = self.seed_history_by_symbol.pop(str(symbol).upper(), None)
+        return _seed_two_minute_aggregate(seed_history, str(symbol).upper(), interval)
 
-    def _transform_bar(self, bar: Dict[str, object]) -> Optional[Dict[str, object]]:
-        if self.interval != "2m":
-            return bar if bool(bar.get("closed")) else None
+    def _transform_bar_for_interval(
+        self,
+        symbol: str,
+        interval: str,
+        bar: Dict[str, object],
+    ) -> Optional[Dict[str, object]]:
+        if interval != "2m":
+            return dict(bar) if bool(bar.get("closed")) else None
+        key = (str(symbol).upper(), str(interval))
+        aggregate_bar = self.aggregate_bars.get(key)
         seed_aggregate = None
-        if self.aggregate_bar is None or pd.Timestamp(self.aggregate_bar["time"]) != pd.Timestamp(bar["time"]).floor("2min"):
-            self._initialize_aggregate_seed()
-            seed_aggregate = self.aggregate_bar
-        self.aggregate_bar, transformed = _transform_two_minute_bar(
-            self.aggregate_bar,
+        if aggregate_bar is None or pd.Timestamp(aggregate_bar["time"]) != pd.Timestamp(bar["time"]).floor("2min"):
+            seed_aggregate = self._initialize_aggregate_seed(symbol, interval)
+        next_aggregate, transformed = _transform_two_minute_bar(
+            aggregate_bar,
             bar,
             seed_aggregate=seed_aggregate,
         )
+        self.aggregate_bars[key] = next_aggregate
         return transformed if bool(transformed.get("closed")) else None
 
     def run(self) -> None:
-        stream_url = f"wss://fstream.binance.com/ws/{self.symbol.lower()}@kline_{self.stream_interval}"
+        stream_names = [
+            f"{symbol.lower()}@kline_{self.base_interval}"
+            for symbol in sorted(self.targets_by_symbol)
+        ]
+        if not stream_names:
+            return
+        stream_url = f"wss://fstream.binance.com/stream?streams={'/'.join(stream_names)}"
         while not self.stop_event.is_set():
             try:
-                self._initialize_aggregate_seed()
                 self.socket = websocket.create_connection(stream_url, timeout=10)
                 self.socket.settimeout(1.0)
-                self._emit_log(f"Trade engine stream connected: {self.symbol} {self.interval}")
+                self._emit_log(
+                    f"Trade engine multiplex stream connected: {self.base_interval} symbols={len(self.targets_by_symbol)}"
+                )
                 while not self.stop_event.is_set():
                     try:
                         raw = self.socket.recv()
@@ -435,12 +412,17 @@ class _EngineKlineStream(threading.Thread):
                     if not raw:
                         continue
                     payload = json.loads(raw)
-                    if payload.get("e") != "kline":
+                    data = payload.get("data", payload)
+                    if data.get("e") != "kline":
                         continue
-                    kline = payload.get("k", {})
-                    bar = {
-                        "symbol": self.symbol,
-                        "interval": self.interval,
+                    kline = data.get("k", {})
+                    symbol = str(data.get("s", "") or kline.get("s", "") or "").upper()
+                    target_intervals = self.targets_by_symbol.get(symbol)
+                    if not symbol or not target_intervals:
+                        continue
+                    source_bar = {
+                        "symbol": symbol,
+                        "interval": self.base_interval,
                         "time": _ws_kline_timestamp(int(kline["t"])),
                         "open": float(kline["o"]),
                         "high": float(kline["h"]),
@@ -450,14 +432,17 @@ class _EngineKlineStream(threading.Thread):
                         "quote_volume": float(kline.get("q", 0.0) or 0.0),
                         "closed": bool(kline.get("x", False)),
                     }
-                    self._emit_price(bar)
-                    transformed = self._transform_bar(bar)
-                    if transformed is not None and bool(transformed.get("closed")):
-                        self._emit_bar(transformed)
+                    for target_interval in target_intervals:
+                        target_bar = dict(source_bar)
+                        target_bar["interval"] = target_interval
+                        self._emit_price(target_bar, target_interval)
+                        transformed = self._transform_bar_for_interval(symbol, target_interval, target_bar)
+                        if transformed is not None:
+                            self._emit_bar(transformed)
             except Exception as exc:
                 if self.stop_event.is_set():
                     break
-                self._emit_log(f"Trade engine stream reconnecting: {self.symbol} {self.interval} ({exc})")
+                self._emit_log(f"Trade engine multiplex stream reconnecting: {self.base_interval} ({exc})")
                 time.sleep(STREAM_RECONNECT_DELAY_SECONDS)
             finally:
                 if self.socket is not None:
@@ -630,7 +615,7 @@ class _TradeEngine:
         self.position_intervals: Dict[str, str] = {}
         self.watchlist: Dict[Tuple[str, str], EngineWatchlistItem] = {}
         self.symbol_states: Dict[Tuple[str, str], _EngineSymbolState] = {}
-        self.streams: Dict[Tuple[str, str], Tuple[_EngineKlineStream, threading.Event]] = {}
+        self.streams: Dict[str, Tuple[_EngineMultiplexKlineStream, threading.Event, Tuple[Tuple[str, Tuple[str, ...]], ...]]] = {}
         self.open_positions: Dict[str, PositionSnapshot] = {}
         self.filled_fraction_by_symbol: Dict[str, float] = {}
         self.auto_trade_cursor_entry_time: Dict[str, pd.Timestamp] = {}
@@ -640,6 +625,11 @@ class _TradeEngine:
         self.auto_close_last_attempt_at: Dict[str, float] = {}
         self.latest_stream_price_by_symbol: Dict[str, float] = {}
         self.last_stream_price_eval_at: Dict[Tuple[str, str], float] = {}
+        self.last_stale_symbol_eval_at: Dict[Tuple[str, str], float] = {}
+        self.base_stream_last_payload_at: Dict[str, float] = {}
+        self.base_stream_started_at: Dict[str, float] = {}
+        self.base_stream_last_restart_at: Dict[str, float] = {}
+        self.stream_health_degraded = False
         self.last_auto_trade_check_at = 0.0
         self.last_position_refresh_at = 0.0
         self.order_sequence = 0
@@ -661,6 +651,7 @@ class _TradeEngine:
             self._drain_order_results()
             self._drain_internal_events()
             now = time.time()
+            self._update_stream_health(now=now)
             if self.api_key and self.api_secret and now - self.last_position_refresh_at >= POSITION_REFRESH_INTERVAL_SECONDS:
                 self._refresh_positions()
             if self.api_key and self.api_secret and now - self.last_auto_trade_check_at >= AUTO_TRADE_RECHECK_INTERVAL_SECONDS:
@@ -861,7 +852,140 @@ class _TradeEngine:
             return locked_settings
         return self.default_strategy_settings
 
+    def _priority_class_for_key(self, key: Tuple[str, str], state: Optional[_EngineSymbolState] = None) -> str:
+        symbol, _interval = key
+        if symbol in self.open_positions:
+            return "position"
+        if (
+            symbol in self.pending_order_symbols
+            or symbol in self.auto_close_enabled_symbols
+            or symbol in self.auto_close_last_trigger_time
+            or (state is not None and state.pending_closed_bar is not None)
+            or (state is not None and state.stale_since > 0)
+        ):
+            return "triggered"
+        return "watchlist"
+
+    def _mark_state_for_reload(
+        self,
+        state: _EngineSymbolState,
+        *,
+        force_history_refetch: bool = False,
+        now: Optional[float] = None,
+    ) -> None:
+        state.loading = True
+        state.needs_reload = True
+        state.force_history_refetch = state.force_history_refetch or force_history_refetch
+        state.reload_requested_at = float(now if now is not None else time.time())
+
+    def _pending_state_sort_key(self, key: Tuple[str, str]) -> Tuple[int, float, str, str]:
+        state = self.symbol_states[key]
+        priority_rank = {
+            "position": 0,
+            "triggered": 1,
+            "watchlist": 2,
+        }.get(self._priority_class_for_key(key, state), 2)
+        requested_at = float(state.reload_requested_at or 0.0)
+        if requested_at <= 0.0:
+            requested_at = time.time()
+        return (priority_rank, requested_at, key[0], key[1])
+
+    def _stream_payload_age_seconds(self, state: _EngineSymbolState, now: float) -> Optional[float]:
+        base_interval = resolve_base_interval(state.interval)
+        if base_interval not in self.streams:
+            return None
+        reference_time = max(
+            float(state.last_stream_payload_at or 0.0),
+            float(self.base_stream_last_payload_at.get(base_interval, 0.0) or 0.0),
+            float(self.base_stream_started_at.get(base_interval, 0.0) or 0.0),
+        )
+        if reference_time <= 0.0:
+            return None
+        return max(0.0, now - reference_time)
+
+    def _stream_price_is_fresh(self, symbol: str, interval: str, now: Optional[float] = None) -> bool:
+        state = self.symbol_states.get((str(symbol).upper(), str(interval)))
+        if state is None:
+            return False
+        reference_now = float(now if now is not None else time.time())
+        if state.stale_since > 0:
+            return False
+        last_price_update_at = float(state.last_price_update_at or 0.0)
+        if last_price_update_at <= 0.0:
+            return False
+        return reference_now - last_price_update_at < STREAM_STALE_SECONDS
+
+    def _update_stream_health(self, *, now: Optional[float] = None) -> None:
+        reference_now = float(now if now is not None else time.time())
+        stale_position_symbols: set[str] = set()
+        stale_watchlist_symbols: set[str] = set()
+        bases_to_restart: set[str] = set()
+        should_force_position_refresh = False
+        for key in sorted(self._active_symbol_keys()):
+            state = self.symbol_states.get(key)
+            if state is None:
+                continue
+            state.priority_class = self._priority_class_for_key(key, state)
+            payload_age = self._stream_payload_age_seconds(state, reference_now)
+            if payload_age is None:
+                continue
+            symbol = key[0]
+            interval = key[1]
+            base_interval = resolve_base_interval(interval)
+            is_stale = payload_age >= STREAM_STALE_SECONDS
+            if is_stale:
+                if state.stale_since <= 0.0:
+                    state.stale_since = reference_now
+                if state.reload_requested_at <= 0.0:
+                    state.reload_requested_at = reference_now
+                if symbol in self.open_positions:
+                    stale_position_symbols.add(symbol)
+                    should_force_position_refresh = True
+                else:
+                    stale_watchlist_symbols.add(symbol)
+                if reference_now - float(self.base_stream_last_restart_at.get(base_interval, 0.0) or 0.0) >= STREAM_STALE_SECONDS:
+                    bases_to_restart.add(base_interval)
+                if (
+                    reference_now - float(state.stale_since) >= STREAM_FORCE_RELOAD_SECONDS
+                    and not state.loading
+                ):
+                    self._mark_state_for_reload(state, force_history_refetch=True, now=reference_now)
+                if (
+                    self.auto_trade_enabled
+                    and reference_now - float(self.last_stale_symbol_eval_at.get(key, 0.0) or 0.0)
+                    >= STALE_SYMBOL_EVAL_INTERVAL_SECONDS
+                ):
+                    self.last_stale_symbol_eval_at[key] = reference_now
+                    self._evaluate_auto_trade(trigger_symbol=symbol, trigger_interval=interval)
+            elif state.stale_since > 0.0:
+                state.stale_since = 0.0
+                self.last_stale_symbol_eval_at.pop(key, None)
+        if should_force_position_refresh and self.api_key and self.api_secret:
+            self._refresh_positions(force=True)
+        for base_interval in sorted(bases_to_restart):
+            self.base_stream_last_restart_at[base_interval] = reference_now
+            self._stop_stream(base_interval)
+        if bases_to_restart:
+            self._refresh_streams()
+        has_stale = bool(stale_position_symbols or stale_watchlist_symbols)
+        if has_stale and not self.stream_health_degraded:
+            self.stream_health_degraded = True
+            self.emit(
+                EngineHealthEvent(
+                    "degraded",
+                    (
+                        "Trade engine degraded: "
+                        f"stale position streams={len(stale_position_symbols)} "
+                        f"watchlist streams={len(stale_watchlist_symbols)}"
+                    ),
+                )
+            )
+        elif not has_stale and self.stream_health_degraded:
+            self.stream_health_degraded = False
+            self.emit(EngineHealthEvent("recovered", "Trade engine stream health recovered"))
+
     def _ensure_active_states(self) -> None:
+        now = time.time()
         active_keys = self._active_symbol_keys()
         for key in list(self.symbol_states):
             if key not in active_keys and key[0] not in self.open_positions:
@@ -876,43 +1000,54 @@ class _TradeEngine:
                     symbol=symbol,
                     interval=interval,
                     strategy_settings=settings,
+                    loaded_strategy_settings=settings,
                     score=float(watch.score) if watch is not None else 0.0,
                     return_pct=float(watch.return_pct) if watch is not None else 0.0,
                     loading=False,
+                    priority_class=self._priority_class_for_key(key),
                 )
             else:
+                if state.backtest is not None and state.loaded_strategy_settings is None:
+                    state.loaded_strategy_settings = state.strategy_settings
                 if state.strategy_settings != settings:
                     state.strategy_settings = settings
-                    state.backtest = None
-                    state.loading = True
+                    self._mark_state_for_reload(state, now=now)
                 else:
                     state.strategy_settings = settings
                 watch = self.watchlist.get(key)
                 state.score = float(watch.score) if watch is not None else state.score
                 state.return_pct = float(watch.return_pct) if watch is not None else state.return_pct
-        active_set = set(active_keys)
-        for key in list(self.streams):
-            if key not in active_set:
-                self._stop_stream(key)
+                state.priority_class = self._priority_class_for_key(key, state)
         for key in active_keys:
             self._ensure_state_loaded(key)
+        self._refresh_streams()
 
     def _ensure_state_loaded(self, key: Tuple[str, str]) -> None:
         state = self.symbol_states[key]
-        if state.history is None and not state.loading:
-            state.loading = True
+        if state.backtest is not None and state.loaded_strategy_settings is None:
+            state.loaded_strategy_settings = state.strategy_settings
+        if state.loading:
+            return
+        if state.history is None or state.history.empty:
+            self._mark_state_for_reload(state)
+            return
+        if state.backtest is None:
+            self._mark_state_for_reload(state)
+            return
+        if state.needs_reload or state.force_history_refetch:
+            self._mark_state_for_reload(state, force_history_refetch=state.force_history_refetch)
 
     def _load_one_pending_state(self) -> None:
         pending_keys = [key for key, state in self.symbol_states.items() if state.loading]
         if not pending_keys:
             return
-        key = pending_keys[0]
+        key = sorted(pending_keys, key=self._pending_state_sort_key)[0]
         state = self.symbol_states[key]
         try:
             if self.client is None:
                 return
-            had_existing_history = state.history is not None and not state.history.empty
-            history = state.history
+            history = None if state.force_history_refetch else state.history
+            had_existing_history = history is not None and not history.empty
             if history is None or history.empty:
                 start_time = _history_fetch_start_time_ms(self.history_days, state.interval, state.strategy_settings)
                 history = self.client.historical_ohlcv(state.symbol, state.interval, start_time=start_time)
@@ -949,6 +1084,10 @@ class _TradeEngine:
                 trigger_bar_time = _fresh_initial_trigger_bar_time(backtest, state.interval)
             state.history = history
             state.backtest = backtest
+            state.loaded_strategy_settings = state.strategy_settings
+            state.needs_reload = False
+            state.force_history_refetch = False
+            state.reload_requested_at = 0.0
             self._start_stream(key)
             self._emit_signal_event(state)
             self._evaluate_backtest_auto_close(state)
@@ -965,28 +1104,91 @@ class _TradeEngine:
         finally:
             state.loading = False
 
-    def _start_stream(self, key: Tuple[str, str]) -> None:
-        if key in self.streams or self.client is None:
-            return
-        symbol, interval = key
-        seed_history = None
-        if interval == "2m":
-            try:
-                seed_history = self.client.historical_ohlcv_recent(symbol, "1m", bars=2)
-            except Exception:
-                seed_history = None
-        stop_event = threading.Event()
-        stream = _EngineKlineStream(symbol, interval, self.internal_queue, stop_event, seed_history=seed_history)
-        self.streams[key] = (stream, stop_event)
-        stream.start()
+    def _stream_targets_signature(
+        self,
+        targets_by_symbol: Dict[str, Tuple[str, ...]],
+    ) -> Tuple[Tuple[str, Tuple[str, ...]], ...]:
+        return tuple(
+            sorted(
+                (
+                    str(symbol).upper(),
+                    tuple(sorted({str(interval) for interval in intervals})),
+                )
+                for symbol, intervals in dict(targets_by_symbol).items()
+                if intervals
+            )
+        )
 
-    def _stop_stream(self, key: Tuple[str, str]) -> None:
-        stream_entry = self.streams.pop(key, None)
+    def _desired_stream_targets_by_base_interval(self) -> Dict[str, Dict[str, Tuple[str, ...]]]:
+        grouped: Dict[str, Dict[str, set[str]]] = {}
+        for symbol, interval in self._active_symbol_keys():
+            base_interval = resolve_base_interval(interval)
+            symbol_map = grouped.setdefault(base_interval, {})
+            symbol_map.setdefault(str(symbol).upper(), set()).add(str(interval))
+        return {
+            base_interval: {
+                symbol: tuple(sorted(intervals))
+                for symbol, intervals in symbol_map.items()
+            }
+            for base_interval, symbol_map in grouped.items()
+        }
+
+    def _refresh_streams(self) -> None:
+        desired = self._desired_stream_targets_by_base_interval()
+        for base_interval in list(self.streams):
+            if base_interval not in desired:
+                self._stop_stream(base_interval)
+                continue
+            _stream, _stop_event, signature = self.streams[base_interval]
+            desired_signature = self._stream_targets_signature(desired[base_interval])
+            if signature != desired_signature:
+                self._stop_stream(base_interval)
+        for base_interval, targets_by_symbol in desired.items():
+            if base_interval in self.streams or self.client is None:
+                continue
+            seed_history_by_symbol: Dict[str, pd.DataFrame] = {}
+            if base_interval == "1m":
+                for symbol, intervals in targets_by_symbol.items():
+                    if "2m" not in intervals:
+                        continue
+                    try:
+                        history = self.client.historical_ohlcv_recent(symbol, "1m", bars=2)
+                    except Exception:
+                        history = None
+                    if history is not None and not history.empty:
+                        seed_history_by_symbol[symbol] = history
+            stop_event = threading.Event()
+            signature = self._stream_targets_signature(targets_by_symbol)
+            stream = _EngineMultiplexKlineStream(
+                base_interval,
+                targets_by_symbol,
+                self.internal_queue,
+                stop_event,
+                seed_history_by_symbol=seed_history_by_symbol,
+            )
+            self.streams[base_interval] = (stream, stop_event, signature)
+            started_at = time.time()
+            self.base_stream_started_at[base_interval] = started_at
+            self.base_stream_last_payload_at[base_interval] = started_at
+            stream.start()
+
+    def _start_stream(self, key: Tuple[str, str]) -> None:
+        del key
+        self._refresh_streams()
+
+    def _stop_stream(self, key: object) -> None:
+        if isinstance(key, tuple):
+            base_interval = resolve_base_interval(str(key[1]))
+        else:
+            base_interval = str(key)
+        stream_entry = self.streams.pop(base_interval, None)
         if stream_entry is None:
             return
-        stream, stop_event = stream_entry
+        stream, stop_event, _signature = stream_entry
         stop_event.set()
         stream.join(timeout=1.5)
+        self.base_stream_last_payload_at.pop(base_interval, None)
+        self.base_stream_started_at.pop(base_interval, None)
 
     def _stop_all_streams(self) -> None:
         for key in list(self.streams):
@@ -996,12 +1198,19 @@ class _TradeEngine:
         key = (symbol, interval)
         state = self.symbol_states.get(key)
         if state is None:
-            state = _EngineSymbolState(symbol=symbol, interval=interval, strategy_settings=self._settings_for_key(symbol, interval))
+            state = _EngineSymbolState(
+                symbol=symbol,
+                interval=interval,
+                strategy_settings=self._settings_for_key(symbol, interval),
+                priority_class=self._priority_class_for_key(key),
+            )
             self.symbol_states[key] = state
+        state.priority_class = self._priority_class_for_key(key, state)
         history = state.history
-        if history is None or history.empty:
+        if state.loading or history is None or history.empty:
             state.pending_closed_bar = dict(bar)
-            state.loading = True
+            if not state.loading:
+                self._mark_state_for_reload(state)
             return
         state.history = _merge_live_bar(history, bar)
         backtest_start_time = pd.to_datetime(_backtest_start_time_ms(self.history_days), unit="ms")
@@ -1020,6 +1229,10 @@ class _TradeEngine:
                 fee_rate=self.fee_rate,
                 backtest_start_time=backtest_start_time,
             )
+        state.loaded_strategy_settings = state.strategy_settings
+        state.needs_reload = False
+        state.force_history_refetch = False
+        state.reload_requested_at = 0.0
         self._emit_signal_event(state)
         self._evaluate_backtest_auto_close(state)
         self._evaluate_auto_trade(
@@ -1037,11 +1250,21 @@ class _TradeEngine:
     ) -> None:
         if price <= 0:
             return
-        self.latest_stream_price_by_symbol[str(symbol)] = float(price)
+        symbol = str(symbol).upper()
+        interval = str(interval)
+        now = time.time()
+        self.latest_stream_price_by_symbol[symbol] = float(price)
+        self.base_stream_last_payload_at[resolve_base_interval(interval)] = now
+        state = self.symbol_states.get((symbol, interval))
+        if state is not None:
+            state.last_stream_payload_at = now
+            state.last_price_update_at = now
+            state.stale_since = 0.0
+            state.priority_class = self._priority_class_for_key((symbol, interval), state)
+            self.last_stale_symbol_eval_at.pop((symbol, interval), None)
         if not self.auto_trade_enabled:
             return
-        key = (str(symbol), str(interval))
-        now = time.time()
+        key = (symbol, interval)
         last_eval = float(self.last_stream_price_eval_at.get(key, 0.0))
         if now - last_eval < STREAM_PRICE_EVAL_MIN_INTERVAL_SECONDS:
             return
@@ -1080,6 +1303,28 @@ class _TradeEngine:
         if self.auto_trade_enabled:
             managed.update(self.open_positions)
         return managed
+
+    def _auto_trade_items(self) -> List[EngineWatchlistItem]:
+        items = list(self.watchlist.values())
+        existing_keys = {(item.symbol, item.interval) for item in items}
+        for symbol in sorted(self.open_positions):
+            interval = self.position_intervals.get(symbol)
+            if interval not in APP_INTERVAL_OPTIONS:
+                interval = next((key_interval for key_symbol, key_interval in self.watchlist if key_symbol == symbol), self.default_interval)
+            key = (symbol, interval)
+            if key in existing_keys:
+                continue
+            state = self.symbol_states.get(key)
+            items.append(
+                EngineWatchlistItem(
+                    symbol=symbol,
+                    interval=interval,
+                    score=0.0 if state is None else float(state.score),
+                    return_pct=0.0 if state is None else float(state.return_pct),
+                    strategy_settings=self._settings_for_key(symbol, interval),
+                )
+            )
+        return items
 
     def _state_for_symbol(self, symbol: str) -> Optional[_EngineSymbolState]:
         interval = self.position_intervals.get(symbol)
@@ -1147,22 +1392,9 @@ class _TradeEngine:
         state = self.symbol_states.get((item.symbol, item.interval))
         if state is None:
             return None
-        return state.backtest
-
-    def _pick_auto_trade_candidate(self, candidates: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
-        if not candidates:
+        if state.needs_reload and item.symbol not in self.open_positions:
             return None
-        if self.optimization_rank_mode == "return":
-            best_return = max(float(item["return_pct"]) for item in candidates)
-            return_tied = [item for item in candidates if float(item["return_pct"]) == best_return]
-            best_score = max(float(item["score"]) for item in return_tied)
-            score_tied = [item for item in return_tied if float(item["score"]) == best_score]
-            return random.choice(score_tied)
-        best_score = max(float(item["score"]) for item in candidates)
-        score_tied = [item for item in candidates if float(item["score"]) == best_score]
-        best_return = max(float(item["return_pct"]) for item in score_tied)
-        return_tied = [item for item in score_tied if float(item["return_pct"]) == best_return]
-        return random.choice(return_tied)
+        return state.backtest
 
     def _evaluate_auto_trade(
         self,
@@ -1178,14 +1410,14 @@ class _TradeEngine:
         normalized_trigger_time = (
             pd.Timestamp(trigger_bar_time).tz_localize(None) if trigger_bar_time is not None else None
         )
-        eligible_items = list(self.watchlist.values())
+        eligible_items = self._auto_trade_items()
         if not eligible_items:
             return
         ticker_map: Optional[Dict[str, Dict[str, object]]] = None
 
-        def current_price_for(symbol: str) -> Optional[float]:
+        def current_price_for(symbol: str, interval: str) -> Optional[float]:
             live_price = float(self.latest_stream_price_by_symbol.get(symbol, 0.0) or 0.0)
-            if live_price > 0:
+            if live_price > 0 and self._stream_price_is_fresh(symbol, interval):
                 return live_price
             nonlocal ticker_map
             if ticker_map is None:
@@ -1202,87 +1434,55 @@ class _TradeEngine:
 
         open_positions_by_symbol = dict(self.open_positions)
         candidates: List[Dict[str, object]] = []
-        trigger_target_seen = False
-        trigger_skip_reason: Optional[str] = None
-
-        def record_trigger_skip(reason: str) -> None:
-            nonlocal trigger_skip_reason
-            if not trigger_symbol or trigger_skip_reason is not None:
-                return
-            trigger_skip_reason = str(reason)
         for item in eligible_items:
             if item.symbol in self.pending_order_symbols:
-                if trigger_symbol and item.symbol == trigger_symbol and (not trigger_interval or item.interval == trigger_interval):
-                    trigger_target_seen = True
-                    record_trigger_skip("pending_order")
                 continue
             if trigger_symbol and item.symbol != trigger_symbol:
                 continue
             if trigger_interval and item.interval != trigger_interval:
                 continue
-            if trigger_symbol and item.symbol == trigger_symbol:
-                trigger_target_seen = True
             open_position = open_positions_by_symbol.get(item.symbol)
             if open_positions_by_symbol and open_position is None:
-                record_trigger_skip("other_open_position_block")
                 continue
             if open_position is not None:
                 remembered_interval = self.position_intervals.get(item.symbol)
                 if remembered_interval in APP_INTERVAL_OPTIONS and remembered_interval != item.interval:
-                    record_trigger_skip("interval_mismatch")
                     continue
             latest_backtest = self._latest_auto_trade_backtest(item)
             if latest_backtest is None:
-                record_trigger_skip("no_backtest")
                 continue
-            signal = _auto_trade_signal_from_backtest(latest_backtest)
-            if signal is None:
-                record_trigger_skip("no_signal")
-                continue
-            current_price = current_price_for(item.symbol)
-            if current_price is None:
-                record_trigger_skip("no_price")
-                continue
-            signal_price = float(signal["price"])
-            zone_prices = dict(signal.get("zone_prices") or {})
-            confirmed_entry = (
-                latest_confirmed_entry_event(latest_backtest, normalized_trigger_time)
-                if normalized_trigger_time is not None
-                and item.symbol == trigger_symbol
-                and item.interval == trigger_interval
-                else None
+            current_price = current_price_for(item.symbol, item.interval)
+            evaluation = evaluate_auto_trade_candidate(
+                symbol=item.symbol,
+                interval=item.interval,
+                score=float(item.score),
+                strategy_settings=item.strategy_settings,
+                latest_backtest=latest_backtest,
+                current_price=current_price,
+                open_position=open_position,
+                remembered_interval=self.position_intervals.get(item.symbol),
+                filled_fraction=self.filled_fraction_by_symbol.get(
+                    item.symbol,
+                    _inferred_auto_trade_fraction(latest_backtest, open_position)
+                    if open_position is not None
+                    else 0.0,
+                ),
+                remembered_cursor_entry_time=self.auto_trade_cursor_entry_time.get(item.symbol),
+                trigger_symbol=trigger_symbol,
+                trigger_interval=trigger_interval,
+                trigger_bar_time=normalized_trigger_time,
             )
-            side = str(signal["side"])
-            has_fresh_confirmed_entry = (
-                confirmed_entry is not None
-                and str(confirmed_entry["side"]) == side
-                and int(confirmed_entry["zone"]) == int(signal["zone"])
-            )
-            if normalized_trigger_time is not None:
-                if confirmed_entry is None:
-                    record_trigger_skip("no_confirmed_entry")
-                elif not has_fresh_confirmed_entry:
-                    record_trigger_skip("fresh_mismatch")
-            # Skip entry when the backtest's exit condition is already active for
-            # this direction: the auto-close would fire immediately, causing a
+            if evaluation.reentry_position_side:
+                self._trigger_reentry_auto_close(item.symbol, evaluation.reentry_position_side, latest_backtest)
+                continue
+            if evaluation.candidate is None:
+                continue
+            candidates.append(dict(evaluation.candidate))
+            continue
             # wasteful enter→close→re-enter cycle on the same bar.
-            bt_latest_state = latest_backtest.latest_state
-            if bt_latest_state and open_position is not None:
-                if side == "long" and (
-                    bool(bt_latest_state.get("trend_to_short")) or bool(bt_latest_state.get("final_bear"))
-                ):
-                    record_trigger_skip("exit_active")
-                    continue
-                if side == "short" and (
-                    bool(bt_latest_state.get("trend_to_long")) or bool(bt_latest_state.get("final_bull"))
-                ):
-                    record_trigger_skip("exit_active")
-                    continue
-            fraction = float(signal["fraction"])
             if open_position is not None:
                 position_side = "long" if float(open_position.amount) > 0 else "short"
                 if side != position_side:
-                    record_trigger_skip("position_side_mismatch")
                     continue
                 # Detect close→reopen: the backtest closed the position and
                 # re-entered, but the real exchange position hasn't been closed
@@ -1292,7 +1492,6 @@ class _TradeEngine:
                 if remembered is not None and cursor_entry_time is not None:
                     if pd.Timestamp(remembered).tz_localize(None) != pd.Timestamp(cursor_entry_time).tz_localize(None):
                         self._trigger_reentry_auto_close(item.symbol, position_side, latest_backtest)
-                        record_trigger_skip("waiting_reentry_close")
                         continue
                 filled_fraction = self.filled_fraction_by_symbol.get(
                     item.symbol,
@@ -1300,14 +1499,12 @@ class _TradeEngine:
                 )
                 fraction = max(0.0, fraction - float(filled_fraction))
                 if fraction <= 1e-9:
-                    record_trigger_skip("no_remaining_fraction")
                     continue
                 if not has_fresh_confirmed_entry:
                     favorable_fraction = _zone_favorable_fraction(
                         side, current_price, signal_price, zone_prices, float(filled_fraction),
                     )
                     if favorable_fraction <= 1e-9:
-                        record_trigger_skip("not_fresh_and_not_favorable")
                         continue
                     fraction = min(fraction, favorable_fraction)
                 # Additional entry (e.g. L2→L3): enter immediately when the
@@ -1320,7 +1517,6 @@ class _TradeEngine:
                         side, current_price, signal_price, zone_prices, 0.0,
                     )
                     if favorable_fraction <= 1e-9:
-                        record_trigger_skip("not_fresh_and_not_favorable")
                         continue
                     fraction = min(fraction, favorable_fraction)
             candidates.append(
@@ -1335,7 +1531,7 @@ class _TradeEngine:
                     "cursor_entry_time": signal.get("cursor_entry_time"),
                 }
             )
-        chosen = self._pick_auto_trade_candidate(candidates)
+        chosen = pick_auto_trade_candidate(candidates, self.optimization_rank_mode)
         if chosen is None:
             return
         # Remember the cursor entry_time on first entry so we can detect

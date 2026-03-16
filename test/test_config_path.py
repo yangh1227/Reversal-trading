@@ -53,7 +53,7 @@ class TestConfigPath(unittest.TestCase):
             self.assertFalse(loaded.use_atr_4h_filter)
             self.assertEqual(loaded.optimization_min_score, 70.0)
             self.assertEqual(loaded.max_grid_combinations, 300)
-            self.assertEqual(loaded.optimize_processes, 8)
+            self.assertEqual(loaded.optimize_processes, self.config.default_optimize_process_count())
             self.assertEqual(loaded.strategy.factor, 17.0)
             self.assertEqual(loaded.strategy.zone_sensitivity, 8.0)
             self.assertEqual(loaded.strategy.sensitivity_mode, "10-Ultra Broad Max")
@@ -143,6 +143,11 @@ class TestConfigPath(unittest.TestCase):
 
             self.assertEqual(loaded.position_intervals["BTCUSDT"], "5m")
             self.assertEqual(loaded.position_strategy_settings["BTCUSDT"], locked_settings)
+
+    def test_default_app_settings_use_dynamic_optimize_process_count(self) -> None:
+        settings = self.config.AppSettings()
+
+        self.assertEqual(settings.optimize_processes, self.config.default_optimize_process_count())
 
 
 if __name__ == "__main__":

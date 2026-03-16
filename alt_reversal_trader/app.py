@@ -5,7 +5,6 @@ from dataclasses import dataclass
 import json
 import multiprocessing as mp
 from numbers import Number
-import random
 import time
 from typing import Dict, List, Optional, Tuple
 import traceback
@@ -14,6 +13,12 @@ import pandas as pd
 from lightweight_charts.widgets import QtChart
 import websocket
 
+from .auto_trade_runtime import (
+    evaluate_auto_trade_candidate,
+    history_can_resume_backtest as _history_can_resume_backtest,
+    inferred_auto_trade_fraction as _inferred_auto_trade_fraction,
+    pick_auto_trade_candidate,
+)
 from .binance_futures import (
     BalanceSnapshot,
     BinanceFuturesClient,
@@ -73,8 +78,6 @@ from .qt_compat import (
     Signal,
 )
 from .strategy import (
-    active_auto_trade_signal as strategy_active_auto_trade_signal,
-    active_entry_price_by_zone,
     CHART_INDICATOR_COLUMNS,
     BacktestResult,
     compact_indicator_frame,
@@ -413,14 +416,6 @@ def _chart_candle_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return frame.loc[:, columns].copy() if columns else pd.DataFrame(columns=["time", "open", "high", "low", "close"])
 
 
-def _history_can_resume_backtest(backtest: Optional[BacktestResult], history: Optional[pd.DataFrame]) -> bool:
-    if backtest is None or history is None or history.empty or backtest.indicators.empty or backtest.cursor is None:
-        return False
-    history_times = pd.to_datetime(history["time"])
-    backtest_last_time = pd.Timestamp(backtest.indicators["time"].iloc[-1])
-    return bool((history_times == backtest_last_time).any()) and pd.Timestamp(history_times.iloc[-1]) > backtest_last_time
-
-
 def _is_provisional_exit_trade(trade, latest_time: Optional[pd.Timestamp]) -> bool:
     if latest_time is None:
         return False
@@ -672,54 +667,6 @@ def _preview_entry_signal(
     if can_short_z3:
         return ("short", 3)
     return None
-
-
-def _signal_fraction_for_zone(zone: int) -> float:
-    return signal_fraction_for_zone(zone)
-
-
-def _zone_favorable_fraction(
-    side: str,
-    current_price: float,
-    signal_price: float,
-    zone_prices: Dict[int, float],
-    filled_fraction: float,
-) -> float:
-    for z in (3, 2):
-        zp = zone_prices.get(z)
-        if zp is None or zp <= 0:
-            continue
-        favorable = current_price < zp if side == "long" else current_price > zp
-        if favorable:
-            zone_fraction = signal_fraction_for_zone(z)
-            remaining = max(0.0, zone_fraction - filled_fraction)
-            if remaining > 1e-9:
-                return remaining
-    favorable = current_price < signal_price if side == "long" else current_price > signal_price
-    if favorable:
-        return max(0.0, signal_fraction_for_zone(1) - filled_fraction)
-    return 0.0
-
-
-def _auto_trade_signal_from_backtest(backtest: BacktestResult) -> Optional[Dict[str, object]]:
-    return strategy_active_auto_trade_signal(backtest)
-
-
-def _inferred_auto_trade_fraction(backtest: BacktestResult, position: Optional[PositionSnapshot]) -> float:
-    cursor = backtest.cursor
-    if cursor is None or position is None or abs(float(position.amount)) < 1e-12:
-        return 0.0
-    side = "long" if float(position.amount) > 0 else "short"
-    zone = 0
-    signal_side = str(cursor.last_entry_signal_side or "").lower()
-    signal_zone = int(cursor.last_entry_signal_zone or 0)
-    if signal_side == side and signal_zone in {1, 2, 3}:
-        zone = signal_zone
-    fallback_zone = int(cursor.last_long_zone if side == "long" else cursor.last_short_zone)
-    if fallback_zone in {1, 2, 3}:
-        zone = max(zone, fallback_zone)
-    return _signal_fraction_for_zone(zone) if zone in {1, 2, 3} else 0.0
-
 
 def _position_return_pct(position: PositionSnapshot) -> float:
     notional = abs(float(position.amount)) * float(position.entry_price)
@@ -1577,6 +1524,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.pending_candidates: List[CandidateSymbol] = []
         self.pending_optimized_results: Dict[Tuple[str, str], OptimizationResult] = {}
         self.pending_history_cache: Dict[Tuple[str, str], pd.DataFrame] = {}
+        self.pending_backtest_cache: Dict[Tuple[str, str], BacktestResult] = {}
+        self.pending_chart_indicator_cache: Dict[Tuple[str, str], pd.DataFrame] = {}
         self.preserve_lists_during_refresh = False
         self.open_positions: List[PositionSnapshot] = []
         self.position_strategy_by_symbol: Dict[str, StrategySettings] = dict(self.settings.position_strategy_settings)
@@ -1640,7 +1589,10 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_trade_entry_pending_symbol: Optional[str] = None
         self.auto_trade_entry_pending_at: float = 0.0
         self.auto_trade_entry_pending_fraction = 0.0
+        self.auto_trade_entry_pending_cursor_time = None
+        self.auto_trade_entry_pending_cursor_time: Optional[pd.Timestamp] = None
         self.auto_trade_filled_fraction_by_symbol: Dict[str, float] = {}
+        self.auto_trade_cursor_entry_time_by_symbol: Dict[str, pd.Timestamp] = {}
         self.order_worker_symbol: Optional[str] = None
         self.order_worker_is_auto_close = False
         self.order_worker_is_auto_trade = False
@@ -3030,21 +2982,61 @@ class AltReversalTraderWindow(QMainWindow):
             return cached_backtest
         return result.best_backtest
 
-    def _pick_auto_trade_candidate(self, candidates: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
-        if not candidates:
-            return None
-        rank_mode = self._optimization_rank_mode()
-        if rank_mode == "return":
-            best_return = max(float(item["return_pct"]) for item in candidates)
-            return_tied = [item for item in candidates if float(item["return_pct"]) == best_return]
-            best_score = max(float(item["score"]) for item in return_tied)
-            score_tied = [item for item in return_tied if float(item["score"]) == best_score]
-            return random.choice(score_tied)
-        best_score = max(float(item["score"]) for item in candidates)
-        score_tied = [item for item in candidates if float(item["score"]) == best_score]
-        best_return = max(float(item["return_pct"]) for item in score_tied)
-        return_tied = [item for item in score_tied if float(item["return_pct"]) == best_return]
-        return random.choice(return_tied)
+    def _fallback_auto_trade_items(self) -> List[Dict[str, object]]:
+        items: List[Dict[str, object]] = []
+        existing_keys: set[Tuple[str, str]] = set()
+        for result in self._eligible_auto_trade_results():
+            interval = result.best_interval or self.settings.kline_interval
+            existing_keys.add((result.symbol, interval))
+            items.append(
+                {
+                    "symbol": result.symbol,
+                    "interval": interval,
+                    "score": float(result.score),
+                    "strategy_settings": result.best_backtest.settings,
+                    "backtest": self._latest_auto_trade_backtest(result),
+                }
+            )
+        for position in self.open_positions:
+            symbol = str(position.symbol)
+            interval = self._position_interval_for_symbol(symbol)
+            key = (symbol, interval)
+            if key in existing_keys:
+                continue
+            strategy_settings = self._active_backtest_settings(
+                symbol,
+                interval,
+                prefer_locked_position_settings=True,
+            )
+            history = self._get_history_frame(symbol, interval)
+            seed_backtest = self.backtest_cache.get(self._symbol_interval_key(symbol, interval))
+            if (
+                seed_backtest is None
+                and symbol == self.current_symbol
+                and interval == self.current_interval
+                and self.current_backtest is not None
+                and self.current_backtest.settings == strategy_settings
+            ):
+                seed_backtest = self.current_backtest
+            backtest = self._materialize_cached_backtest(
+                symbol,
+                interval,
+                history,
+                seed_backtest,
+                strategy_settings,
+            )
+            if backtest is None:
+                continue
+            items.append(
+                {
+                    "symbol": symbol,
+                    "interval": interval,
+                    "score": 0.0,
+                    "strategy_settings": strategy_settings,
+                    "backtest": backtest,
+                }
+            )
+        return items
 
     def _toggle_auto_trade_mode(self, checked: bool) -> None:
         self.auto_trade_requested = bool(checked)
@@ -3082,6 +3074,10 @@ class AltReversalTraderWindow(QMainWindow):
             if time.time() - self.auto_trade_entry_pending_at > 60.0:
                 self.log(f"Auto-trade pending timeout: {self.auto_trade_entry_pending_symbol}")
                 self.auto_trade_entry_pending_symbol = None
+                self.auto_trade_entry_pending_fraction = 0.0
+                self.auto_trade_entry_pending_cursor_time = None
+                self.auto_trade_filled_fraction_by_symbol = {}
+                self.auto_trade_cursor_entry_time_by_symbol = {}
             else:
                 return
         self._refresh_auto_close_monitors()
@@ -3091,8 +3087,8 @@ class AltReversalTraderWindow(QMainWindow):
             pd.Timestamp(trigger_bar_time).tz_localize(None) if trigger_bar_time is not None else None
         )
         open_positions_by_symbol = {position.symbol: position for position in self.open_positions}
-        eligible_results = self._eligible_auto_trade_results()
-        if not eligible_results:
+        eligible_items = self._fallback_auto_trade_items()
+        if not eligible_items:
             return
         try:
             ticker_map = self.public_client.ticker_24h()
@@ -3100,80 +3096,51 @@ class AltReversalTraderWindow(QMainWindow):
             self.log(f"자동매매 시세 조회 실패: {exc}")
             return
         candidates: List[Dict[str, object]] = []
-        for result in eligible_results:
-            interval = result.best_interval or self.settings.kline_interval
-            open_position = open_positions_by_symbol.get(result.symbol)
+        for item in eligible_items:
+            symbol = str(item["symbol"])
+            interval = str(item["interval"])
+            open_position = open_positions_by_symbol.get(symbol)
             if open_positions_by_symbol and open_position is None:
                 continue
-            latest_backtest = self._latest_auto_trade_backtest(result)
-            signal = _auto_trade_signal_from_backtest(latest_backtest)
-            if signal is None:
-                continue
-            ticker = ticker_map.get(result.symbol)
+            latest_backtest = item.get("backtest")
+            ticker = ticker_map.get(symbol)
             if not ticker:
                 continue
             current_price = float(ticker.get("lastPrice", 0.0) or 0.0)
-            signal_price = float(signal["price"])
-            zone_prices = dict(signal.get("zone_prices") or {})
-            confirmed_entry = (
-                latest_confirmed_entry_event(latest_backtest, normalized_trigger_time)
-                if normalized_trigger_time is not None
-                and result.symbol == trigger_symbol
-                and interval == trigger_interval
-                else None
+            evaluation = evaluate_auto_trade_candidate(
+                symbol=symbol,
+                interval=interval,
+                score=float(item["score"]),
+                strategy_settings=item.get("strategy_settings"),
+                latest_backtest=latest_backtest,
+                current_price=current_price,
+                open_position=open_position,
+                remembered_interval=self.settings.position_intervals.get(symbol),
+                filled_fraction=self.auto_trade_filled_fraction_by_symbol.get(
+                    symbol,
+                    _inferred_auto_trade_fraction(latest_backtest, open_position)
+                    if latest_backtest is not None
+                    else 0.0,
+                ),
+                remembered_cursor_entry_time=self.auto_trade_cursor_entry_time_by_symbol.get(symbol),
+                trigger_symbol=trigger_symbol,
+                trigger_interval=trigger_interval,
+                trigger_bar_time=normalized_trigger_time,
             )
-            side = str(signal["side"])
-            has_fresh_confirmed_entry = (
-                confirmed_entry is not None
-                and str(confirmed_entry["side"]) == side
-                and int(confirmed_entry["zone"]) == int(signal["zone"])
-            )
-            fraction = float(signal["fraction"])
-            if open_position is not None:
-                position_side = "long" if float(open_position.amount) > 0 else "short"
-                if side != position_side:
-                    continue
-                filled_fraction = self.auto_trade_filled_fraction_by_symbol.get(
-                    result.symbol,
-                    _inferred_auto_trade_fraction(latest_backtest, open_position),
-                )
-                fraction = max(0.0, fraction - float(filled_fraction))
-                if fraction <= 1e-9:
-                    continue
-                if not has_fresh_confirmed_entry:
-                    favorable_fraction = _zone_favorable_fraction(
-                        side, current_price, signal_price, zone_prices, float(filled_fraction),
-                    )
-                    if favorable_fraction <= 1e-9:
-                        continue
-                    fraction = min(fraction, favorable_fraction)
-            else:
-                if not has_fresh_confirmed_entry:
-                    favorable_fraction = _zone_favorable_fraction(
-                        side, current_price, signal_price, zone_prices, 0.0,
-                    )
-                    if favorable_fraction <= 1e-9:
-                        continue
-                    fraction = min(fraction, favorable_fraction)
-            candidates.append(
-                {
-                    "symbol": result.symbol,
-                    "interval": interval,
-                    "side": "BUY" if side == "long" else "SELL",
-                    "score": float(result.score),
-                    "return_pct": float(latest_backtest.metrics.total_return_pct),
-                    "fraction": float(fraction),
-                    "zone": int(signal["zone"]),
-                    "signal_time": (
-                        pd.Timestamp(confirmed_entry["bar_time"])
-                        if confirmed_entry is not None
-                        else pd.Timestamp(signal["time"])
-                    ),
-                }
-            )
-        chosen = self._pick_auto_trade_candidate(candidates)
+            if evaluation.reentry_position_side and latest_backtest is not None:
+                self._evaluate_backtest_auto_close(symbol, latest_backtest)
+                continue
+            if evaluation.candidate is None:
+                continue
+            candidates.append(dict(evaluation.candidate))
+        chosen = pick_auto_trade_candidate(candidates, self._optimization_rank_mode())
         if chosen is None:
             return
+        self.auto_trade_entry_pending_cursor_time = (
+            pd.Timestamp(chosen["cursor_entry_time"])
+            if chosen.get("cursor_entry_time") is not None
+            else None
+        )
         self._submit_open_order(
             str(chosen["side"]),
             fraction=float(chosen["fraction"]),
@@ -3545,6 +3512,9 @@ class AltReversalTraderWindow(QMainWindow):
             self.log("자동매매 비활성화")
         self.auto_trade_entry_pending_symbol = None
         self.auto_trade_entry_pending_fraction = 0.0
+        self.auto_trade_entry_pending_cursor_time = None
+        self.auto_trade_filled_fraction_by_symbol = {}
+        self.auto_trade_cursor_entry_time_by_symbol = {}
         self._refresh_auto_close_monitors()
         self._sync_trade_engine_state()
         self.update_positions_table()
@@ -5462,7 +5432,7 @@ class AltReversalTraderWindow(QMainWindow):
             or (self.optimize_worker and self.optimize_worker.isRunning())
         )
 
-    def run_scan_and_optimize(self, preserve_existing: bool = False) -> None:
+    def run_scan_and_optimize(self, preserve_existing: bool = True) -> None:
         if self._is_refresh_running():
             return
         self.save_settings()
@@ -5470,27 +5440,12 @@ class AltReversalTraderWindow(QMainWindow):
         self._stop_optimize_worker()
         self._stop_load_worker()
         self._stop_live_backtest_worker()
-        self.preserve_lists_during_refresh = preserve_existing
+        self.preserve_lists_during_refresh = bool(preserve_existing)
         self.pending_candidates = []
         self.pending_optimized_results = {}
         self.pending_history_cache = {}
-        if not preserve_existing:
-            self._stop_live_stream()
-            self.candidates = []
-            self.optimized_results.clear()
-            self.history_cache.clear()
-            self.chart_history_cache.clear()
-            self.history_refresh_times.clear()
-            self.backtest_cache.clear()
-            self.chart_indicator_cache.clear()
-            self.current_symbol = None
-            self.current_backtest = None
-            self.current_chart_indicators = None
-            self.current_chart_snapshot = None
-            self.update_candidate_table()
-            self.update_optimized_table()
-            self.summary_box.clear()
-            self._refresh_auto_trade_button_state()
+        self.pending_backtest_cache = {}
+        self.pending_chart_indicator_cache = {}
         self.log("후보 스캔 + 최적화 시작" + (" (기존 목록 유지)" if preserve_existing else ""))
         self._set_backtest_progress_scanning()
         self._set_refresh_running(True)
@@ -5519,6 +5474,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.pending_candidates = []
         self.pending_optimized_results = {}
         self.pending_history_cache = {}
+        self.pending_backtest_cache = {}
+        self.pending_chart_indicator_cache = {}
         self.preserve_lists_during_refresh = False
         self._set_backtest_progress_idle("백테스트 대상 없음")
         self._set_refresh_running(False)
@@ -5554,12 +5511,14 @@ class AltReversalTraderWindow(QMainWindow):
         interval = optimization.best_interval or self.settings.kline_interval
         self._advance_backtest_progress(candidate.symbol, interval)
         cache_key = self._symbol_interval_key(candidate.symbol, optimization.best_interval or self.settings.kline_interval)
-        self.backtest_cache[cache_key] = optimization.best_backtest
-        self.chart_indicator_cache[cache_key] = _chart_indicators_from_backtest(optimization.best_backtest)
         if self.preserve_lists_during_refresh:
             self.pending_optimized_results[cache_key] = optimization
             self._set_pending_history_frame(candidate.symbol, history, optimization.best_interval or self.settings.kline_interval)
+            self.pending_backtest_cache[cache_key] = optimization.best_backtest
+            self.pending_chart_indicator_cache[cache_key] = _chart_indicators_from_backtest(optimization.best_backtest)
             return
+        self.backtest_cache[cache_key] = optimization.best_backtest
+        self.chart_indicator_cache[cache_key] = _chart_indicators_from_backtest(optimization.best_backtest)
         self.optimized_results[cache_key] = optimization
         self._set_history_frame(candidate.symbol, history, optimization.best_interval or self.settings.kline_interval)
         self._mark_history_refreshed(candidate.symbol, time.time(), optimization.best_interval or self.settings.kline_interval)
@@ -5577,6 +5536,8 @@ class AltReversalTraderWindow(QMainWindow):
                 self.update_candidate_table()
             if self.pending_optimized_results:
                 self.optimized_results = dict(self.pending_optimized_results)
+                self.backtest_cache.update(self.pending_backtest_cache)
+                self.chart_indicator_cache.update(self.pending_chart_indicator_cache)
                 self._flush_optimized_table()
             self.history_cache.update(self.pending_history_cache)
             refreshed_at = time.time()
@@ -5585,6 +5546,8 @@ class AltReversalTraderWindow(QMainWindow):
             self.pending_candidates = []
             self.pending_optimized_results = {}
             self.pending_history_cache = {}
+            self.pending_backtest_cache = {}
+            self.pending_chart_indicator_cache = {}
             self.preserve_lists_during_refresh = False
         self._prune_caches()
         self.log(f"최적화 완료: {len(self.optimized_results)}개 케이스")
@@ -5602,6 +5565,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.pending_candidates = []
         self.pending_optimized_results = {}
         self.pending_history_cache = {}
+        self.pending_backtest_cache = {}
+        self.pending_chart_indicator_cache = {}
         self.preserve_lists_during_refresh = False
         log_runtime_event("Worker Failure", message, open_notepad=False)
         self.log(message)
@@ -6294,6 +6259,10 @@ class AltReversalTraderWindow(QMainWindow):
                 self.auto_trade_enabled = False
                 self.auto_trade_timer.stop()
                 self.auto_trade_entry_pending_symbol = None
+                self.auto_trade_entry_pending_fraction = 0.0
+                self.auto_trade_entry_pending_cursor_time = None
+                self.auto_trade_filled_fraction_by_symbol = {}
+                self.auto_trade_cursor_entry_time_by_symbol = {}
                 self.log("API 키가 없어 자동매매를 비활성화했습니다.")
             self.open_positions = []
             self.position_strategy_by_symbol = {}
@@ -6343,6 +6312,11 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_trade_filled_fraction_by_symbol = {
             symbol: fraction
             for symbol, fraction in self.auto_trade_filled_fraction_by_symbol.items()
+            if symbol in open_symbols
+        }
+        self.auto_trade_cursor_entry_time_by_symbol = {
+            symbol: entry_time
+            for symbol, entry_time in self.auto_trade_cursor_entry_time_by_symbol.items()
             if symbol in open_symbols
         }
         self._forget_closed_position_intervals(open_symbols, persist=False)
@@ -6395,7 +6369,9 @@ class AltReversalTraderWindow(QMainWindow):
         self.log(message)
         self.auto_trade_entry_pending_symbol = None
         self.auto_trade_entry_pending_fraction = 0.0
+        self.auto_trade_entry_pending_cursor_time = None
         self.auto_trade_filled_fraction_by_symbol = {}
+        self.auto_trade_cursor_entry_time_by_symbol = {}
         self._refresh_auto_close_retry_timer()
         self._refresh_auto_trade_button_state()
         self._sync_trade_engine_state()
@@ -6458,9 +6434,11 @@ class AltReversalTraderWindow(QMainWindow):
             self.auto_trade_entry_pending_symbol = target_symbol
             self.auto_trade_entry_pending_at = time.time()
             self.auto_trade_entry_pending_fraction = float(fraction or 0.0)
+            self.auto_trade_entry_pending_cursor_time = None
             self._request_symbol_load(target_symbol, target_interval)
         else:
             self.auto_trade_entry_pending_fraction = 0.0
+            self.auto_trade_entry_pending_cursor_time = None
         self._set_order_buttons_enabled(False)
         if auto_trade:
             self.log(
@@ -6571,6 +6549,8 @@ class AltReversalTraderWindow(QMainWindow):
                 signal_fraction_for_zone(3),
                 current_fraction + float(self.auto_trade_entry_pending_fraction or 0.0),
             )
+            if self.auto_trade_entry_pending_cursor_time is not None:
+                self.auto_trade_cursor_entry_time_by_symbol[order_symbol] = self.auto_trade_entry_pending_cursor_time
         self.order_worker_symbol = None
         self.order_worker_is_auto_close = False
         self.order_worker_is_auto_trade = False
@@ -6593,6 +6573,7 @@ class AltReversalTraderWindow(QMainWindow):
         if was_auto_trade:
             self.auto_trade_entry_pending_symbol = None
             self.auto_trade_entry_pending_fraction = 0.0
+            self.auto_trade_entry_pending_cursor_time = None
         self.order_worker_symbol = None
         self.order_worker_is_auto_close = False
         self.order_worker_is_auto_trade = False

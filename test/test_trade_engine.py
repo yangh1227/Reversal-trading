@@ -1,6 +1,8 @@
 import multiprocessing as mp
 import alt_reversal_trader.trade_engine as trade_engine_module
 from dataclasses import replace
+import threading
+import time
 
 import pandas as pd
 
@@ -269,6 +271,74 @@ def test_trade_engine_keeps_locked_position_strategy_when_watchlist_updates() ->
     assert state.loading is False
 
 
+def test_trade_engine_groups_active_symbols_by_base_interval() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.watchlist[("AAAUSDT", "1m")] = EngineWatchlistItem(
+        symbol="AAAUSDT",
+        interval="1m",
+        score=1.0,
+        return_pct=1.0,
+        strategy_settings=StrategySettings(),
+    )
+    engine.watchlist[("BBBUSDT", "2m")] = EngineWatchlistItem(
+        symbol="BBBUSDT",
+        interval="2m",
+        score=1.0,
+        return_pct=1.0,
+        strategy_settings=StrategySettings(),
+    )
+    engine.watchlist[("CCCUSDT", "5m")] = EngineWatchlistItem(
+        symbol="CCCUSDT",
+        interval="5m",
+        score=1.0,
+        return_pct=1.0,
+        strategy_settings=StrategySettings(),
+    )
+
+    grouped = engine._desired_stream_targets_by_base_interval()
+
+    assert grouped == {
+        "1m": {
+            "AAAUSDT": ("1m",),
+            "BBBUSDT": ("2m",),
+        },
+        "5m": {
+            "CCCUSDT": ("5m",),
+        },
+    }
+
+
+def test_trade_engine_refreshes_stream_targets_when_watchlist_changes() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    stream_snapshots: list[dict[str, dict[str, tuple[str, ...]]]] = []
+    engine._refresh_streams = lambda: stream_snapshots.append(engine._desired_stream_targets_by_base_interval())
+    engine.watchlist[("AAAUSDT", "1m")] = EngineWatchlistItem(
+        symbol="AAAUSDT",
+        interval="1m",
+        score=1.0,
+        return_pct=1.0,
+        strategy_settings=StrategySettings(),
+    )
+
+    engine._ensure_active_states()
+
+    engine.watchlist.pop(("AAAUSDT", "1m"))
+    engine.watchlist[("BBBUSDT", "2m")] = EngineWatchlistItem(
+        symbol="BBBUSDT",
+        interval="2m",
+        score=1.0,
+        return_pct=1.0,
+        strategy_settings=StrategySettings(),
+    )
+
+    engine._ensure_active_states()
+
+    assert stream_snapshots == [
+        {"1m": {"AAAUSDT": ("1m",)}},
+        {"1m": {"BBBUSDT": ("2m",)}},
+    ]
+
+
 def test_trade_engine_rebuilds_changed_state_from_cached_history_without_refetch() -> None:
     class NoFetchClient:
         def historical_ohlcv(self, *args, **kwargs):
@@ -304,14 +374,18 @@ def test_trade_engine_rebuilds_changed_state_from_cached_history_without_refetch
 
     state = engine.symbol_states[key]
     assert state.strategy_settings == new_settings
-    assert state.backtest is None
+    assert state.backtest is not None
     assert state.loading is True
+    assert state.needs_reload is True
+    assert state.loaded_strategy_settings == old_settings
 
     engine._load_one_pending_state()
 
     assert state.loading is False
     assert state.backtest is not None
     assert state.backtest.settings == new_settings
+    assert state.loaded_strategy_settings == new_settings
+    assert state.needs_reload is False
 
 
 def test_trade_engine_buffers_closed_bar_until_state_history_is_ready() -> None:
@@ -395,6 +469,51 @@ def test_trade_engine_initial_load_triggers_fresh_confirmed_latest_bar() -> None
     ]
 
 
+def test_trade_engine_prioritizes_open_position_state_reload() -> None:
+    class HistoryClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def historical_ohlcv(self, symbol, interval, start_time=None):
+            del interval, start_time
+            self.calls.append(str(symbol))
+            return make_sample_ohlcv(30)
+
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.client = HistoryClient()
+    engine._start_stream = lambda key: None
+    engine._emit_signal_event = lambda state: None
+    engine._evaluate_backtest_auto_close = lambda state: None
+    engine._evaluate_auto_trade = lambda **kwargs: None
+    engine.watchlist[("WATCHUSDT", "1m")] = EngineWatchlistItem(
+        symbol="WATCHUSDT",
+        interval="1m",
+        score=2.0,
+        return_pct=3.0,
+        strategy_settings=StrategySettings(),
+    )
+    engine.symbol_states[("WATCHUSDT", "1m")] = _EngineSymbolState(
+        symbol="WATCHUSDT",
+        interval="1m",
+        strategy_settings=StrategySettings(),
+        loading=True,
+        reload_requested_at=10.0,
+    )
+    engine.open_positions["POSUSDT"] = make_position("POSUSDT")
+    engine.position_intervals["POSUSDT"] = "1m"
+    engine.symbol_states[("POSUSDT", "1m")] = _EngineSymbolState(
+        symbol="POSUSDT",
+        interval="1m",
+        strategy_settings=StrategySettings(),
+        loading=True,
+        reload_requested_at=20.0,
+    )
+
+    engine._load_one_pending_state()
+
+    assert engine.client.calls == ["POSUSDT"]
+
+
 def test_trade_engine_drops_symbol_after_auto_close_reports_no_open_position() -> None:
     engine = _TradeEngine(mp.Queue(), mp.Queue())
     engine.open_positions["TESTUSDT"] = make_position()
@@ -425,35 +544,107 @@ def test_trade_engine_drops_symbol_after_auto_close_reports_no_open_position() -
     assert "TESTUSDT" not in engine.auto_close_last_attempt_at
 
 
-def test_trade_engine_logs_trigger_skip_reason_for_missing_price() -> None:
+def test_trade_engine_uses_rest_price_when_stream_price_is_stale() -> None:
     engine = _TradeEngine(mp.Queue(), mp.Queue())
     engine.auto_trade_enabled = True
-    engine.client = FakeTickerClient({})
-    backtest = make_signal_backtest(zone=3, signal_time="2026-01-01 00:15:00")
-    key = ("TESTUSDT", "2m")
+    engine.client = FakeTickerClient({"TESTUSDT": 110.0})
+    backtest = make_signal_backtest(side="short", zone=2, signal_time="2026-01-01 00:15:00", price=100.0)
+    key = ("TESTUSDT", "1m")
     engine.watchlist[key] = EngineWatchlistItem(
         symbol="TESTUSDT",
-        interval="2m",
+        interval="1m",
         score=7.0,
         return_pct=12.0,
         strategy_settings=StrategySettings(),
     )
     engine.symbol_states[key] = _EngineSymbolState(
         symbol="TESTUSDT",
-        interval="2m",
+        interval="1m",
         strategy_settings=StrategySettings(),
         backtest=backtest,
+        loaded_strategy_settings=StrategySettings(),
+        last_price_update_at=time.time() - 10.0,
+        stale_since=1.0,
     )
-    messages: list[str] = []
-    engine.log = lambda message: messages.append(str(message))
+    engine.latest_stream_price_by_symbol["TESTUSDT"] = 95.0
+    submitted: list[dict[str, object]] = []
+    engine._enqueue_open_order = lambda **kwargs: submitted.append(kwargs)
 
-    engine._evaluate_auto_trade(
-        trigger_symbol="TESTUSDT",
-        trigger_interval="2m",
-        trigger_bar_time=pd.Timestamp("2026-01-01 00:15:00"),
+    engine._evaluate_auto_trade()
+
+    assert len(submitted) == 1
+    assert submitted[0]["symbol"] == "TESTUSDT"
+
+
+def test_trade_engine_emits_degraded_and_recovered_health_events_for_stale_position_stream() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.api_key = "key"
+    engine.api_secret = "secret"
+    engine.streams["1m"] = (None, threading.Event(), tuple())  # type: ignore[arg-type]
+    engine.base_stream_started_at["1m"] = 100.0
+    engine.base_stream_last_payload_at["1m"] = 100.0
+    engine.open_positions["TESTUSDT"] = make_position()
+    engine.position_intervals["TESTUSDT"] = "1m"
+    state = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="1m",
+        strategy_settings=StrategySettings(),
+        backtest=make_signal_backtest(zone=2),
+        loaded_strategy_settings=StrategySettings(),
+        last_stream_payload_at=100.0,
+        last_price_update_at=100.0,
     )
+    engine.symbol_states[("TESTUSDT", "1m")] = state
+    events: list[object] = []
+    refresh_calls: list[bool] = []
+    stopped: list[str] = []
+    refreshed: list[bool] = []
+    engine.emit = lambda event: events.append(event)
+    engine._refresh_positions = lambda force=False: refresh_calls.append(force)
+    engine._stop_stream = lambda key: stopped.append(str(key))
+    engine._refresh_streams = lambda: refreshed.append(True)
 
-    assert any("Auto-trade trigger skipped" in message and "reason=no_price" in message for message in messages)
+    engine._update_stream_health(now=104.0)
+
+    assert state.stale_since == 104.0
+    assert refresh_calls == [True]
+    assert stopped == ["1m"]
+    assert refreshed == [True]
+    assert any(getattr(event, "status", "") == "degraded" for event in events)
+
+    state.last_stream_payload_at = 105.0
+    state.last_price_update_at = 105.0
+    engine.base_stream_last_payload_at["1m"] = 105.0
+
+    engine._update_stream_health(now=105.5)
+
+    assert state.stale_since == 0.0
+    assert any(getattr(event, "status", "") == "recovered" for event in events)
+
+
+def test_trade_engine_keeps_open_position_symbol_active_outside_watchlist() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.auto_trade_enabled = True
+    engine.client = FakeTickerClient({"TESTUSDT": 80.0})
+    engine.open_positions["TESTUSDT"] = make_position("TESTUSDT")
+    engine.position_intervals["TESTUSDT"] = "1m"
+    engine.filled_fraction_by_symbol["TESTUSDT"] = 0.5
+    backtest = make_signal_backtest(side="long", zone=3, signal_time="2026-01-01 00:15:00", price=100.0)
+    engine.symbol_states[("TESTUSDT", "1m")] = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="1m",
+        strategy_settings=StrategySettings(),
+        backtest=backtest,
+        loaded_strategy_settings=StrategySettings(),
+    )
+    submitted: list[dict[str, object]] = []
+    engine._enqueue_open_order = lambda **kwargs: submitted.append(kwargs)
+
+    engine._evaluate_auto_trade()
+
+    assert len(submitted) == 1
+    assert submitted[0]["symbol"] == "TESTUSDT"
+    assert submitted[0]["fraction"] > 0.0
 
 
 def test_trade_engine_drops_symbol_after_successful_close_before_refresh() -> None:
