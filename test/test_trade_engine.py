@@ -1,4 +1,5 @@
 import multiprocessing as mp
+from dataclasses import replace
 
 import pandas as pd
 
@@ -479,6 +480,48 @@ def test_trade_engine_enters_on_favorable_price_without_fresh_confirmed_trigger(
 
     assert len(submitted) == 1
     assert submitted[0]["side"] == "BUY"
+    assert round(float(submitted[0]["fraction"]), 2) == 0.50
+
+
+def test_trade_engine_allows_new_short_entry_even_if_opposite_exit_flags_are_set() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.auto_trade_enabled = True
+    engine.client = FakeTickerClient({"TESTUSDT": 110.0})
+    backtest = make_signal_backtest(
+        side="short",
+        zone=2,
+        signal_time="2026-01-01 00:15:00",
+        latest_time="2026-01-01 00:16:00",
+        price=100.0,
+    )
+    backtest = replace(
+        backtest,
+        latest_state={
+            "trend_to_long": True,
+            "final_bull": True,
+        },
+    )
+    key = ("TESTUSDT", "1m")
+    engine.watchlist[key] = EngineWatchlistItem(
+        symbol="TESTUSDT",
+        interval="1m",
+        score=7.0,
+        return_pct=12.0,
+        strategy_settings=StrategySettings(),
+    )
+    engine.symbol_states[key] = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="1m",
+        strategy_settings=StrategySettings(),
+        backtest=backtest,
+    )
+    submitted: list[dict[str, object]] = []
+    engine._enqueue_open_order = lambda **kwargs: submitted.append(kwargs)
+
+    engine._evaluate_auto_trade()
+
+    assert len(submitted) == 1
+    assert submitted[0]["side"] == "SELL"
     assert round(float(submitted[0]["fraction"]), 2) == 0.50
 
 

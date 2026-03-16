@@ -1230,7 +1230,7 @@ class _TradeEngine:
             # this direction: the auto-close would fire immediately, causing a
             # wasteful enter→close→re-enter cycle on the same bar.
             bt_latest_state = latest_backtest.latest_state
-            if bt_latest_state:
+            if bt_latest_state and open_position is not None:
                 if side == "long" and (
                     bool(bt_latest_state.get("trend_to_short")) or bool(bt_latest_state.get("final_bear"))
                 ):
