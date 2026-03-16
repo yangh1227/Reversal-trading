@@ -8,7 +8,7 @@ import pandas as pd
 
 from alt_reversal_trader.binance_futures import PositionSnapshot
 from alt_reversal_trader.config import StrategySettings
-from alt_reversal_trader.strategy import BacktestCursor, BacktestResult, StrategyMetrics, run_backtest
+from alt_reversal_trader.strategy import BacktestCursor, BacktestResult, StrategyMetrics, TradeRecord, run_backtest
 from alt_reversal_trader.trade_engine import (
     EngineSyncCommand,
     EngineWatchlistItem,
@@ -176,6 +176,58 @@ def make_stale_multi_zone_backtest() -> BacktestResult:
         latest_state={},
         equity_curve=pd.Series([1000.0], index=[pd.Timestamp("2026-01-01 00:30:00")]),
         cursor=cursor,
+    )
+
+
+def make_stale_signal_backtest_after_exit() -> BacktestResult:
+    backtest = make_signal_backtest(
+        side="short",
+        zone=2,
+        signal_time="2026-01-01 00:15:00",
+        latest_time="2026-01-01 00:30:00",
+        price=100.0,
+        position_qty=0.0,
+    )
+    trades = [
+        TradeRecord(
+            side="short",
+            entry_time=pd.Timestamp("2026-01-01 00:15:00"),
+            exit_time=pd.Timestamp("2026-01-01 00:20:00"),
+            entry_price=100.0,
+            exit_price=101.0,
+            quantity=1.0,
+            pnl=-1.0,
+            return_pct=-1.0,
+            reason="trend_to_long",
+            zones="S2",
+            entry_events=((pd.Timestamp("2026-01-01 00:15:00"), "S2"),),
+        )
+    ]
+    indicators = pd.DataFrame(
+        {
+            "time": [pd.Timestamp("2026-01-01 00:30:00")],
+            "open": [101.0],
+            "high": [102.0],
+            "low": [100.0],
+            "close": [101.0],
+            "volume": [1000.0],
+            "zone2_line": [101.0],
+            "zone3_line": [102.0],
+            "trend_to_long": [False],
+            "trend_to_short": [False],
+            "final_bull": [False],
+            "final_bear": [False],
+        }
+    )
+    return BacktestResult(
+        settings=backtest.settings,
+        metrics=backtest.metrics,
+        trades=trades,
+        open_entry_events=backtest.open_entry_events,
+        indicators=indicators,
+        latest_state={},
+        equity_curve=pd.Series([1000.0], index=[pd.Timestamp("2026-01-01 00:30:00")]),
+        cursor=backtest.cursor,
     )
 
 
@@ -851,6 +903,33 @@ def test_trade_engine_enters_on_displayed_stale_signal_even_without_backtest_pos
     assert len(submitted) == 1
     assert submitted[0]["side"] == "SELL"
     assert round(float(submitted[0]["fraction"]), 2) == 0.50
+
+
+def test_trade_engine_skips_stale_signal_after_exit_until_new_entry_signal() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.auto_trade_enabled = True
+    engine.client = FakeTickerClient({"TESTUSDT": 110.0})
+    backtest = make_stale_signal_backtest_after_exit()
+    key = ("TESTUSDT", "1m")
+    engine.watchlist[key] = EngineWatchlistItem(
+        symbol="TESTUSDT",
+        interval="1m",
+        score=7.0,
+        return_pct=12.0,
+        strategy_settings=StrategySettings(),
+    )
+    engine.symbol_states[key] = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="1m",
+        strategy_settings=StrategySettings(),
+        backtest=backtest,
+    )
+    submitted: list[dict[str, object]] = []
+    engine._enqueue_open_order = lambda **kwargs: submitted.append(kwargs)
+
+    engine._evaluate_auto_trade()
+
+    assert submitted == []
 
 
 def test_trade_engine_allows_new_short_entry_even_if_opposite_exit_flags_are_set() -> None:

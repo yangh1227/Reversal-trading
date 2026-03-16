@@ -221,6 +221,22 @@ def latest_confirmed_entry_event(
     }
 
 
+def _latest_effective_exit_time(backtest: Optional["BacktestResult"]) -> Optional[pd.Timestamp]:
+    if backtest is None or not backtest.trades:
+        return None
+    latest_bar_time = None
+    if not backtest.indicators.empty and "time" in backtest.indicators.columns:
+        latest_bar_time = _normalize_event_timestamp(backtest.indicators["time"].iloc[-1])
+    for trade in reversed(backtest.trades):
+        exit_time = _normalize_event_timestamp(getattr(trade, "exit_time", None))
+        if exit_time is None:
+            continue
+        if str(getattr(trade, "reason", "")).strip() == "end_of_test" and latest_bar_time == exit_time:
+            continue
+        return exit_time
+    return None
+
+
 def active_entry_price_by_zone(backtest: Optional["BacktestResult"]) -> Dict[int, float]:
     if backtest is None:
         return {}
@@ -288,10 +304,17 @@ def active_auto_trade_signal(backtest: Optional["BacktestResult"]) -> Optional[D
         return None
     zone_prices = active_entry_price_by_zone(backtest)
     latest_event: Optional[Dict[str, object]] = None
+    latest_signal_time: Optional[pd.Timestamp] = None
     for event_time, event_label in reversed(list(getattr(backtest, "open_entry_events", ()) or ())):
         latest_event = _entry_event_from_label(event_label, event_time)
         if latest_event is not None:
+            latest_signal_time = pd.Timestamp(latest_event["bar_time"])
             break
+    if latest_signal_time is None:
+        latest_signal_time = _normalize_event_timestamp(getattr(cursor, "last_entry_signal_time", None))
+    latest_exit_time = _latest_effective_exit_time(backtest)
+    if latest_exit_time is not None and latest_signal_time is not None and latest_exit_time >= latest_signal_time:
+        return None
     if latest_event is not None:
         zone = int(latest_event["zone"])
         price = float(zone_prices.get(zone, 0.0) or 0.0)

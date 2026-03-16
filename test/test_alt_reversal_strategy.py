@@ -27,6 +27,7 @@ from alt_reversal_trader.strategy import (
     run_backtest,
     run_backtest_metrics,
     signal_fraction_for_zone,
+    TradeRecord,
 )
 
 
@@ -212,6 +213,46 @@ def make_flat_signal_backtest(*, with_open_event: bool) -> BacktestResult:
     )
 
 
+def make_flat_signal_backtest_after_exit() -> BacktestResult:
+    backtest = make_flat_signal_backtest(with_open_event=True)
+    exit_time = pd.Timestamp("2026-01-01 00:25:00")
+    indicators = pd.DataFrame(
+        {
+            "time": [pd.Timestamp("2026-01-01 00:30:00")],
+            "open": [121.0],
+            "high": [122.0],
+            "low": [120.0],
+            "close": [121.0],
+            "volume": [1000.0],
+        }
+    )
+    trades = [
+        TradeRecord(
+            side="short",
+            entry_time=pd.Timestamp("2026-01-01 00:20:00"),
+            exit_time=exit_time,
+            entry_price=120.0,
+            exit_price=121.0,
+            quantity=1.0,
+            pnl=-1.0,
+            return_pct=-0.83,
+            reason="trend_to_long",
+            zones="S2",
+            entry_events=((pd.Timestamp("2026-01-01 00:20:00"), "S2"),),
+        )
+    ]
+    return BacktestResult(
+        settings=backtest.settings,
+        metrics=backtest.metrics,
+        trades=trades,
+        open_entry_events=backtest.open_entry_events,
+        indicators=indicators,
+        latest_state={},
+        equity_curve=pd.Series([1000.0], index=[pd.Timestamp("2026-01-01 00:30:00")]),
+        cursor=backtest.cursor,
+    )
+
+
 def test_backtest_smoke() -> None:
     df = make_sample_ohlcv()
     result = run_backtest(df, settings=StrategySettings())
@@ -335,6 +376,14 @@ def test_active_auto_trade_signal_falls_back_to_cursor_signal_without_position()
     assert signal["zone"] == 2
     assert signal["price"] == 120.0
     assert signal["time"] == pd.Timestamp("2026-01-01 00:20:00")
+
+
+def test_active_auto_trade_signal_clears_stale_entry_after_exit_signal() -> None:
+    backtest = make_flat_signal_backtest_after_exit()
+
+    signal = active_auto_trade_signal(backtest)
+
+    assert signal is None
 
 
 def test_parameter_grid_filters_invalid_combinations() -> None:
