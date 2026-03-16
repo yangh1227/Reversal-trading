@@ -72,6 +72,7 @@ from .qt_compat import (
     Signal,
 )
 from .strategy import (
+    active_auto_trade_signal as strategy_active_auto_trade_signal,
     active_entry_price_by_zone,
     CHART_INDICATOR_COLUMNS,
     BacktestResult,
@@ -700,23 +701,7 @@ def _zone_favorable_fraction(
 
 
 def _auto_trade_signal_from_backtest(backtest: BacktestResult) -> Optional[Dict[str, object]]:
-    cursor = backtest.cursor
-    if cursor is None or abs(float(cursor.position_qty)) < 1e-12:
-        return None
-    side = str(cursor.last_entry_signal_side or cursor.entry_side or ("long" if float(cursor.position_qty) > 0 else "short")).lower()
-    zone = int(cursor.last_entry_signal_zone or (cursor.last_long_zone if side == "long" else cursor.last_short_zone) or 0)
-    price = float(cursor.last_entry_signal_price or cursor.avg_entry_price or cursor.entry_price or 0.0)
-    signal_time = cursor.last_entry_signal_time or cursor.entry_time
-    if side not in {"long", "short"} or zone not in {1, 2, 3} or price <= 0 or signal_time is None:
-        return None
-    return {
-        "side": side,
-        "zone": zone,
-        "price": price,
-        "zone_prices": active_entry_price_by_zone(backtest),
-        "time": pd.Timestamp(signal_time),
-        "fraction": _signal_fraction_for_zone(zone),
-    }
+    return strategy_active_auto_trade_signal(backtest)
 
 
 def _inferred_auto_trade_fraction(backtest: BacktestResult, position: Optional[PositionSnapshot]) -> float:

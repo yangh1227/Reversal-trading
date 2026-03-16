@@ -17,6 +17,7 @@ from alt_reversal_trader.optimizer import (
 )
 from alt_reversal_trader.strategy import StrategyMetrics
 from alt_reversal_trader.strategy import (
+    active_auto_trade_signal,
     active_entry_price_by_zone,
     BacktestCursor,
     BacktestResult,
@@ -162,6 +163,55 @@ def make_open_entry_price_backtest() -> BacktestResult:
     )
 
 
+def make_flat_signal_backtest(*, with_open_event: bool) -> BacktestResult:
+    signal_time = pd.Timestamp("2026-01-01 00:20:00")
+    indicators = pd.DataFrame(
+        {
+            "time": [signal_time],
+            "open": [120.0],
+            "high": [121.0],
+            "low": [119.0],
+            "close": [120.0],
+            "volume": [1000.0],
+        }
+    )
+    cursor = BacktestCursor(
+        processed_bars=1,
+        last_time=signal_time,
+        equity=1000.0,
+        position_qty=0.0,
+        avg_entry_price=0.0,
+        entry_side="short",
+        entry_time=signal_time,
+        entry_price=120.0,
+        zone_events=("S2",) if with_open_event else (),
+        zone_event_times=((signal_time, "S2"),) if with_open_event else (),
+        gross_profit=0.0,
+        gross_loss=0.0,
+        trade_count=0,
+        win_count=0,
+        long_zone_used=(False, False, False),
+        short_zone_used=(False, True, False),
+        last_long_zone=0,
+        last_short_zone=2,
+        last_entry_signal_time=signal_time,
+        last_entry_signal_price=120.0,
+        last_entry_signal_side="short",
+        last_entry_signal_zone=2,
+        last_equity_value=1000.0,
+    )
+    return BacktestResult(
+        settings=StrategySettings(),
+        metrics=StrategyMetrics(0.0, 0.0, 0.0, 0, 0.0, 0.0),
+        trades=[],
+        open_entry_events=((signal_time, "S2"),) if with_open_event else (),
+        indicators=indicators,
+        latest_state={},
+        equity_curve=pd.Series([1000.0], index=[signal_time]),
+        cursor=cursor,
+    )
+
+
 def test_backtest_smoke() -> None:
     df = make_sample_ohlcv()
     result = run_backtest(df, settings=StrategySettings())
@@ -261,6 +311,30 @@ def test_active_entry_price_by_zone_uses_confirmed_entry_bar_prices() -> None:
     prices = active_entry_price_by_zone(backtest)
 
     assert prices == {2: 100.0, 3: 120.0}
+
+
+def test_active_auto_trade_signal_uses_open_entry_event_even_without_position() -> None:
+    backtest = make_flat_signal_backtest(with_open_event=True)
+
+    signal = active_auto_trade_signal(backtest)
+
+    assert signal is not None
+    assert signal["side"] == "short"
+    assert signal["zone"] == 2
+    assert signal["price"] == 120.0
+    assert signal["time"] == pd.Timestamp("2026-01-01 00:20:00")
+
+
+def test_active_auto_trade_signal_falls_back_to_cursor_signal_without_position() -> None:
+    backtest = make_flat_signal_backtest(with_open_event=False)
+
+    signal = active_auto_trade_signal(backtest)
+
+    assert signal is not None
+    assert signal["side"] == "short"
+    assert signal["zone"] == 2
+    assert signal["price"] == 120.0
+    assert signal["time"] == pd.Timestamp("2026-01-01 00:20:00")
 
 
 def test_parameter_grid_filters_invalid_combinations() -> None:

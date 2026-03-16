@@ -225,9 +225,20 @@ def active_entry_price_by_zone(backtest: Optional["BacktestResult"]) -> Dict[int
     if backtest is None:
         return {}
     cursor = backtest.cursor
-    if cursor is None or abs(float(cursor.position_qty)) < POSITION_EPSILON:
+    if cursor is None:
         return {}
-    active_side = str(cursor.entry_side or ("long" if float(cursor.position_qty) > 0 else "short")).lower()
+    active_side = ""
+    for event_time, event_label in reversed(list(getattr(backtest, "open_entry_events", ()) or ())):
+        event = _entry_event_from_label(event_label, event_time)
+        if event is not None:
+            active_side = str(event["side"])
+            break
+    if active_side not in {"long", "short"}:
+        signal_side = str(getattr(cursor, "last_entry_signal_side", "") or "").lower()
+        if signal_side in {"long", "short"}:
+            active_side = signal_side
+        else:
+            active_side = str(cursor.entry_side or ("long" if float(cursor.position_qty) > 0 else "short")).lower()
     if active_side not in {"long", "short"}:
         return {}
     close_by_time: Dict[pd.Timestamp, float] = {}
@@ -267,6 +278,60 @@ def active_entry_price_by_zone(backtest: Optional["BacktestResult"]) -> Dict[int
     if signal_side == active_side and signal_zone in {1, 2, 3} and signal_price > 0:
         return {signal_zone: signal_price}
     return {}
+
+
+def active_auto_trade_signal(backtest: Optional["BacktestResult"]) -> Optional[Dict[str, object]]:
+    if backtest is None:
+        return None
+    cursor = backtest.cursor
+    if cursor is None:
+        return None
+    zone_prices = active_entry_price_by_zone(backtest)
+    latest_event: Optional[Dict[str, object]] = None
+    for event_time, event_label in reversed(list(getattr(backtest, "open_entry_events", ()) or ())):
+        latest_event = _entry_event_from_label(event_label, event_time)
+        if latest_event is not None:
+            break
+    if latest_event is not None:
+        zone = int(latest_event["zone"])
+        price = float(zone_prices.get(zone, 0.0) or 0.0)
+        if price <= 0:
+            signal_time = _normalize_event_timestamp(getattr(cursor, "last_entry_signal_time", None))
+            signal_side = str(getattr(cursor, "last_entry_signal_side", "") or "").lower()
+            signal_zone = int(getattr(cursor, "last_entry_signal_zone", 0) or 0)
+            signal_price = float(getattr(cursor, "last_entry_signal_price", 0.0) or 0.0)
+            if (
+                signal_time == pd.Timestamp(latest_event["bar_time"])
+                and signal_side == str(latest_event["side"])
+                and signal_zone == zone
+                and signal_price > 0
+            ):
+                price = signal_price
+        if price > 0:
+            return {
+                "side": str(latest_event["side"]),
+                "zone": zone,
+                "price": price,
+                "zone_prices": zone_prices,
+                "time": pd.Timestamp(latest_event["bar_time"]),
+                "fraction": signal_fraction_for_zone(zone),
+                "cursor_entry_time": pd.Timestamp(cursor.entry_time) if cursor.entry_time is not None else None,
+            }
+    side = str(getattr(cursor, "last_entry_signal_side", "") or "").lower()
+    zone = int(getattr(cursor, "last_entry_signal_zone", 0) or 0)
+    price = float(getattr(cursor, "last_entry_signal_price", 0.0) or 0.0)
+    signal_time = _normalize_event_timestamp(getattr(cursor, "last_entry_signal_time", None))
+    if side not in {"long", "short"} or zone not in {1, 2, 3} or price <= 0 or signal_time is None:
+        return None
+    return {
+        "side": side,
+        "zone": zone,
+        "price": price,
+        "zone_prices": zone_prices,
+        "time": pd.Timestamp(signal_time),
+        "fraction": signal_fraction_for_zone(zone),
+        "cursor_entry_time": pd.Timestamp(cursor.entry_time) if cursor.entry_time is not None else None,
+    }
 
 
 def compact_indicator_frame(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:

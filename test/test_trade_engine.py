@@ -54,17 +54,18 @@ def make_signal_backtest(
     latest_time: str | None = None,
     entry_time: str | None = None,
     price: float = 100.0,
+    position_qty: float | None = None,
 ) -> BacktestResult:
     signal_timestamp = pd.Timestamp(signal_time)
     latest_timestamp = pd.Timestamp(latest_time or signal_time)
     entry_timestamp = pd.Timestamp(entry_time or signal_time)
     label = f"{side[0].upper()}{zone}"
-    position_qty = 1.0 if side == "long" else -1.0
+    actual_position_qty = position_qty if position_qty is not None else (1.0 if side == "long" else -1.0)
     cursor = BacktestCursor(
         processed_bars=1,
         last_time=latest_timestamp,
         equity=1000.0,
-        position_qty=position_qty,
+        position_qty=actual_position_qty,
         avg_entry_price=price,
         entry_side=side,
         entry_time=entry_timestamp,
@@ -480,6 +481,42 @@ def test_trade_engine_enters_on_favorable_price_without_fresh_confirmed_trigger(
 
     assert len(submitted) == 1
     assert submitted[0]["side"] == "BUY"
+    assert round(float(submitted[0]["fraction"]), 2) == 0.50
+
+
+def test_trade_engine_enters_on_displayed_stale_signal_even_without_backtest_position() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.auto_trade_enabled = True
+    engine.client = FakeTickerClient({"TESTUSDT": 110.0})
+    backtest = make_signal_backtest(
+        side="short",
+        zone=2,
+        signal_time="2026-01-01 00:15:00",
+        latest_time="2026-01-01 00:16:00",
+        price=100.0,
+        position_qty=0.0,
+    )
+    key = ("TESTUSDT", "1m")
+    engine.watchlist[key] = EngineWatchlistItem(
+        symbol="TESTUSDT",
+        interval="1m",
+        score=7.0,
+        return_pct=12.0,
+        strategy_settings=StrategySettings(),
+    )
+    engine.symbol_states[key] = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="1m",
+        strategy_settings=StrategySettings(),
+        backtest=backtest,
+    )
+    submitted: list[dict[str, object]] = []
+    engine._enqueue_open_order = lambda **kwargs: submitted.append(kwargs)
+
+    engine._evaluate_auto_trade()
+
+    assert len(submitted) == 1
+    assert submitted[0]["side"] == "SELL"
     assert round(float(submitted[0]["fraction"]), 2) == 0.50
 
 
