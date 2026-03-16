@@ -1337,12 +1337,6 @@ class _TradeEngine:
             )
         chosen = self._pick_auto_trade_candidate(candidates)
         if chosen is None:
-            if trigger_symbol:
-                trigger_detail = f"symbol={trigger_symbol} interval={trigger_interval or '?'}"
-                if normalized_trigger_time is not None:
-                    trigger_detail += f" bar={normalized_trigger_time}"
-                reason = trigger_skip_reason or ("no_candidate" if trigger_target_seen else "no_matching_watchlist_item")
-                self.log(f"Auto-trade trigger skipped: {trigger_detail} reason={reason}")
             return
         # Remember the cursor entry_time on first entry so we can detect
         # close→reopen cycles on subsequent evaluations.

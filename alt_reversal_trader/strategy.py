@@ -317,6 +317,8 @@ def active_auto_trade_signal(backtest: Optional["BacktestResult"]) -> Optional[D
                 "fraction": signal_fraction_for_zone(zone),
                 "cursor_entry_time": pd.Timestamp(cursor.entry_time) if cursor.entry_time is not None else None,
             }
+    if abs(float(cursor.position_qty)) < POSITION_EPSILON:
+        return None
     side = str(getattr(cursor, "last_entry_signal_side", "") or "").lower()
     zone = int(getattr(cursor, "last_entry_signal_zone", 0) or 0)
     price = float(getattr(cursor, "last_entry_signal_price", 0.0) or 0.0)
