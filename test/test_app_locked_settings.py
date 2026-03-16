@@ -203,6 +203,23 @@ def test_collect_settings_preserves_auto_refresh_minutes_and_locked_positions() 
     assert "position_strategy_settings=dict(self.settings.position_strategy_settings)" in source_segment
 
 
+def test_kline_stream_worker_uses_shared_two_minute_transform_helper() -> None:
+    module = _load_app_module_ast()
+    source = APP_PATH.read_text(encoding="utf-8")
+
+    helper_import_present = "transform_two_minute_bar as _transform_two_minute_bar" in source
+    transform_method_source = ""
+    for node in module.body:
+        if isinstance(node, ast.ClassDef) and node.name == "KlineStreamWorker":
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == "_transform_bar":
+                    transform_method_source = ast.get_source_segment(source, item) or ""
+                    break
+
+    assert helper_import_present
+    assert "_transform_two_minute_bar(" in transform_method_source
+
+
 def test_run_auto_refresh_logs_use_configured_minutes() -> None:
     source_segment = ast.get_source_segment(
         APP_PATH.read_text(encoding="utf-8"),

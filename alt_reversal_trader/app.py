@@ -29,6 +29,7 @@ from .live_chart_utils import (
     merge_live_bar as _merge_live_bar,
     preview_bar_matches_context as _preview_bar_matches_context,
     seed_two_minute_aggregate as _seed_two_minute_aggregate,
+    transform_two_minute_bar as _transform_two_minute_bar,
 )
 from .optimizer import OptimizationResult, optimization_sort_key, optimize_symbol_interval_results, parameter_value_range
 from .qt_compat import (
@@ -817,59 +818,16 @@ class KlineStreamWorker(QThread):
     def _transform_bar(self, bar: Dict[str, object]) -> List[Dict[str, object]]:
         if self.interval != "2m":
             return [bar]
-
-        bar_time = pd.Timestamp(bar["time"])
-        bucket_time = bar_time.floor("2min")
-        is_first_minute = bar_time == bucket_time
-
-        if is_first_minute:
-            self._aggregate_bar = {
-                "symbol": self.symbol,
-                "interval": self.interval,
-                "time": bucket_time,
-                "open": float(bar["open"]),
-                "high": float(bar["high"]),
-                "low": float(bar["low"]),
-                "close": float(bar["close"]),
-                "volume": float(bar["volume"]),
-                "base_volume": float(bar["volume"]),
-                "quote_volume": float(bar.get("quote_volume", 0.0) or 0.0),
-                "base_quote_volume": float(bar.get("quote_volume", 0.0) or 0.0),
-                "closed": False,
-            }
-            return [
-                {
-                    key: value
-                    for key, value in self._aggregate_bar.items()
-                    if key not in {"base_volume", "base_quote_volume"}
-                }
-            ]
-
-        if self._aggregate_bar is None or pd.Timestamp(self._aggregate_bar["time"]) != bucket_time:
+        seed_aggregate = None
+        if self._aggregate_bar is None or pd.Timestamp(self._aggregate_bar["time"]) != pd.Timestamp(bar["time"]).floor("2min"):
             self._initialize_aggregate_seed()
-        if self._aggregate_bar is None or pd.Timestamp(self._aggregate_bar["time"]) != bucket_time:
-            provisional = dict(bar)
-            provisional["time"] = bucket_time
-            provisional["closed"] = False
-            return [provisional]
-
-        self._aggregate_bar["high"] = max(float(self._aggregate_bar["high"]), float(bar["high"]))
-        self._aggregate_bar["low"] = min(float(self._aggregate_bar["low"]), float(bar["low"]))
-        self._aggregate_bar["close"] = float(bar["close"])
-        self._aggregate_bar["volume"] = float(self._aggregate_bar["base_volume"]) + float(bar["volume"])
-        self._aggregate_bar["quote_volume"] = (
-            float(self._aggregate_bar.get("base_quote_volume", 0.0))
-            + float(bar.get("quote_volume", 0.0) or 0.0)
+            seed_aggregate = self._aggregate_bar
+        self._aggregate_bar, transformed = _transform_two_minute_bar(
+            self._aggregate_bar,
+            bar,
+            seed_aggregate=seed_aggregate,
         )
-        self._aggregate_bar["closed"] = bool(bar.get("closed", False))
-        completed = {
-            key: value
-            for key, value in self._aggregate_bar.items()
-            if key not in {"base_volume", "base_quote_volume"}
-        }
-        if completed["closed"]:
-            self._aggregate_bar = None
-        return [completed]
+        return [transformed]
 
 
 class ScanWorker(QThread):
@@ -6191,8 +6149,6 @@ class AltReversalTraderWindow(QMainWindow):
                 if not previous_prefix.equals(next_prefix):
                     return False
         latest_chart_time = pd.Timestamp(chart_history["time"].iloc[-1])
-        if _backtest_has_latest_trade_marker_change(previous_backtest, new_backtest, latest_chart_time):
-            return False
         try:
             if not skip_candle_update:
                 latest_bar = _chart_candle_frame(chart_history).iloc[-1].copy()

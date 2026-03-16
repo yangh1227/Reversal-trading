@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import pandas as pd
 
@@ -107,3 +107,72 @@ def seed_two_minute_aggregate(
         seed["quote_volume"] = float(last_row["quote_volume"])
         seed["base_quote_volume"] = float(last_row["quote_volume"])
     return seed
+
+
+def transform_two_minute_bar(
+    aggregate_bar: Optional[Dict[str, object]],
+    bar: Dict[str, object],
+    seed_aggregate: Optional[Dict[str, object]] = None,
+) -> Tuple[Optional[Dict[str, object]], Dict[str, object]]:
+    """Advance a 2m aggregate with a 1m source bar.
+
+    Returns the next aggregate state and the current aggregated event. The
+    returned event is a preview bar until the second minute closes.
+    """
+    bar_time = pd.Timestamp(bar["time"])
+    bucket_time = bar_time.floor("2min")
+    is_first_minute = bar_time == bucket_time
+
+    def _visible_bar(payload: Dict[str, object]) -> Dict[str, object]:
+        return {
+            key: value
+            for key, value in payload.items()
+            if key not in {"base_volume", "base_quote_volume"}
+        }
+
+    def _new_bucket() -> Dict[str, object]:
+        payload = {
+            "symbol": str(bar["symbol"]),
+            "interval": str(bar["interval"]),
+            "time": bucket_time,
+            "open": float(bar["open"]),
+            "high": float(bar["high"]),
+            "low": float(bar["low"]),
+            "close": float(bar["close"]),
+            "volume": float(bar["volume"]),
+            "base_volume": float(bar["volume"]),
+            "closed": False,
+        }
+        quote_volume = float(bar.get("quote_volume", 0.0) or 0.0)
+        if quote_volume > 0:
+            payload["quote_volume"] = quote_volume
+            payload["base_quote_volume"] = quote_volume
+        return payload
+
+    if is_first_minute:
+        next_aggregate = _new_bucket()
+        return next_aggregate, _visible_bar(next_aggregate)
+
+    working = dict(aggregate_bar) if aggregate_bar is not None else None
+    if working is None or pd.Timestamp(working["time"]) != bucket_time:
+        candidate = dict(seed_aggregate) if seed_aggregate is not None else None
+        if candidate is not None and pd.Timestamp(candidate["time"]) == bucket_time:
+            working = candidate
+
+    if working is None or pd.Timestamp(working["time"]) != bucket_time:
+        provisional = dict(bar)
+        provisional["time"] = bucket_time
+        provisional["closed"] = False
+        return None, provisional
+
+    working["high"] = max(float(working["high"]), float(bar["high"]))
+    working["low"] = min(float(working["low"]), float(bar["low"]))
+    working["close"] = float(bar["close"])
+    working["volume"] = float(working["base_volume"]) + float(bar["volume"])
+    if "base_quote_volume" in working or "quote_volume" in bar:
+        working["quote_volume"] = float(working.get("base_quote_volume", 0.0)) + float(bar.get("quote_volume", 0.0) or 0.0)
+    working["closed"] = bool(bar.get("closed", False))
+    visible = _visible_bar(working)
+    if visible["closed"]:
+        return None, visible
+    return working, visible

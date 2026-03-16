@@ -17,6 +17,7 @@ from .binance_futures import BinanceFuturesClient, PositionSnapshot, resolve_bas
 from .config import APP_INTERVAL_OPTIONS, StrategySettings
 from .live_chart_utils import merge_live_bar as _merge_live_bar
 from .live_chart_utils import seed_two_minute_aggregate as _seed_two_minute_aggregate
+from .live_chart_utils import transform_two_minute_bar as _transform_two_minute_bar
 from .strategy import (
     active_auto_trade_signal as strategy_active_auto_trade_signal,
     active_entry_price_by_zone,
@@ -151,6 +152,7 @@ class _EngineSymbolState:
     history: Optional[pd.DataFrame] = None
     backtest: Optional[BacktestResult] = None
     loading: bool = False
+    pending_closed_bar: Optional[Dict[str, object]] = None
 
 
 @dataclass(frozen=True)
@@ -202,6 +204,27 @@ def _ws_kline_timestamp(time_ms: int) -> pd.Timestamp:
 def _backtest_start_time_ms(history_days: int) -> int:
     now_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
     return now_ms - max(int(history_days), 1) * 86_400_000
+
+
+def _fresh_initial_trigger_bar_time(
+    backtest: Optional[BacktestResult],
+    interval: str,
+    now_time: Optional[pd.Timestamp] = None,
+) -> Optional[pd.Timestamp]:
+    if backtest is None or backtest.indicators.empty or "time" not in backtest.indicators.columns:
+        return None
+    latest_bar_time = pd.Timestamp(backtest.indicators["time"].iloc[-1]).tz_localize(None)
+    if latest_confirmed_entry_event(backtest, latest_bar_time) is None:
+        return None
+    reference_time = now_time
+    if reference_time is None:
+        reference_time = pd.Timestamp.now(tz="UTC").tz_localize(None)
+    if latest_bar_time > reference_time:
+        return None
+    freshness_window = pd.Timedelta(milliseconds=_interval_to_ms(interval) * 1.5)
+    if reference_time - latest_bar_time > freshness_window:
+        return None
+    return latest_bar_time
 
 
 def _history_fetch_start_time_ms(history_days: int, interval: str, strategy_settings: StrategySettings) -> int:
@@ -385,50 +408,16 @@ class _EngineKlineStream(threading.Thread):
     def _transform_bar(self, bar: Dict[str, object]) -> Optional[Dict[str, object]]:
         if self.interval != "2m":
             return bar if bool(bar.get("closed")) else None
-
-        bar_time = pd.Timestamp(bar["time"])
-        bucket_time = bar_time.floor("2min")
-        is_first_minute = bar_time == bucket_time
-        if is_first_minute:
-            self.aggregate_bar = {
-                "symbol": self.symbol,
-                "interval": self.interval,
-                "time": bucket_time,
-                "open": float(bar["open"]),
-                "high": float(bar["high"]),
-                "low": float(bar["low"]),
-                "close": float(bar["close"]),
-                "volume": float(bar["volume"]),
-                "base_volume": float(bar["volume"]),
-                "quote_volume": float(bar.get("quote_volume", 0.0) or 0.0),
-                "base_quote_volume": float(bar.get("quote_volume", 0.0) or 0.0),
-                "closed": False,
-            }
-            return None
-
-        if self.aggregate_bar is None or pd.Timestamp(self.aggregate_bar["time"]) != bucket_time:
+        seed_aggregate = None
+        if self.aggregate_bar is None or pd.Timestamp(self.aggregate_bar["time"]) != pd.Timestamp(bar["time"]).floor("2min"):
             self._initialize_aggregate_seed()
-        if self.aggregate_bar is None or pd.Timestamp(self.aggregate_bar["time"]) != bucket_time:
-            return None
-
-        self.aggregate_bar["high"] = max(float(self.aggregate_bar["high"]), float(bar["high"]))
-        self.aggregate_bar["low"] = min(float(self.aggregate_bar["low"]), float(bar["low"]))
-        self.aggregate_bar["close"] = float(bar["close"])
-        self.aggregate_bar["volume"] = float(self.aggregate_bar["base_volume"]) + float(bar["volume"])
-        self.aggregate_bar["quote_volume"] = (
-            float(self.aggregate_bar.get("base_quote_volume", 0.0))
-            + float(bar.get("quote_volume", 0.0) or 0.0)
+            seed_aggregate = self.aggregate_bar
+        self.aggregate_bar, transformed = _transform_two_minute_bar(
+            self.aggregate_bar,
+            bar,
+            seed_aggregate=seed_aggregate,
         )
-        self.aggregate_bar["closed"] = bool(bar.get("closed", False))
-        completed = {
-            key: value
-            for key, value in self.aggregate_bar.items()
-            if key not in {"base_volume", "base_quote_volume"}
-        }
-        if completed["closed"]:
-            self.aggregate_bar = None
-            return completed
-        return None
+        return transformed if bool(transformed.get("closed")) else None
 
     def run(self) -> None:
         stream_url = f"wss://fstream.binance.com/ws/{self.symbol.lower()}@kline_{self.stream_interval}"
@@ -922,23 +911,55 @@ class _TradeEngine:
         try:
             if self.client is None:
                 return
+            had_existing_history = state.history is not None and not state.history.empty
             history = state.history
             if history is None or history.empty:
                 start_time = _history_fetch_start_time_ms(self.history_days, state.interval, state.strategy_settings)
                 history = self.client.historical_ohlcv(state.symbol, state.interval, start_time=start_time)
             history = prepare_ohlcv(history)
+            backtest_start_time = pd.to_datetime(_backtest_start_time_ms(self.history_days), unit="ms")
             backtest = run_backtest(
                 history,
                 settings=state.strategy_settings,
                 fee_rate=self.fee_rate,
-                backtest_start_time=pd.to_datetime(_backtest_start_time_ms(self.history_days), unit="ms"),
+                backtest_start_time=backtest_start_time,
             )
+            trigger_bar_time: Optional[pd.Timestamp] = None
+            pending_closed_bar = dict(state.pending_closed_bar) if state.pending_closed_bar is not None else None
+            if pending_closed_bar is not None:
+                history = _merge_live_bar(history, pending_closed_bar)
+                if _history_can_resume_backtest(backtest, history):
+                    backtest = resume_backtest(
+                        history,
+                        previous_result=backtest,
+                        settings=state.strategy_settings,
+                        fee_rate=self.fee_rate,
+                        backtest_start_time=backtest_start_time,
+                    )
+                else:
+                    backtest = run_backtest(
+                        history,
+                        settings=state.strategy_settings,
+                        fee_rate=self.fee_rate,
+                        backtest_start_time=backtest_start_time,
+                    )
+                trigger_bar_time = pd.Timestamp(pending_closed_bar["time"]).tz_localize(None)
+                state.pending_closed_bar = None
+            elif not had_existing_history:
+                trigger_bar_time = _fresh_initial_trigger_bar_time(backtest, state.interval)
             state.history = history
             state.backtest = backtest
             self._start_stream(key)
             self._emit_signal_event(state)
             self._evaluate_backtest_auto_close(state)
-            self._evaluate_auto_trade()
+            if trigger_bar_time is not None:
+                self._evaluate_auto_trade(
+                    trigger_symbol=state.symbol,
+                    trigger_interval=state.interval,
+                    trigger_bar_time=trigger_bar_time,
+                )
+            else:
+                self._evaluate_auto_trade()
         except Exception:
             self.log(traceback.format_exc())
         finally:
@@ -979,6 +1000,7 @@ class _TradeEngine:
             self.symbol_states[key] = state
         history = state.history
         if history is None or history.empty:
+            state.pending_closed_bar = dict(bar)
             state.loading = True
             return
         state.history = _merge_live_bar(history, bar)
@@ -1180,28 +1202,46 @@ class _TradeEngine:
 
         open_positions_by_symbol = dict(self.open_positions)
         candidates: List[Dict[str, object]] = []
+        trigger_target_seen = False
+        trigger_skip_reason: Optional[str] = None
+
+        def record_trigger_skip(reason: str) -> None:
+            nonlocal trigger_skip_reason
+            if not trigger_symbol or trigger_skip_reason is not None:
+                return
+            trigger_skip_reason = str(reason)
         for item in eligible_items:
             if item.symbol in self.pending_order_symbols:
+                if trigger_symbol and item.symbol == trigger_symbol and (not trigger_interval or item.interval == trigger_interval):
+                    trigger_target_seen = True
+                    record_trigger_skip("pending_order")
                 continue
             if trigger_symbol and item.symbol != trigger_symbol:
                 continue
             if trigger_interval and item.interval != trigger_interval:
                 continue
+            if trigger_symbol and item.symbol == trigger_symbol:
+                trigger_target_seen = True
             open_position = open_positions_by_symbol.get(item.symbol)
             if open_positions_by_symbol and open_position is None:
+                record_trigger_skip("other_open_position_block")
                 continue
             if open_position is not None:
                 remembered_interval = self.position_intervals.get(item.symbol)
                 if remembered_interval in APP_INTERVAL_OPTIONS and remembered_interval != item.interval:
+                    record_trigger_skip("interval_mismatch")
                     continue
             latest_backtest = self._latest_auto_trade_backtest(item)
             if latest_backtest is None:
+                record_trigger_skip("no_backtest")
                 continue
             signal = _auto_trade_signal_from_backtest(latest_backtest)
             if signal is None:
+                record_trigger_skip("no_signal")
                 continue
             current_price = current_price_for(item.symbol)
             if current_price is None:
+                record_trigger_skip("no_price")
                 continue
             signal_price = float(signal["price"])
             zone_prices = dict(signal.get("zone_prices") or {})
@@ -1218,6 +1258,11 @@ class _TradeEngine:
                 and str(confirmed_entry["side"]) == side
                 and int(confirmed_entry["zone"]) == int(signal["zone"])
             )
+            if normalized_trigger_time is not None:
+                if confirmed_entry is None:
+                    record_trigger_skip("no_confirmed_entry")
+                elif not has_fresh_confirmed_entry:
+                    record_trigger_skip("fresh_mismatch")
             # Skip entry when the backtest's exit condition is already active for
             # this direction: the auto-close would fire immediately, causing a
             # wasteful enter→close→re-enter cycle on the same bar.
@@ -1226,15 +1271,18 @@ class _TradeEngine:
                 if side == "long" and (
                     bool(bt_latest_state.get("trend_to_short")) or bool(bt_latest_state.get("final_bear"))
                 ):
+                    record_trigger_skip("exit_active")
                     continue
                 if side == "short" and (
                     bool(bt_latest_state.get("trend_to_long")) or bool(bt_latest_state.get("final_bull"))
                 ):
+                    record_trigger_skip("exit_active")
                     continue
             fraction = float(signal["fraction"])
             if open_position is not None:
                 position_side = "long" if float(open_position.amount) > 0 else "short"
                 if side != position_side:
+                    record_trigger_skip("position_side_mismatch")
                     continue
                 # Detect close→reopen: the backtest closed the position and
                 # re-entered, but the real exchange position hasn't been closed
@@ -1244,6 +1292,7 @@ class _TradeEngine:
                 if remembered is not None and cursor_entry_time is not None:
                     if pd.Timestamp(remembered).tz_localize(None) != pd.Timestamp(cursor_entry_time).tz_localize(None):
                         self._trigger_reentry_auto_close(item.symbol, position_side, latest_backtest)
+                        record_trigger_skip("waiting_reentry_close")
                         continue
                 filled_fraction = self.filled_fraction_by_symbol.get(
                     item.symbol,
@@ -1251,12 +1300,14 @@ class _TradeEngine:
                 )
                 fraction = max(0.0, fraction - float(filled_fraction))
                 if fraction <= 1e-9:
+                    record_trigger_skip("no_remaining_fraction")
                     continue
                 if not has_fresh_confirmed_entry:
                     favorable_fraction = _zone_favorable_fraction(
                         side, current_price, signal_price, zone_prices, float(filled_fraction),
                     )
                     if favorable_fraction <= 1e-9:
+                        record_trigger_skip("not_fresh_and_not_favorable")
                         continue
                     fraction = min(fraction, favorable_fraction)
                 # Additional entry (e.g. L2→L3): enter immediately when the
@@ -1269,6 +1320,7 @@ class _TradeEngine:
                         side, current_price, signal_price, zone_prices, 0.0,
                     )
                     if favorable_fraction <= 1e-9:
+                        record_trigger_skip("not_fresh_and_not_favorable")
                         continue
                     fraction = min(fraction, favorable_fraction)
             candidates.append(
@@ -1285,6 +1337,12 @@ class _TradeEngine:
             )
         chosen = self._pick_auto_trade_candidate(candidates)
         if chosen is None:
+            if trigger_symbol:
+                trigger_detail = f"symbol={trigger_symbol} interval={trigger_interval or '?'}"
+                if normalized_trigger_time is not None:
+                    trigger_detail += f" bar={normalized_trigger_time}"
+                reason = trigger_skip_reason or ("no_candidate" if trigger_target_seen else "no_matching_watchlist_item")
+                self.log(f"Auto-trade trigger skipped: {trigger_detail} reason={reason}")
             return
         # Remember the cursor entry_time on first entry so we can detect
         # close→reopen cycles on subsequent evaluations.

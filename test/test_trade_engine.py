@@ -1,4 +1,5 @@
 import multiprocessing as mp
+import alt_reversal_trader.trade_engine as trade_engine_module
 from dataclasses import replace
 
 import pandas as pd
@@ -313,6 +314,87 @@ def test_trade_engine_rebuilds_changed_state_from_cached_history_without_refetch
     assert state.backtest.settings == new_settings
 
 
+def test_trade_engine_buffers_closed_bar_until_state_history_is_ready() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    key = ("TESTUSDT", "2m")
+    engine.symbol_states[key] = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="2m",
+        strategy_settings=StrategySettings(),
+        history=None,
+        backtest=None,
+        loading=False,
+    )
+    closed_bar = {
+        "symbol": "TESTUSDT",
+        "interval": "2m",
+        "time": pd.Timestamp("2026-01-01 00:10:00"),
+        "open": 100.0,
+        "high": 101.0,
+        "low": 99.0,
+        "close": 100.5,
+        "volume": 1000.0,
+        "closed": True,
+    }
+
+    engine._handle_closed_bar("TESTUSDT", "2m", closed_bar)
+
+    assert engine.symbol_states[key].loading is True
+    assert engine.symbol_states[key].pending_closed_bar == closed_bar
+
+
+def test_trade_engine_initial_load_triggers_fresh_confirmed_latest_bar() -> None:
+    class HistoryClient:
+        def historical_ohlcv(self, *args, **kwargs):
+            return make_sample_ohlcv(20)
+
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.auto_trade_enabled = True
+    engine.client = HistoryClient()
+    key = ("TESTUSDT", "2m")
+    engine.watchlist[key] = EngineWatchlistItem(
+        symbol="TESTUSDT",
+        interval="2m",
+        score=7.0,
+        return_pct=12.0,
+        strategy_settings=StrategySettings(),
+    )
+    engine.symbol_states[key] = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="2m",
+        strategy_settings=StrategySettings(),
+        history=None,
+        backtest=None,
+        loading=True,
+    )
+    signal_time = pd.Timestamp.now(tz="UTC").tz_localize(None).floor("2min")
+    captured_calls: list[dict[str, object]] = []
+    original_run_backtest = trade_engine_module.run_backtest
+    engine._start_stream = lambda key: None
+    engine._emit_signal_event = lambda state: None
+    engine._evaluate_backtest_auto_close = lambda state: None
+    engine._evaluate_auto_trade = lambda **kwargs: captured_calls.append(kwargs)
+    trade_engine_module.run_backtest = lambda *args, **kwargs: make_signal_backtest(
+        side="short",
+        zone=3,
+        signal_time=str(signal_time),
+        latest_time=str(signal_time),
+        price=100.0,
+    )
+    try:
+        engine._load_one_pending_state()
+    finally:
+        trade_engine_module.run_backtest = original_run_backtest
+
+    assert captured_calls == [
+        {
+            "trigger_symbol": "TESTUSDT",
+            "trigger_interval": "2m",
+            "trigger_bar_time": signal_time,
+        }
+    ]
+
+
 def test_trade_engine_drops_symbol_after_auto_close_reports_no_open_position() -> None:
     engine = _TradeEngine(mp.Queue(), mp.Queue())
     engine.open_positions["TESTUSDT"] = make_position()
@@ -341,6 +423,37 @@ def test_trade_engine_drops_symbol_after_auto_close_reports_no_open_position() -
     assert "TESTUSDT" not in engine.filled_fraction_by_symbol
     assert "TESTUSDT" not in engine.auto_close_last_trigger_time
     assert "TESTUSDT" not in engine.auto_close_last_attempt_at
+
+
+def test_trade_engine_logs_trigger_skip_reason_for_missing_price() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.auto_trade_enabled = True
+    engine.client = FakeTickerClient({})
+    backtest = make_signal_backtest(zone=3, signal_time="2026-01-01 00:15:00")
+    key = ("TESTUSDT", "2m")
+    engine.watchlist[key] = EngineWatchlistItem(
+        symbol="TESTUSDT",
+        interval="2m",
+        score=7.0,
+        return_pct=12.0,
+        strategy_settings=StrategySettings(),
+    )
+    engine.symbol_states[key] = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="2m",
+        strategy_settings=StrategySettings(),
+        backtest=backtest,
+    )
+    messages: list[str] = []
+    engine.log = lambda message: messages.append(str(message))
+
+    engine._evaluate_auto_trade(
+        trigger_symbol="TESTUSDT",
+        trigger_interval="2m",
+        trigger_bar_time=pd.Timestamp("2026-01-01 00:15:00"),
+    )
+
+    assert any("Auto-trade trigger skipped" in message and "reason=no_price" in message for message in messages)
 
 
 def test_trade_engine_drops_symbol_after_successful_close_before_refresh() -> None:
