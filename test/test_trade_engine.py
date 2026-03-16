@@ -326,6 +326,7 @@ def test_trade_engine_drops_symbol_after_auto_close_reports_no_open_position() -
             message="TESTUSDT close skipped: no open position",
             auto_close=True,
             auto_trade=False,
+            close_order=True,
             interval="1m",
             fraction=0.0,
             strategy_settings=None,
@@ -340,6 +341,34 @@ def test_trade_engine_drops_symbol_after_auto_close_reports_no_open_position() -
     assert "TESTUSDT" not in engine.filled_fraction_by_symbol
     assert "TESTUSDT" not in engine.auto_close_last_trigger_time
     assert "TESTUSDT" not in engine.auto_close_last_attempt_at
+
+
+def test_trade_engine_drops_symbol_after_successful_close_before_refresh() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.open_positions["TESTUSDT"] = make_position()
+    engine.filled_fraction_by_symbol["TESTUSDT"] = 0.5
+    engine.auto_trade_cursor_entry_time["TESTUSDT"] = pd.Timestamp("2026-01-01 00:00:00")
+    engine.order_result_queue.put(
+        _OrderExecutionResult(
+            symbol="TESTUSDT",
+            success=True,
+            message="TESTUSDT close completed: orderId=1",
+            auto_close=False,
+            auto_trade=False,
+            close_order=True,
+            interval="1m",
+            fraction=0.0,
+            strategy_settings=None,
+            no_open_position=False,
+        )
+    )
+    engine._refresh_positions = lambda force=False: None
+
+    engine._drain_order_results()
+
+    assert "TESTUSDT" not in engine.open_positions
+    assert "TESTUSDT" not in engine.filled_fraction_by_symbol
+    assert "TESTUSDT" not in engine.auto_trade_cursor_entry_time
 
 
 def test_trade_engine_enters_fresh_confirmed_new_signal_on_trigger_bar() -> None:

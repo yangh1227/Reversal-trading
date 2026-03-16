@@ -176,6 +176,7 @@ class _OrderExecutionResult:
     message: str
     auto_close: bool
     auto_trade: bool
+    close_order: bool
     interval: Optional[str]
     fraction: float
     strategy_settings: Optional[StrategySettings]
@@ -509,6 +510,7 @@ class _OrderExecutor(threading.Thread):
                         message=message,
                         auto_close=request.auto_close,
                         auto_trade=request.auto_trade,
+                        close_order=True,
                         interval=request.interval,
                         fraction=float(request.fraction or 0.0),
                         strategy_settings=request.strategy_settings,
@@ -534,6 +536,7 @@ class _OrderExecutor(threading.Thread):
                         ),
                         auto_close=request.auto_close,
                         auto_trade=request.auto_trade,
+                        close_order=False,
                         interval=request.interval,
                         fraction=float(request.fraction or 0.0),
                         strategy_settings=request.strategy_settings,
@@ -547,6 +550,7 @@ class _OrderExecutor(threading.Thread):
                     message=traceback.format_exc(),
                     auto_close=request.auto_close,
                     auto_trade=request.auto_trade,
+                    close_order=request.side is None,
                     interval=request.interval,
                     fraction=float(request.fraction or 0.0),
                     strategy_settings=request.strategy_settings,
@@ -726,6 +730,10 @@ class _TradeEngine:
             if not isinstance(result, _OrderExecutionResult):
                 continue
             self.pending_order_symbols.pop(result.symbol, None)
+            if result.close_order and result.success:
+                self.open_positions.pop(result.symbol, None)
+                self.filled_fraction_by_symbol.pop(result.symbol, None)
+                self.auto_trade_cursor_entry_time.pop(result.symbol, None)
             if result.no_open_position:
                 self.open_positions.pop(result.symbol, None)
                 self.filled_fraction_by_symbol.pop(result.symbol, None)
