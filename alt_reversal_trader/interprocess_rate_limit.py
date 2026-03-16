@@ -13,6 +13,8 @@ _STATE_FILENAME = "interprocess_rate_limit.json"
 _SENTINEL = b"#"
 _FALLBACK_LOCK = threading.Lock()
 _FALLBACK_NEXT_AT: Dict[str, float] = {}
+_PROCESS_PATH_LOCKS: Dict[str, threading.Lock] = {}
+_PROCESS_PATH_LOCKS_GUARD = threading.Lock()
 
 
 def _runtime_dir() -> Path:
@@ -24,6 +26,16 @@ def _runtime_dir() -> Path:
 
 def default_rate_limit_state_path() -> Path:
     return _runtime_dir() / _STATE_FILENAME
+
+
+def _process_lock_for(path: Path) -> threading.Lock:
+    key = str(Path(path).resolve())
+    with _PROCESS_PATH_LOCKS_GUARD:
+        lock = _PROCESS_PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _PROCESS_PATH_LOCKS[key] = lock
+        return lock
 
 
 def _ensure_parent(path: Path) -> None:
@@ -114,41 +126,43 @@ def wait_for_request_slot(
     gate_key = str(gate_name or "default")
     interval = max(0.0, float(min_interval_seconds))
     resolved_path = Path(state_path) if state_path is not None else default_rate_limit_state_path()
-    with _locked_state_file(resolved_path) as handle:
-        if handle is None:
-            with _FALLBACK_LOCK:
-                now = time.monotonic()
-                next_allowed = float(_FALLBACK_NEXT_AT.get(gate_key, 0.0))
-                delay = max(0.0, next_allowed - now)
-                if delay > 0:
-                    time.sleep(delay)
+    with _process_lock_for(resolved_path):
+        with _locked_state_file(resolved_path) as handle:
+            if handle is None:
+                with _FALLBACK_LOCK:
                     now = time.monotonic()
-                _FALLBACK_NEXT_AT[gate_key] = now + interval
-            return
-        state = _read_state(handle)
-        now = time.monotonic()
-        next_allowed = float(state.get(gate_key, 0.0))
-        delay = max(0.0, next_allowed - now)
-        if delay > 0:
-            time.sleep(delay)
+                    next_allowed = float(_FALLBACK_NEXT_AT.get(gate_key, 0.0))
+                    delay = max(0.0, next_allowed - now)
+                    if delay > 0:
+                        time.sleep(delay)
+                        now = time.monotonic()
+                    _FALLBACK_NEXT_AT[gate_key] = now + interval
+                return
+            state = _read_state(handle)
             now = time.monotonic()
-        state[gate_key] = now + interval
-        _write_state(handle, state)
+            next_allowed = float(state.get(gate_key, 0.0))
+            delay = max(0.0, next_allowed - now)
+            if delay > 0:
+                time.sleep(delay)
+                now = time.monotonic()
+            state[gate_key] = now + interval
+            _write_state(handle, state)
 
 
 def reset_request_gate_for_tests(*, gate_name: str | None = None, state_path: Path | None = None) -> None:
     resolved_path = Path(state_path) if state_path is not None else default_rate_limit_state_path()
-    with _locked_state_file(resolved_path) as handle:
-        if handle is None:
-            with _FALLBACK_LOCK:
-                if gate_name is None:
-                    _FALLBACK_NEXT_AT.clear()
-                else:
-                    _FALLBACK_NEXT_AT.pop(str(gate_name), None)
-            return
-        state = _read_state(handle)
-        if gate_name is None:
-            state = {}
-        else:
-            state.pop(str(gate_name), None)
-        _write_state(handle, state)
+    with _process_lock_for(resolved_path):
+        with _locked_state_file(resolved_path) as handle:
+            if handle is None:
+                with _FALLBACK_LOCK:
+                    if gate_name is None:
+                        _FALLBACK_NEXT_AT.clear()
+                    else:
+                        _FALLBACK_NEXT_AT.pop(str(gate_name), None)
+                return
+            state = _read_state(handle)
+            if gate_name is None:
+                state = {}
+            else:
+                state.pop(str(gate_name), None)
+            _write_state(handle, state)
