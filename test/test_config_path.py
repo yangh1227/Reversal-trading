@@ -46,6 +46,7 @@ class TestConfigPath(unittest.TestCase):
 
             self.assertEqual(loaded.leverage, 2)
             self.assertEqual(loaded.history_days, 3)
+            self.assertEqual(loaded.auto_refresh_minutes, 30)
             self.assertEqual(loaded.daily_volatility_min, 20.0)
             self.assertEqual(loaded.quote_volume_min, 10_000_000.0)
             self.assertFalse(loaded.use_rsi_filter)
@@ -71,7 +72,12 @@ class TestConfigPath(unittest.TestCase):
             config_dir.mkdir()
             other_cwd.mkdir()
 
-            settings = self.config.AppSettings(kline_interval="5m", order_mode="simple", simple_order_amount=123.0)
+            settings = self.config.AppSettings(
+                kline_interval="5m",
+                order_mode="simple",
+                simple_order_amount=123.0,
+                auto_refresh_minutes=45,
+            )
             original_cwd = Path.cwd()
             try:
                 os.chdir(other_cwd)
@@ -89,6 +95,7 @@ class TestConfigPath(unittest.TestCase):
             self.assertEqual(saved_payload["kline_interval"], "5m")
             self.assertEqual(saved_payload["order_mode"], "simple")
             self.assertEqual(saved_payload["simple_order_amount"], 123.0)
+            self.assertEqual(saved_payload["auto_refresh_minutes"], 45)
 
     def test_load_falls_back_to_legacy_app_dir_file_and_migrates_it(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

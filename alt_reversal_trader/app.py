@@ -1704,7 +1704,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.engine_order_pending = False
         self.engine_failed = False
         self.pending_open_order_interval: Optional[str] = None
-        self.auto_refresh_minutes = 10
+        self.auto_refresh_minutes = int(self.settings.auto_refresh_minutes)
         self.auto_refresh_timer = QTimer(self)
         self.live_update_timer = QTimer(self)
         self.optimized_table_timer = QTimer(self)
@@ -2077,6 +2077,9 @@ class AltReversalTraderWindow(QMainWindow):
         self.history_days_spin.setRange(1, 30)
         self.scan_workers_spin = QSpinBox()
         self.scan_workers_spin.setRange(1, 24)
+        self.auto_refresh_minutes_spin = QSpinBox()
+        self.auto_refresh_minutes_spin.setRange(1, 1_440)
+        self.auto_refresh_minutes_spin.setSuffix(" 분")
         self.rsi_filter_check.toggled.connect(self._refresh_filter_controls)
         self.atr_4h_filter_check.toggled.connect(self._refresh_filter_controls)
         layout.addRow("1일 변동성 % >=", self.daily_vol_spin)
@@ -2091,6 +2094,7 @@ class AltReversalTraderWindow(QMainWindow):
         layout.addRow("차트 엔진", self.chart_engine_combo)
         layout.addRow("히스토리 일수", self.history_days_spin)
         layout.addRow("스캔 워커", self.scan_workers_spin)
+        layout.addRow("자동 갱신", self.auto_refresh_minutes_spin)
         return group
 
     def _build_optimization_group(self) -> QGroupBox:
@@ -2749,6 +2753,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.chart_engine_combo.setCurrentText("Lightweight")
         self.history_days_spin.setValue(settings.history_days)
         self.scan_workers_spin.setValue(settings.scan_workers)
+        self.auto_refresh_minutes_spin.setValue(settings.auto_refresh_minutes)
         self.opt_span_spin.setValue(settings.optimization_span_pct)
         self.opt_steps_spin.setValue(settings.optimization_steps)
         rank_mode_index = self.opt_rank_mode_combo.findData(settings.optimization_rank_mode)
@@ -2793,6 +2798,7 @@ class AltReversalTraderWindow(QMainWindow):
             simple_order_amount=float(self.simple_order_amount_spin.value()),
             fee_rate=float(self.fee_spin.value()) / 100.0,
             history_days=int(self.history_days_spin.value()),
+            auto_refresh_minutes=int(self.auto_refresh_minutes_spin.value()),
             kline_interval=self.interval_combo.currentText(),
             daily_volatility_min=float(self.daily_vol_spin.value()),
             quote_volume_min=float(self.quote_volume_spin.value()),
@@ -2814,11 +2820,13 @@ class AltReversalTraderWindow(QMainWindow):
             strategy=StrategySettings(**strategy_payload),
             optimize_flags=optimize_flags,
             position_intervals=dict(self.settings.position_intervals),
+            position_strategy_settings=dict(self.settings.position_strategy_settings),
         )
 
     def _sync_settings(self, persist: bool = False) -> AppSettings:
         previous = self.settings
         self.settings = self.collect_settings()
+        self.auto_refresh_minutes = int(self.settings.auto_refresh_minutes)
         if not self.current_symbol:
             self.current_interval = self.settings.kline_interval
         if (
@@ -2847,6 +2855,8 @@ class AltReversalTraderWindow(QMainWindow):
             self.auto_close_last_attempt_at.clear()
             self._stop_all_auto_close_monitors()
             self._refresh_auto_close_monitors()
+        if previous.auto_refresh_minutes != self.settings.auto_refresh_minutes:
+            self._apply_auto_refresh_interval(log_message=True)
         self._sync_trade_engine_state()
         if persist:
             self.settings.save()
@@ -5425,9 +5435,15 @@ class AltReversalTraderWindow(QMainWindow):
     def _flush_optimized_table(self) -> None:
         self.update_optimized_table()
 
-    def _init_auto_refresh(self) -> None:
+    def _apply_auto_refresh_interval(self, *, log_message: bool = False) -> None:
+        self.auto_refresh_minutes = max(1, int(self.auto_refresh_minutes))
         self.auto_refresh_timer.setInterval(self.auto_refresh_minutes * 60 * 1000)
+        if log_message:
+            self.log(f"자동 갱신 주기 변경: {self.auto_refresh_minutes}분")
+
+    def _init_auto_refresh(self) -> None:
         self.auto_refresh_timer.timeout.connect(self.run_auto_refresh)
+        self._apply_auto_refresh_interval()
         self.auto_refresh_timer.start()
         self.log(f"자동 갱신 활성화: {self.auto_refresh_minutes}분마다 스캔+최적화")
 
@@ -5653,9 +5669,9 @@ class AltReversalTraderWindow(QMainWindow):
 
     def run_auto_refresh(self) -> None:
         if self._is_refresh_running():
-            self.log("자동 10분 갱신 시점이지만 이전 작업이 아직 실행 중이라 건너뜁니다.")
+            self.log(f"자동 {self.auto_refresh_minutes}분 갱신 시점이지만 이전 작업이 아직 실행 중이라 건너뜁니다.")
             return
-        self.log("자동 10분 갱신 시작")
+        self.log(f"자동 {self.auto_refresh_minutes}분 갱신 시작")
         self.run_scan_and_optimize(preserve_existing=True)
 
     def selected_candidate_symbols(self) -> List[str]:

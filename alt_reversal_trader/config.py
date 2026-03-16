@@ -136,6 +136,7 @@ class AppSettings:
     simple_order_amount: float = 50.0
     fee_rate: float = 0.0005
     history_days: int = 3
+    auto_refresh_minutes: int = 30
     kline_interval: str = "1m"
     daily_volatility_min: float = 20.0
     quote_volume_min: float = 10_000_000.0
@@ -171,6 +172,7 @@ class AppSettings:
         self.optimization_min_return_pct = float(self.optimization_min_return_pct)
         self.scan_workers = max(1, int(self.scan_workers))
         self.optimize_processes = max(1, int(self.optimize_processes))
+        self.auto_refresh_minutes = max(1, int(self.auto_refresh_minutes))
         if not self.optimize_flags:
             self.optimize_flags = DEFAULT_OPTIMIZE_FLAGS.copy()
         self.position_intervals = {
@@ -190,6 +192,7 @@ class AppSettings:
             "simple_order_amount": self.simple_order_amount,
             "fee_rate": self.fee_rate,
             "history_days": self.history_days,
+            "auto_refresh_minutes": self.auto_refresh_minutes,
             "kline_interval": self.kline_interval,
             "daily_volatility_min": self.daily_volatility_min,
             "quote_volume_min": self.quote_volume_min,

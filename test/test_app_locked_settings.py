@@ -191,3 +191,23 @@ def test_lightweight_indicator_lines_disable_crosshair_markers() -> None:
     ) or ""
 
     assert source_segment.count("crosshair_marker=False") >= 6
+
+
+def test_collect_settings_preserves_auto_refresh_minutes_and_locked_positions() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("collect_settings"),
+    ) or ""
+
+    assert "auto_refresh_minutes=int(self.auto_refresh_minutes_spin.value())" in source_segment
+    assert "position_strategy_settings=dict(self.settings.position_strategy_settings)" in source_segment
+
+
+def test_run_auto_refresh_logs_use_configured_minutes() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("run_auto_refresh"),
+    ) or ""
+
+    assert 'f"자동 {self.auto_refresh_minutes}분 갱신 시점이지만 이전 작업이 아직 실행 중이라 건너뜁니다."' in source_segment
+    assert 'f"자동 {self.auto_refresh_minutes}분 갱신 시작"' in source_segment
