@@ -4,14 +4,15 @@ from dataclasses import asdict, dataclass, field
 import os
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 import json
+import pandas as pd
 
 
 APP_CONFIG_FILENAME = "alt_reversal_trader_config.json"
 APP_INTERVAL_OPTIONS = ("1m", "2m", "3m", "5m", "15m")
-CHART_ENGINE_OPTIONS = ("Lightweight",)
 OPTIMIZATION_RANK_MODE_OPTIONS = ("score", "return")
+DEFAULT_HISTORY_DAYS = 3
 DEFAULT_OPTIMIZATION_PROFILE_SCALE = 20.0
 QIP_SENSITIVITY_OPTIONS = (
     "1-Ultra Fine Max",
@@ -126,16 +127,30 @@ def _normalize_position_strategy_settings(
     return normalized
 
 
+def _normalize_position_cursor_entry_times(
+    payload: Dict[str, Any] | None,
+) -> Dict[str, pd.Timestamp]:
+    normalized: Dict[str, pd.Timestamp] = {}
+    for symbol, raw_time in dict(payload or {}).items():
+        symbol_text = str(symbol or "").strip()
+        if not symbol_text or raw_time in {None, ""}:
+            continue
+        try:
+            normalized[symbol_text] = pd.Timestamp(raw_time).tz_localize(None)
+        except Exception:
+            continue
+    return normalized
+
+
 @dataclass
 class AppSettings:
     api_key: str = ""
     api_secret: str = ""
-    chart_engine: str = "Lightweight"
     leverage: int = 2
     order_mode: str = "compound"
     simple_order_amount: float = 50.0
     fee_rate: float = 0.0005
-    history_days: int = 3
+    history_days: int = DEFAULT_HISTORY_DAYS
     auto_refresh_minutes: int = 30
     kline_interval: str = "1m"
     daily_volatility_min: float = 20.0
@@ -159,9 +174,10 @@ class AppSettings:
     optimize_flags: Dict[str, bool] = field(default_factory=dict)
     position_intervals: Dict[str, str] = field(default_factory=dict)
     position_strategy_settings: Dict[str, StrategySettings] = field(default_factory=dict)
+    position_filled_fractions: Dict[str, float] = field(default_factory=dict)
+    position_cursor_entry_times: Dict[str, pd.Timestamp] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.chart_engine = CHART_ENGINE_OPTIONS[0]
         if self.order_mode not in {"compound", "simple"}:
             self.order_mode = "compound"
         self.simple_order_amount = max(1.0, float(self.simple_order_amount))
@@ -181,12 +197,17 @@ class AppSettings:
             if str(interval) in APP_INTERVAL_OPTIONS
         }
         self.position_strategy_settings = _normalize_position_strategy_settings(self.position_strategy_settings)
+        self.position_filled_fractions = {
+            str(symbol): max(0.0, min(0.99, float(fraction)))
+            for symbol, fraction in dict(self.position_filled_fractions).items()
+            if str(symbol or "").strip()
+        }
+        self.position_cursor_entry_times = _normalize_position_cursor_entry_times(self.position_cursor_entry_times)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "api_key": self.api_key,
             "api_secret": self.api_secret,
-            "chart_engine": self.chart_engine,
             "leverage": self.leverage,
             "order_mode": self.order_mode,
             "simple_order_amount": self.simple_order_amount,
@@ -218,6 +239,11 @@ class AppSettings:
                 symbol: settings.to_dict()
                 for symbol, settings in self.position_strategy_settings.items()
             },
+            "position_filled_fractions": dict(self.position_filled_fractions),
+            "position_cursor_entry_times": {
+                symbol: timestamp.isoformat()
+                for symbol, timestamp in self.position_cursor_entry_times.items()
+            },
         }
 
     @classmethod
@@ -227,6 +253,8 @@ class AppSettings:
         optimize_flags = payload.pop("optimize_flags", {}) or {}
         position_intervals = payload.pop("position_intervals", {}) or {}
         position_strategy_settings = payload.pop("position_strategy_settings", {}) or {}
+        position_filled_fractions = payload.pop("position_filled_fractions", {}) or {}
+        position_cursor_entry_times = payload.pop("position_cursor_entry_times", {}) or {}
         simple_order_amount = payload.pop("simple_order_amount", None)
         legacy_simple_long = payload.pop("simple_long_order_amount", None)
         legacy_simple_short = payload.pop("simple_short_order_amount", None)
@@ -248,6 +276,12 @@ class AppSettings:
             if str(interval) in APP_INTERVAL_OPTIONS
         }
         settings.position_strategy_settings = _normalize_position_strategy_settings(position_strategy_settings)
+        settings.position_filled_fractions = {
+            str(symbol): max(0.0, min(0.99, float(fraction)))
+            for symbol, fraction in dict(position_filled_fractions).items()
+            if str(symbol or "").strip()
+        }
+        settings.position_cursor_entry_times = _normalize_position_cursor_entry_times(position_cursor_entry_times)
         return settings
 
     @classmethod

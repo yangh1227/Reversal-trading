@@ -27,7 +27,7 @@ from .binance_futures import (
     resample_ohlcv,
     resolve_base_interval,
 )
-from .config import APP_INTERVAL_OPTIONS, CHART_ENGINE_OPTIONS, PARAMETER_SPECS, AppSettings, StrategySettings
+from .config import APP_INTERVAL_OPTIONS, PARAMETER_SPECS, AppSettings, StrategySettings
 from .crash_logger import log_runtime_event
 from .live_chart_utils import (
     history_with_live_preview as _history_with_live_preview,
@@ -1591,13 +1591,16 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_trade_entry_pending_fraction = 0.0
         self.auto_trade_entry_pending_cursor_time = None
         self.auto_trade_entry_pending_cursor_time: Optional[pd.Timestamp] = None
-        self.auto_trade_filled_fraction_by_symbol: Dict[str, float] = {}
-        self.auto_trade_cursor_entry_time_by_symbol: Dict[str, pd.Timestamp] = {}
+        self.auto_trade_filled_fraction_by_symbol: Dict[str, float] = dict(self.settings.position_filled_fractions)
+        self.auto_trade_cursor_entry_time_by_symbol: Dict[str, pd.Timestamp] = dict(
+            self.settings.position_cursor_entry_times
+        )
         self.order_worker_symbol: Optional[str] = None
         self.order_worker_is_auto_close = False
         self.order_worker_is_auto_trade = False
         self.engine_order_pending = False
         self.engine_failed = False
+        self.trade_engine_recovery_scheduled = False
         self.pending_open_order_interval: Optional[str] = None
         self.auto_refresh_minutes = int(self.settings.auto_refresh_minutes)
         self.auto_refresh_timer = QTimer(self)
@@ -1610,7 +1613,6 @@ class AltReversalTraderWindow(QMainWindow):
         self.parameter_editors: Dict[str, object] = {}
         self.parameter_opt_boxes: Dict[str, QCheckBox] = {}
         self.parameter_opt_hint_labels: Dict[str, QLabel] = {}
-        self.chart_mode = "Lightweight"
         self.chart_transition_overlay: Optional[QWidget] = None
         self.chart_transition_effect: Optional[QGraphicsOpacityEffect] = None
         self.chart_transition_animation: Optional[QPropertyAnimation] = None
@@ -1653,7 +1655,6 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_close_retry_timer.timeout.connect(self._run_auto_close_retry_cycle)
         self.auto_trade_timer.setInterval(AUTO_TRADE_INTERVAL_MS)
         self.auto_trade_timer.timeout.connect(self._run_auto_trade_cycle)
-        self.chart_engine_combo.currentTextChanged.connect(self.on_chart_engine_changed)
         self._init_auto_refresh()
         self._start_trade_engine()
         self.statusBar().showMessage("준비됨")
@@ -1965,11 +1966,10 @@ class AltReversalTraderWindow(QMainWindow):
         self.atr_4h_spin.setSingleStep(1.0)
         self.interval_combo = QComboBox()
         self.interval_combo.addItems(APP_INTERVAL_OPTIONS)
-        self.chart_engine_combo = QComboBox()
-        self.chart_engine_combo.addItems(CHART_ENGINE_OPTIONS)
-        self.chart_engine_combo.setEnabled(False)
         self.history_days_spin = QSpinBox()
         self.history_days_spin.setRange(1, 30)
+        self.history_days_spin.setSuffix(" 일")
+        self.history_days_spin.setToolTip("차트 로드와 백테스트에 사용할 히스토리 일수")
         self.scan_workers_spin = QSpinBox()
         self.scan_workers_spin.setRange(1, 24)
         self.auto_refresh_minutes_spin = QSpinBox()
@@ -1986,8 +1986,7 @@ class AltReversalTraderWindow(QMainWindow):
         layout.addRow("4h ATR% 필터", self.atr_4h_filter_check)
         layout.addRow("4h ATR% >=", self.atr_4h_spin)
         layout.addRow("백테스트 봉", self.interval_combo)
-        layout.addRow("차트 엔진", self.chart_engine_combo)
-        layout.addRow("히스토리 일수", self.history_days_spin)
+        layout.addRow("차트/백테스트 일수", self.history_days_spin)
         layout.addRow("스캔 워커", self.scan_workers_spin)
         layout.addRow("자동 갱신", self.auto_refresh_minutes_spin)
         return group
@@ -2198,7 +2197,7 @@ class AltReversalTraderWindow(QMainWindow):
         return group
 
     def _init_chart(self) -> None:
-        self._rebuild_chart_engine(force=True)
+        self._rebuild_chart_view(force=True)
 
     def _init_chart_transition_overlay(self) -> None:
         if not hasattr(self, "chart_host"):
@@ -2284,13 +2283,12 @@ class AltReversalTraderWindow(QMainWindow):
         self.ema_fast_line = None
         self.ema_slow_line = None
 
-    def _rebuild_chart_engine(self, force: bool = False) -> None:
-        if not force and self.chart_mode == "Lightweight":
+    def _rebuild_chart_view(self, force: bool = False) -> None:
+        if not force and self.chart is not None:
             self.update_positions_table()
             return
         self._clear_chart_host()
         self._init_lightweight_chart()
-        self.chart_mode = "Lightweight"
         self._sync_chart_transition_overlay()
         if self.current_symbol and self.current_backtest:
             self.render_chart(self.current_symbol, self.current_backtest)
@@ -2486,7 +2484,7 @@ class AltReversalTraderWindow(QMainWindow):
         )
 
     def _set_lightweight_bar_close_overlay(self, countdown: Optional[str], price: Optional[float]) -> None:
-        if self.chart_mode != "Lightweight" or self.chart is None:
+        if self.chart is None:
             return
         if not countdown or price is None:
             self.chart.run_script(
@@ -2582,7 +2580,7 @@ class AltReversalTraderWindow(QMainWindow):
     def _set_lightweight_optimization_overlay(self, symbol: Optional[str] = None, interval: Optional[str] = None) -> None:
         showing_optimized_chart = self._showing_optimized_chart(symbol, interval)
         self._set_optimization_chart_notice_text(showing_optimized_chart)
-        if self.chart_mode != "Lightweight" or self.chart is None:
+        if self.chart is None:
             return
         if showing_optimized_chart:
             self.chart.run_script(
@@ -2618,18 +2616,12 @@ class AltReversalTraderWindow(QMainWindow):
             [
                 f"engine: {engine_label}",
                 f"current_symbol: {self.current_symbol}",
-                f"chart_mode: {self.chart_mode}",
                 f"status: {status}",
                 f"exit_code: {exit_code}",
             ]
         )
         path = log_runtime_event("WebEngine Render Crash", body, open_notepad=True)
         self.log(f"{engine_label} 렌더 프로세스 종료. 로그: {path}")
-
-    def on_chart_engine_changed(self, _engine: str) -> None:
-        self.settings.chart_engine = "Lightweight"
-        if self.chart_engine_combo.currentText() != "Lightweight":
-            self.chart_engine_combo.setCurrentText("Lightweight")
 
     def _apply_loaded_settings(self) -> None:
         settings = self.settings
@@ -2645,7 +2637,6 @@ class AltReversalTraderWindow(QMainWindow):
         self.atr_4h_filter_check.setChecked(settings.use_atr_4h_filter)
         self.atr_4h_spin.setValue(settings.atr_4h_min_pct)
         self.interval_combo.setCurrentText(settings.kline_interval)
-        self.chart_engine_combo.setCurrentText("Lightweight")
         self.history_days_spin.setValue(settings.history_days)
         self.scan_workers_spin.setValue(settings.scan_workers)
         self.auto_refresh_minutes_spin.setValue(settings.auto_refresh_minutes)
@@ -2687,7 +2678,6 @@ class AltReversalTraderWindow(QMainWindow):
         return AppSettings(
             api_key=self.api_key_edit.text().strip(),
             api_secret=self.api_secret_edit.text().strip(),
-            chart_engine="Lightweight",
             leverage=int(self.leverage_spin.value()),
             order_mode="simple" if self.simple_order_radio.isChecked() else "compound",
             simple_order_amount=float(self.simple_order_amount_spin.value()),
@@ -2716,6 +2706,8 @@ class AltReversalTraderWindow(QMainWindow):
             optimize_flags=optimize_flags,
             position_intervals=dict(self.settings.position_intervals),
             position_strategy_settings=dict(self.settings.position_strategy_settings),
+            position_filled_fractions=dict(self.settings.position_filled_fractions),
+            position_cursor_entry_times=dict(self.settings.position_cursor_entry_times),
         )
 
     def _sync_settings(self, persist: bool = False) -> AppSettings:
@@ -2777,6 +2769,7 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _start_trade_engine(self) -> None:
         self._stop_trade_engine()
+        self.trade_engine_recovery_scheduled = False
         controller = TradeEngineController()
         controller.start()
         self.trade_engine = controller
@@ -2790,6 +2783,40 @@ class AltReversalTraderWindow(QMainWindow):
             self.trade_engine.stop()
         self.trade_engine = None
         self.engine_failed = False
+        self.trade_engine_recovery_scheduled = False
+
+    def _schedule_trade_engine_recovery(self, delay_ms: int = 1500) -> None:
+        if self.trade_engine_recovery_scheduled:
+            return
+        self.trade_engine_recovery_scheduled = True
+        QTimer.singleShot(delay_ms, self._recover_trade_engine_if_needed)
+
+    def _recover_trade_engine_if_needed(self) -> None:
+        self.trade_engine_recovery_scheduled = False
+        if self._trade_engine_alive():
+            return
+        if not self.settings.api_key or not self.settings.api_secret:
+            self._refresh_auto_trade_button_state()
+            return
+        self.log("Trade engine restarting...")
+        try:
+            self._start_trade_engine()
+        except Exception as exc:
+            self.engine_failed = True
+            self.trade_engine = None
+            self.log(f"Trade engine restart failed: {exc}")
+            self._refresh_auto_trade_button_state()
+            self._schedule_trade_engine_recovery(delay_ms=3000)
+            return
+        if self.auto_trade_requested and self._auto_trade_ready():
+            QTimer.singleShot(0, self._activate_requested_auto_trade_if_ready)
+        self._refresh_auto_trade_button_state()
+
+    def _ensure_trade_engine_available(self) -> bool:
+        if self._trade_engine_alive():
+            return True
+        self._recover_trade_engine_if_needed()
+        return self._trade_engine_alive()
 
     def _trade_engine_watchlist_items(self) -> Tuple[EngineWatchlistItem, ...]:
         items: List[EngineWatchlistItem] = []
@@ -2824,6 +2851,8 @@ class AltReversalTraderWindow(QMainWindow):
                     auto_close_enabled_symbols=tuple(sorted(self.auto_close_enabled_symbols)),
                     position_intervals=dict(self.settings.position_intervals),
                     position_strategy_settings=dict(self.settings.position_strategy_settings),
+                    position_filled_fractions=dict(self.settings.position_filled_fractions),
+                    position_cursor_entry_times=dict(self.settings.position_cursor_entry_times),
                     watchlist=self._trade_engine_watchlist_items(),
                 )
             )
@@ -2840,11 +2869,10 @@ class AltReversalTraderWindow(QMainWindow):
             self._handle_trade_engine_event(event)
 
     def _handle_trade_engine_failure(self, message: str) -> None:
-        if self.engine_failed:
-            return
+        requested_auto_trade = bool(self.auto_trade_requested or self.auto_trade_enabled)
         self.engine_failed = True
         self.auto_trade_enabled = False
-        self.auto_trade_requested = False
+        self.auto_trade_requested = requested_auto_trade
         self.engine_order_pending = False
         self.trade_engine_poll_timer.stop()
         if self.trade_engine is not None:
@@ -2853,6 +2881,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.log(message)
         self._refresh_auto_trade_button_state()
         self._set_order_buttons_enabled(True)
+        self._schedule_trade_engine_recovery()
 
     def _handle_trade_engine_event(self, event: object) -> None:
         if isinstance(event, EngineLogEvent):
@@ -3312,6 +3341,40 @@ class AltReversalTraderWindow(QMainWindow):
     def _persist_position_intervals(self) -> None:
         self.settings.save()
 
+    def _remember_position_filled_fraction(
+        self,
+        symbol: str,
+        fraction: float,
+        persist: bool = True,
+    ) -> None:
+        if not symbol:
+            return
+        normalized = max(0.0, min(signal_fraction_for_zone(3), float(fraction)))
+        current = self.settings.position_filled_fractions.get(symbol)
+        if current is not None and abs(current - normalized) <= 1e-9:
+            return
+        self.auto_trade_filled_fraction_by_symbol[symbol] = normalized
+        self.settings.position_filled_fractions[symbol] = normalized
+        if persist:
+            self._persist_position_intervals()
+
+    def _remember_position_cursor_entry_time(
+        self,
+        symbol: str,
+        entry_time: Optional[pd.Timestamp],
+        persist: bool = True,
+    ) -> None:
+        if not symbol or entry_time is None:
+            return
+        normalized = pd.Timestamp(entry_time).tz_localize(None)
+        current = self.settings.position_cursor_entry_times.get(symbol)
+        if current is not None and current == normalized:
+            return
+        self.auto_trade_cursor_entry_time_by_symbol[symbol] = normalized
+        self.settings.position_cursor_entry_times[symbol] = normalized
+        if persist:
+            self._persist_position_intervals()
+
     def _remember_position_interval(self, symbol: str, interval: Optional[str], persist: bool = True) -> None:
         normalized = str(interval or "").strip()
         if not symbol or normalized not in APP_INTERVAL_OPTIONS:
@@ -3350,6 +3413,18 @@ class AltReversalTraderWindow(QMainWindow):
             self.settings.position_strategy_settings.pop(symbol, None)
             self.position_strategy_by_symbol.pop(symbol, None)
             removed = True
+        for symbol in list(self.settings.position_filled_fractions):
+            if symbol in open_symbols:
+                continue
+            self.settings.position_filled_fractions.pop(symbol, None)
+            self.auto_trade_filled_fraction_by_symbol.pop(symbol, None)
+            removed = True
+        for symbol in list(self.settings.position_cursor_entry_times):
+            if symbol in open_symbols:
+                continue
+            self.settings.position_cursor_entry_times.pop(symbol, None)
+            self.auto_trade_cursor_entry_time_by_symbol.pop(symbol, None)
+            removed = True
         if removed and persist:
             self._persist_position_intervals()
 
@@ -3366,12 +3441,16 @@ class AltReversalTraderWindow(QMainWindow):
                     changed = True
             if symbol in self.settings.position_strategy_settings:
                 self.position_strategy_by_symbol[symbol] = self.settings.position_strategy_settings[symbol]
-                continue
-            optimization = self._optimization_result(symbol, interval if interval in APP_INTERVAL_OPTIONS else None)
-            strategy_settings = optimization.best_backtest.settings if optimization else self.settings.strategy
-            self.settings.position_strategy_settings[symbol] = strategy_settings
-            self.position_strategy_by_symbol[symbol] = strategy_settings
-            changed = True
+            else:
+                optimization = self._optimization_result(symbol, interval if interval in APP_INTERVAL_OPTIONS else None)
+                strategy_settings = optimization.best_backtest.settings if optimization else self.settings.strategy
+                self.settings.position_strategy_settings[symbol] = strategy_settings
+                self.position_strategy_by_symbol[symbol] = strategy_settings
+                changed = True
+            if symbol in self.settings.position_filled_fractions:
+                self.auto_trade_filled_fraction_by_symbol[symbol] = self.settings.position_filled_fractions[symbol]
+            if symbol in self.settings.position_cursor_entry_times:
+                self.auto_trade_cursor_entry_time_by_symbol[symbol] = self.settings.position_cursor_entry_times[symbol]
         if changed:
             self._persist_position_intervals()
 
@@ -3492,10 +3571,14 @@ class AltReversalTraderWindow(QMainWindow):
         button.blockSignals(False)
 
     def _auto_trade_ready(self) -> bool:
-        return bool(self.optimized_results) and bool(self.settings.api_key and self.settings.api_secret) and not self.engine_failed
+        return bool(self.optimized_results) and bool(self.settings.api_key and self.settings.api_secret)
 
     def _enable_auto_trade_runtime(self) -> None:
         if self.auto_trade_enabled:
+            return
+        if not self._ensure_trade_engine_available():
+            self.log("자동매매 예약됨: trade engine 복구 후 자동으로 다시 켜집니다.")
+            self._refresh_auto_trade_button_state()
             return
         self.auto_trade_enabled = True
         self.log("자동매매 활성화")
@@ -3529,7 +3612,7 @@ class AltReversalTraderWindow(QMainWindow):
     def _refresh_auto_trade_button_state(self) -> None:
         if not hasattr(self, "auto_trade_button"):
             return
-        available = bool(self.settings.api_key and self.settings.api_secret) and not self.engine_failed
+        available = bool(self.settings.api_key and self.settings.api_secret)
         requested = bool(self.auto_trade_requested or self.auto_trade_enabled)
         pending = bool(self.auto_trade_requested and not self.auto_trade_enabled)
         self.auto_trade_button.setEnabled(requested or available)
@@ -3742,7 +3825,7 @@ class AltReversalTraderWindow(QMainWindow):
         return markers
 
     def _render_lightweight_markers(self, confirmed_markers: Optional[List[Dict[str, object]]] = None) -> None:
-        if self.chart_mode != "Lightweight" or self.chart is None:
+        if self.chart is None:
             return
         if confirmed_markers is not None:
             self.current_lightweight_markers = list(confirmed_markers)
@@ -3759,7 +3842,6 @@ class AltReversalTraderWindow(QMainWindow):
     def _build_live_preview_markers(self, symbol: str) -> List[Dict[str, object]]:
         if (
             symbol != self.current_symbol
-            or self.chart_mode != "Lightweight"
             or self.current_backtest is None
             or self.current_backtest.cursor is None
         ):
@@ -3997,7 +4079,7 @@ class AltReversalTraderWindow(QMainWindow):
         return True
 
     def _refresh_live_preview_markers(self, symbol: Optional[str]) -> None:
-        if self.chart_mode != "Lightweight":
+        if self.chart is None:
             return
         target_symbol = str(symbol or "")
         preview_markers = self._build_live_preview_markers(target_symbol) if target_symbol else []
@@ -4035,7 +4117,7 @@ class AltReversalTraderWindow(QMainWindow):
         return candle_df, indicators, equity_df, markers
 
     def _clear_lightweight_volume_series(self) -> None:
-        if self.chart_mode != "Lightweight" or self.chart is None:
+        if self.chart is None:
             return
         self.chart.run_script(f"{self.chart.id}.volumeSeries.setData([])")
 
@@ -4061,10 +4143,10 @@ class AltReversalTraderWindow(QMainWindow):
         target_symbol = symbol or self.current_symbol
         if (
             not target_symbol
-            or self.chart_mode != "Lightweight"
             or target_symbol != self.current_symbol
             or self.current_backtest is None
             or self.chart_history_page_worker is not None
+            or self.chart is None
         ):
             return
         if self.chart_range_bars_before > CHART_LAZY_LOAD_TRIGGER_BARS:
@@ -4094,7 +4176,7 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _on_lightweight_range_change(self, _chart, bars_before: float, _bars_after: float) -> None:
         self.chart_range_bars_before = float(bars_before)
-        if self.chart_mode != "Lightweight" or not self.current_symbol:
+        if self.chart is None or not self.current_symbol:
             return
         if self.chart_history_page_worker is not None:
             self.chart_history_load_pending = self.chart_range_bars_before <= CHART_LAZY_LOAD_TRIGGER_BARS
@@ -4748,7 +4830,7 @@ class AltReversalTraderWindow(QMainWindow):
         if worker is not None:
             worker.stop()
             worker.wait(1500)
-        if self.chart_mode == "Lightweight" and self.chart is not None:
+        if self.chart is not None:
             self._render_lightweight_markers()
 
     def _stop_position_price_worker(self, symbol: str) -> None:
@@ -4862,7 +4944,7 @@ class AltReversalTraderWindow(QMainWindow):
         self._evaluate_closed_bar_auto_close(symbol, confirmed_history)
 
     def _apply_live_lightweight_bar(self, symbol: str, bar: Dict[str, object]) -> None:
-        if symbol != self.current_symbol or self.chart_mode != "Lightweight" or self.chart is None:
+        if symbol != self.current_symbol or self.chart is None:
             return
         series = pd.Series(
             {
@@ -4919,9 +5001,8 @@ class AltReversalTraderWindow(QMainWindow):
             return
         current_history = self._get_history_frame(symbol, self.current_interval)
         if _history_frame_signature(result.get("history")) != _history_frame_signature(current_history):
-            if self.live_recalc_pending:
-                self.live_recalc_pending = False
-                self._schedule_live_backtest(symbol)
+            self.live_recalc_pending = False
+            self._schedule_live_backtest(symbol)
             return
         perf = dict(result.get("perf") or {})
         self._log_perf_ms(f"{symbol} live worker backtest", float(perf.get("worker_backtest_ms", 0.0) or 0.0))
@@ -5041,8 +5122,7 @@ class AltReversalTraderWindow(QMainWindow):
     def _update_entry_price_overlay(self) -> None:
         position = self.current_position_snapshot
         if (
-            self.chart_mode != "Lightweight"
-            or self.chart is None
+            self.chart is None
             or position is None
             or position.symbol != self.current_symbol
         ):
@@ -5969,7 +6049,7 @@ class AltReversalTraderWindow(QMainWindow):
         reveal_overlay: bool = True,
     ) -> None:
         if self.chart is None:
-            self._rebuild_chart_engine(force=True)
+            self._rebuild_chart_view(force=True)
         if not reset_view:
             self._stash_lightweight_range()
         self.chart.set(candle_df)
@@ -6076,7 +6156,6 @@ class AltReversalTraderWindow(QMainWindow):
     ) -> bool:
         if (
             symbol != self.current_symbol
-            or self.chart_mode != "Lightweight"
             or self.chart is None
             or self.equity_line is None
             or previous_backtest is None
@@ -6314,9 +6393,19 @@ class AltReversalTraderWindow(QMainWindow):
             for symbol, fraction in self.auto_trade_filled_fraction_by_symbol.items()
             if symbol in open_symbols
         }
+        self.settings.position_filled_fractions = {
+            symbol: fraction
+            for symbol, fraction in self.settings.position_filled_fractions.items()
+            if symbol in open_symbols
+        }
         self.auto_trade_cursor_entry_time_by_symbol = {
             symbol: entry_time
             for symbol, entry_time in self.auto_trade_cursor_entry_time_by_symbol.items()
+            if symbol in open_symbols
+        }
+        self.settings.position_cursor_entry_times = {
+            symbol: entry_time
+            for symbol, entry_time in self.settings.position_cursor_entry_times.items()
             if symbol in open_symbols
         }
         self._forget_closed_position_intervals(open_symbols, persist=False)
@@ -6420,7 +6509,7 @@ class AltReversalTraderWindow(QMainWindow):
             else:
                 self.show_warning("주문금액은 0보다 커야 합니다.")
             return
-        if not self._trade_engine_alive():
+        if not self._ensure_trade_engine_available():
             self.show_error("Trade engine is not available.")
             return
         optimization = self._optimization_result(target_symbol, target_interval)
@@ -6497,7 +6586,7 @@ class AltReversalTraderWindow(QMainWindow):
             if auto_close_reason is None:
                 self.show_warning("이미 주문 처리 중입니다.")
             return False
-        if not self._trade_engine_alive():
+        if not self._ensure_trade_engine_available():
             if auto_close_reason is None:
                 self.show_error("Trade engine is not available.")
             else:
@@ -6545,12 +6634,20 @@ class AltReversalTraderWindow(QMainWindow):
         was_auto_trade = self.order_worker_is_auto_trade
         if was_auto_trade and order_symbol:
             current_fraction = float(self.auto_trade_filled_fraction_by_symbol.get(order_symbol, 0.0))
-            self.auto_trade_filled_fraction_by_symbol[order_symbol] = min(
-                signal_fraction_for_zone(3),
-                current_fraction + float(self.auto_trade_entry_pending_fraction or 0.0),
+            self._remember_position_filled_fraction(
+                order_symbol,
+                min(
+                    signal_fraction_for_zone(3),
+                    current_fraction + float(self.auto_trade_entry_pending_fraction or 0.0),
+                ),
+                persist=True,
             )
             if self.auto_trade_entry_pending_cursor_time is not None:
-                self.auto_trade_cursor_entry_time_by_symbol[order_symbol] = self.auto_trade_entry_pending_cursor_time
+                self._remember_position_cursor_entry_time(
+                    order_symbol,
+                    self.auto_trade_entry_pending_cursor_time,
+                    persist=True,
+                )
         self.order_worker_symbol = None
         self.order_worker_is_auto_close = False
         self.order_worker_is_auto_trade = False

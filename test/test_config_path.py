@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import pandas as pd
 
 
 CONFIG_MODULE_PATH = Path(__file__).resolve().parents[1] / "alt_reversal_trader" / "config.py"
@@ -136,6 +137,8 @@ class TestConfigPath(unittest.TestCase):
             settings = self.config.AppSettings(
                 position_intervals={"BTCUSDT": "5m"},
                 position_strategy_settings={"BTCUSDT": locked_settings},
+                position_filled_fractions={"BTCUSDT": 0.5},
+                position_cursor_entry_times={"BTCUSDT": pd.Timestamp("2026-01-01 00:10:00")},
             )
 
             settings.save(config_path)
@@ -143,11 +146,29 @@ class TestConfigPath(unittest.TestCase):
 
             self.assertEqual(loaded.position_intervals["BTCUSDT"], "5m")
             self.assertEqual(loaded.position_strategy_settings["BTCUSDT"], locked_settings)
+            self.assertEqual(loaded.position_filled_fractions["BTCUSDT"], 0.5)
+            self.assertEqual(loaded.position_cursor_entry_times["BTCUSDT"], pd.Timestamp("2026-01-01 00:10:00"))
 
     def test_default_app_settings_use_dynamic_optimize_process_count(self) -> None:
         settings = self.config.AppSettings()
 
         self.assertEqual(settings.optimize_processes, self.config.default_optimize_process_count())
+
+    def test_legacy_chart_engine_field_is_ignored_on_load(self) -> None:
+        settings = self.config.AppSettings.from_dict(
+            {
+                "chart_engine": "Plotly",
+                "kline_interval": "2m",
+            }
+        )
+
+        self.assertEqual(settings.kline_interval, "2m")
+        self.assertFalse(hasattr(settings, "chart_engine"))
+
+    def test_save_omits_legacy_chart_engine_field(self) -> None:
+        payload = self.config.AppSettings().to_dict()
+
+        self.assertNotIn("chart_engine", payload)
 
 
 if __name__ == "__main__":

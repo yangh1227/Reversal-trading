@@ -141,6 +141,22 @@ def test_closed_bar_backtest_schedules_auto_trade_with_trigger_bar_time() -> Non
     assert "trigger_bar_time=confirmed_bar_time" in source_segment
 
 
+def test_live_backtest_completion_always_reschedules_on_history_mismatch() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_on_live_backtest_completed"),
+    ) or ""
+
+    mismatch_block = source_segment.split(
+        'if _history_frame_signature(result.get("history")) != _history_frame_signature(current_history):',
+        1,
+    )[1].split("perf = dict", 1)[0]
+
+    assert "self.live_recalc_pending = False" in mismatch_block
+    assert "self._schedule_live_backtest(symbol)" in mismatch_block
+    assert "if self.live_recalc_pending:" not in mismatch_block
+
+
 def test_optimization_completion_does_not_auto_select_first_result_row() -> None:
     source_segment = ast.get_source_segment(
         APP_PATH.read_text(encoding="utf-8"),
@@ -169,10 +185,42 @@ def test_auto_trade_button_refresh_does_not_require_optimized_results_to_enable(
         _window_method_node("_refresh_auto_trade_button_state"),
     ) or ""
 
-    assert "available = bool(self.settings.api_key and self.settings.api_secret) and not self.engine_failed" in source_segment
+    assert "available = bool(self.settings.api_key and self.settings.api_secret)" in source_segment
     assert "requested = bool(self.auto_trade_requested or self.auto_trade_enabled)" in source_segment
     assert "self.auto_trade_button.setEnabled(requested or available)" in source_segment
     assert "self.optimized_results" not in source_segment
+
+
+def test_auto_trade_ready_ignores_engine_failed_lockout() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_auto_trade_ready"),
+    ) or ""
+
+    assert "self.optimized_results" in source_segment
+    assert "self.settings.api_key and self.settings.api_secret" in source_segment
+    assert "engine_failed" not in source_segment
+
+
+def test_trade_engine_failure_schedules_recovery_and_preserves_request() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_handle_trade_engine_failure"),
+    ) or ""
+
+    assert "requested_auto_trade = bool(self.auto_trade_requested or self.auto_trade_enabled)" in source_segment
+    assert "self.auto_trade_requested = requested_auto_trade" in source_segment
+    assert "self._schedule_trade_engine_recovery()" in source_segment
+
+
+def test_auto_trade_runtime_ensures_trade_engine_is_available() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_enable_auto_trade_runtime"),
+    ) or ""
+
+    assert "self._ensure_trade_engine_available()" in source_segment
+    assert "trade engine 복구 후 자동으로 다시 켜집니다." in source_segment
 
 
 def test_optimization_completion_activates_requested_auto_trade() -> None:
@@ -201,6 +249,8 @@ def test_collect_settings_preserves_auto_refresh_minutes_and_locked_positions() 
 
     assert "auto_refresh_minutes=int(self.auto_refresh_minutes_spin.value())" in source_segment
     assert "position_strategy_settings=dict(self.settings.position_strategy_settings)" in source_segment
+    assert "position_filled_fractions=dict(self.settings.position_filled_fractions)" in source_segment
+    assert "position_cursor_entry_times=dict(self.settings.position_cursor_entry_times)" in source_segment
 
 
 def test_kline_stream_worker_uses_shared_two_minute_transform_helper() -> None:
@@ -260,6 +310,34 @@ def test_run_scan_and_optimize_does_not_clear_live_results_before_refresh() -> N
     assert "self.history_cache = {}" not in source_segment
     assert "self.backtest_cache = {}" not in source_segment
     assert "self.current_symbol = None" not in source_segment
+
+
+def test_filter_group_does_not_expose_chart_engine_selector() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_build_filter_group"),
+    ) or ""
+
+    assert "chart_engine_combo" not in source_segment
+    assert "차트 엔진" not in source_segment
+
+
+def test_app_source_no_longer_keeps_legacy_chart_engine_state() -> None:
+    source = APP_PATH.read_text(encoding="utf-8")
+
+    assert "chart_mode" not in source
+    assert "CHART_ENGINE_OPTIONS" not in source
+
+
+def test_filter_group_exposes_chart_backtest_history_days_setting() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_build_filter_group"),
+    ) or ""
+
+    assert 'self.history_days_spin.setSuffix(" 일")' in source_segment
+    assert 'self.history_days_spin.setToolTip("차트 로드와 백테스트에 사용할 히스토리 일수")' in source_segment
+    assert 'layout.addRow("차트/백테스트 일수", self.history_days_spin)' in source_segment
 
 
 def test_optimization_result_buffers_pending_backtests_when_preserving_lists() -> None:

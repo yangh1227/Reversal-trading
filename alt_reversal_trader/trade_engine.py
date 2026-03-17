@@ -20,7 +20,7 @@ from .auto_trade_runtime import (
     pick_auto_trade_candidate,
 )
 from .binance_futures import BinanceFuturesClient, PositionSnapshot, resolve_base_interval
-from .config import APP_INTERVAL_OPTIONS, StrategySettings
+from .config import APP_INTERVAL_OPTIONS, DEFAULT_HISTORY_DAYS, StrategySettings
 from .live_chart_utils import merge_live_bar as _merge_live_bar
 from .live_chart_utils import seed_two_minute_aggregate as _seed_two_minute_aggregate
 from .live_chart_utils import transform_two_minute_bar as _transform_two_minute_bar
@@ -71,6 +71,8 @@ class EngineSyncCommand:
     auto_close_enabled_symbols: Tuple[str, ...]
     position_intervals: Dict[str, str]
     position_strategy_settings: Dict[str, StrategySettings]
+    position_filled_fractions: Dict[str, float]
+    position_cursor_entry_times: Dict[str, pd.Timestamp]
     watchlist: Tuple[EngineWatchlistItem, ...]
 
 
@@ -606,7 +608,7 @@ class _TradeEngine:
         self.api_secret = ""
         self.leverage = 1
         self.fee_rate = 0.0005
-        self.history_days = 5
+        self.history_days = DEFAULT_HISTORY_DAYS
         self.default_interval = "1m"
         self.default_strategy_settings = StrategySettings()
         self.optimization_rank_mode = "score"
@@ -785,6 +787,16 @@ class _TradeEngine:
             str(symbol): settings
             for symbol, settings in dict(command.position_strategy_settings).items()
             if isinstance(settings, StrategySettings)
+        }
+        self.filled_fraction_by_symbol = {
+            str(symbol): max(0.0, min(signal_fraction_for_zone(3), float(fraction)))
+            for symbol, fraction in dict(command.position_filled_fractions).items()
+            if str(symbol or "").strip()
+        }
+        self.auto_trade_cursor_entry_time = {
+            str(symbol): pd.Timestamp(entry_time).tz_localize(None)
+            for symbol, entry_time in dict(command.position_cursor_entry_times).items()
+            if str(symbol or "").strip()
         }
         self.watchlist = {
             (item.symbol, item.interval): item

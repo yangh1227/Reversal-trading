@@ -27,6 +27,8 @@ class EngineSyncCommand:
     auto_close_enabled_symbols: Tuple[str, ...]
     position_intervals: Dict[str, str]
     position_strategy_settings: Dict[str, StrategySettings]
+    position_filled_fractions: Dict[str, float]
+    position_cursor_entry_times: Dict[str, pd.Timestamp]
     watchlist: Tuple[EngineWatchlistItem, ...]
 
 

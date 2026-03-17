@@ -7,7 +7,7 @@ import time
 import pandas as pd
 
 from alt_reversal_trader.binance_futures import PositionSnapshot
-from alt_reversal_trader.config import StrategySettings
+from alt_reversal_trader.config import DEFAULT_HISTORY_DAYS, StrategySettings
 from alt_reversal_trader.strategy import BacktestCursor, BacktestResult, StrategyMetrics, TradeRecord, run_backtest
 from alt_reversal_trader.trade_engine import (
     EngineSyncCommand,
@@ -47,6 +47,12 @@ def make_position(symbol: str = "TESTUSDT") -> PositionSnapshot:
         unrealized_pnl=1.0,
         leverage=3,
     )
+
+
+def test_trade_engine_defaults_history_days_to_shared_config_default() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+
+    assert engine.history_days == DEFAULT_HISTORY_DAYS
 
 
 def make_signal_backtest(
@@ -231,6 +237,38 @@ def make_stale_signal_backtest_after_exit() -> BacktestResult:
     )
 
 
+def make_stale_signal_backtest_after_latest_state_exit() -> BacktestResult:
+    backtest = make_signal_backtest(
+        side="short",
+        zone=2,
+        signal_time="2026-01-01 00:15:00",
+        latest_time="2026-01-01 00:30:00",
+        price=100.0,
+        position_qty=0.0,
+    )
+    indicators = pd.DataFrame(
+        {
+            "time": [pd.Timestamp("2026-01-01 00:30:00")],
+            "open": [101.0],
+            "high": [102.0],
+            "low": [100.0],
+            "close": [101.0],
+            "volume": [1000.0],
+            "zone2_line": [101.0],
+            "zone3_line": [102.0],
+            "trend_to_long": [True],
+            "trend_to_short": [False],
+            "final_bull": [True],
+            "final_bear": [False],
+        }
+    )
+    return replace(
+        backtest,
+        indicators=indicators,
+        latest_state={"trend_to_long": True, "final_bull": True},
+    )
+
+
 class FakeTickerClient:
     def __init__(self, price_by_symbol: dict[str, float]) -> None:
         self.price_by_symbol = dict(price_by_symbol)
@@ -266,11 +304,12 @@ def test_trade_engine_prefers_locked_strategy_for_open_positions() -> None:
 def test_trade_engine_sync_restores_locked_position_strategies() -> None:
     engine = _TradeEngine(mp.Queue(), mp.Queue())
     locked_settings = StrategySettings(atr_period=7)
+    engine._refresh_positions = lambda force=False: None
 
     engine._apply_sync(
         EngineSyncCommand(
-            api_key="",
-            api_secret="",
+            api_key="key",
+            api_secret="secret",
             leverage=3,
             fee_rate=0.0005,
             history_days=3,
@@ -281,12 +320,16 @@ def test_trade_engine_sync_restores_locked_position_strategies() -> None:
             auto_close_enabled_symbols=(),
             position_intervals={"TESTUSDT": "1m"},
             position_strategy_settings={"TESTUSDT": locked_settings},
+            position_filled_fractions={"TESTUSDT": 0.5},
+            position_cursor_entry_times={"TESTUSDT": pd.Timestamp("2026-01-01 00:10:00")},
             watchlist=(),
         )
     )
 
     assert engine.position_intervals["TESTUSDT"] == "1m"
     assert engine.position_strategy_by_symbol["TESTUSDT"] == locked_settings
+    assert engine.filled_fraction_by_symbol["TESTUSDT"] == 0.5
+    assert engine.auto_trade_cursor_entry_time["TESTUSDT"] == pd.Timestamp("2026-01-01 00:10:00")
 
 
 def test_trade_engine_keeps_locked_position_strategy_when_watchlist_updates() -> None:
@@ -699,6 +742,65 @@ def test_trade_engine_keeps_open_position_symbol_active_outside_watchlist() -> N
     assert submitted[0]["fraction"] > 0.0
 
 
+def test_trade_engine_uses_persisted_filled_fraction_after_restart_for_additional_entry() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine._refresh_positions = lambda force=False: None
+    backtest = make_signal_backtest(
+        side="long",
+        zone=3,
+        signal_time="2026-01-01 00:20:00",
+        latest_time="2026-01-01 00:25:00",
+        entry_time="2026-01-01 00:10:00",
+        price=100.0,
+    )
+    submitted: list[dict[str, object]] = []
+    engine._enqueue_open_order = lambda **kwargs: submitted.append(kwargs)
+
+    engine._apply_sync(
+        EngineSyncCommand(
+            api_key="key",
+            api_secret="secret",
+            leverage=2,
+            fee_rate=0.0005,
+            history_days=DEFAULT_HISTORY_DAYS,
+            default_interval="1m",
+            default_strategy_settings=StrategySettings(),
+            optimization_rank_mode="score",
+            auto_trade_enabled=True,
+            auto_close_enabled_symbols=(),
+            position_intervals={"TESTUSDT": "1m"},
+            position_strategy_settings={"TESTUSDT": StrategySettings()},
+            position_filled_fractions={"TESTUSDT": 0.5},
+            position_cursor_entry_times={"TESTUSDT": pd.Timestamp("2026-01-01 00:10:00")},
+            watchlist=(
+                EngineWatchlistItem(
+                    symbol="TESTUSDT",
+                    interval="1m",
+                    score=7.0,
+                    return_pct=12.0,
+                    strategy_settings=StrategySettings(),
+                ),
+            ),
+        )
+    )
+    engine.client = FakeTickerClient({"TESTUSDT": 80.0})
+    engine.open_positions["TESTUSDT"] = make_position("TESTUSDT")
+    engine.position_intervals["TESTUSDT"] = "1m"
+    engine.symbol_states[("TESTUSDT", "1m")] = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="1m",
+        strategy_settings=StrategySettings(),
+        backtest=backtest,
+        loaded_strategy_settings=StrategySettings(),
+    )
+
+    engine._evaluate_auto_trade()
+
+    assert len(submitted) == 1
+    assert submitted[0]["symbol"] == "TESTUSDT"
+    assert round(float(submitted[0]["fraction"]), 2) == 0.49
+
+
 def test_trade_engine_drops_symbol_after_successful_close_before_refresh() -> None:
     engine = _TradeEngine(mp.Queue(), mp.Queue())
     engine.open_positions["TESTUSDT"] = make_position()
@@ -832,6 +934,33 @@ def test_trade_engine_skips_stale_confirmed_signal_without_matching_trigger_bar(
         trigger_interval="1m",
         trigger_bar_time=pd.Timestamp("2026-01-01 00:16:00"),
     )
+
+    assert submitted == []
+
+
+def test_trade_engine_skips_favorable_reentry_after_latest_state_exit_signal() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.auto_trade_enabled = True
+    engine.client = FakeTickerClient({"TESTUSDT": 110.0})
+    backtest = make_stale_signal_backtest_after_latest_state_exit()
+    key = ("TESTUSDT", "1m")
+    engine.watchlist[key] = EngineWatchlistItem(
+        symbol="TESTUSDT",
+        interval="1m",
+        score=7.0,
+        return_pct=12.0,
+        strategy_settings=StrategySettings(),
+    )
+    engine.symbol_states[key] = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="1m",
+        strategy_settings=StrategySettings(),
+        backtest=backtest,
+    )
+    submitted: list[dict[str, object]] = []
+    engine._enqueue_open_order = lambda **kwargs: submitted.append(kwargs)
+
+    engine._evaluate_auto_trade()
 
     assert submitted == []
 
