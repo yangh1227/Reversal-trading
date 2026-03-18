@@ -1,6 +1,5 @@
 import {
     ColorType,
-    Coordinate,
     CrosshairMode,
     DeepPartial,
     HistogramStyleOptions,
@@ -16,7 +15,6 @@ import {
     Time,
     createChart
 } from "lightweight-charts";
-import { ShiftDragMeasure } from "../shift-drag-measure/shift-drag-measure";
 
 import { GlobalParams, globalParamInit } from "./global-params";
 import { Legend } from "./legend";
@@ -53,7 +51,6 @@ export class Handler {
     public spinner: HTMLDivElement | undefined;
 
     public _seriesList: ISeriesApi<SeriesType>[] = [];
-    private _shiftDragMeasure: ShiftDragMeasure = new ShiftDragMeasure();
 
     // TODO find a better solution rather than the 'position' parameter
     constructor(
@@ -94,48 +91,6 @@ export class Handler {
         })
         window.handlerInFocus = this.id;
         this.wrapper.addEventListener('mouseover', () => window.handlerInFocus = this.id)
-
-        // Shift+Drag 가격 측정 오버레이
-        this.series.attachPrimitive(this._shiftDragMeasure);
-
-        let _sdmDragging = false;
-        let _sdmScrollDisabled = false;  // handleScroll 복원 추적 (coordinateToPrice null여도 항상 복원)
-        let _sdmStartY: number | null = null;
-        let _sdmStartPrice: number | null = null;
-
-        this.div.addEventListener('mousedown', (e: MouseEvent) => {
-            if (e.shiftKey) {
-                this.chart.applyOptions({ handleScroll: false, handleScale: false });
-                _sdmScrollDisabled = true;
-                const rect = this.div.getBoundingClientRect();
-                const y = e.clientY - rect.top;
-                _sdmStartY = y;
-                _sdmStartPrice = this.series.coordinateToPrice(y as Coordinate);
-                _sdmDragging = true;
-                this._shiftDragMeasure.setPoints(y, y, _sdmStartPrice, _sdmStartPrice);
-            } else {
-                if (this._shiftDragMeasure.isActive()) {
-                    this._shiftDragMeasure.clear();
-                }
-            }
-        });
-
-        document.addEventListener('mousemove', (e: MouseEvent) => {
-            if (!_sdmDragging || _sdmStartY === null) return;
-            const rect = this.div.getBoundingClientRect();
-            const endY = e.clientY - rect.top;
-            const endPrice = this.series.coordinateToPrice(endY as Coordinate);
-            this._shiftDragMeasure.setPoints(_sdmStartY, endY, _sdmStartPrice, endPrice);
-        });
-
-        document.addEventListener('mouseup', () => {
-            // coordinateToPrice null 여부와 무관하게 항상 복원 (panning 영구 차단 버그 수정)
-            if (_sdmScrollDisabled) {
-                this.chart.applyOptions({ handleScroll: { vertTouchDrag: true }, handleScale: true });
-                _sdmScrollDisabled = false;
-            }
-            _sdmDragging = false;
-        });
 
         this.reSize()
         if (!autoSize) return
