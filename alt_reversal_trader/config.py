@@ -12,6 +12,7 @@ import pandas as pd
 APP_CONFIG_FILENAME = "alt_reversal_trader_config.json"
 APP_INTERVAL_OPTIONS = ("1m", "2m", "3m", "5m", "15m")
 OPTIMIZATION_RANK_MODE_OPTIONS = ("score", "return")
+AUTO_TRADE_FOCUS_SIGNAL_MODE_OPTIONS = ("preview", "confirmed")
 DEFAULT_HISTORY_DAYS = 3
 DEFAULT_OPTIMIZATION_PROFILE_SCALE = 20.0
 QIP_SENSITIVITY_OPTIONS = (
@@ -154,6 +155,7 @@ class AppSettings:
     auto_refresh_minutes: int = 30
     auto_trade_use_favorable_price: bool = True
     auto_trade_focus_on_signal: bool = True
+    auto_trade_focus_signal_mode: str = "preview"
     kline_interval: str = "1m"
     daily_volatility_min: float = 20.0
     quote_volume_min: float = 10_000_000.0
@@ -193,6 +195,8 @@ class AppSettings:
         self.auto_refresh_minutes = max(1, int(self.auto_refresh_minutes))
         self.auto_trade_use_favorable_price = bool(self.auto_trade_use_favorable_price)
         self.auto_trade_focus_on_signal = bool(self.auto_trade_focus_on_signal)
+        if self.auto_trade_focus_signal_mode not in AUTO_TRADE_FOCUS_SIGNAL_MODE_OPTIONS:
+            self.auto_trade_focus_signal_mode = AUTO_TRADE_FOCUS_SIGNAL_MODE_OPTIONS[0]
         if not self.optimize_flags:
             self.optimize_flags = DEFAULT_OPTIMIZE_FLAGS.copy()
         self.position_intervals = {
@@ -220,6 +224,7 @@ class AppSettings:
             "auto_refresh_minutes": self.auto_refresh_minutes,
             "auto_trade_use_favorable_price": self.auto_trade_use_favorable_price,
             "auto_trade_focus_on_signal": self.auto_trade_focus_on_signal,
+            "auto_trade_focus_signal_mode": self.auto_trade_focus_signal_mode,
             "kline_interval": self.kline_interval,
             "daily_volatility_min": self.daily_volatility_min,
             "quote_volume_min": self.quote_volume_min,

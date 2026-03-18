@@ -72,9 +72,11 @@ def test_engine_signal_event_auto_focuses_chart_when_favorable_price_toggle_is_o
     ) or ""
 
     assert "self.settings.auto_trade_focus_on_signal" in source_segment
-    assert "not self.settings.auto_trade_use_favorable_price" in source_segment
+    assert 'focus_mode == "confirmed"' in source_segment
     assert 'event.preview_entry_side' in source_segment
     assert 'event.preview_entry_zone' in source_segment
+    assert 'event.entry_side' in source_segment
+    assert 'event.entry_zone' in source_segment
     assert "next_signal != previous_signal" in source_segment
     assert "prefer_locked_position_settings=False" in source_segment
 
@@ -263,7 +265,8 @@ def test_collect_settings_preserves_auto_refresh_minutes_and_locked_positions() 
 
     assert "auto_refresh_minutes=int(self.auto_refresh_minutes_spin.value())" in source_segment
     assert "auto_trade_use_favorable_price=bool(self.auto_trade_favorable_check.isChecked())" in source_segment
-    assert "auto_trade_focus_on_signal=bool(self.auto_trade_focus_signal_check.isChecked())" in source_segment
+    assert "auto_trade_focus_on_signal=bool(" in source_segment
+    assert "auto_trade_focus_signal_mode=self._auto_trade_focus_signal_mode()" in source_segment
     assert "position_strategy_settings=dict(self.settings.position_strategy_settings)" in source_segment
     assert "position_filled_fractions=dict(self.settings.position_filled_fractions)" in source_segment
     assert "position_cursor_entry_times=dict(self.settings.position_cursor_entry_times)" in source_segment
@@ -473,6 +476,20 @@ def test_backtest_summary_moves_to_button_dialog_and_frees_chart_space() -> None
     assert "self.backtest_summary_window.hide()" in show_source
     assert 'QWidget(None, windowTitle="백테스트 서머리")' in show_source
     assert 'QMessageBox.information(self, "백테스트 서머리", "표시할 백테스트 서머리가 없습니다.")' in show_source
+
+
+def test_chart_focus_settings_button_sits_above_chart_and_uses_popup_controls() -> None:
+    source = APP_PATH.read_text(encoding="utf-8")
+    build_ui_source = ast.get_source_segment(source, _window_method_node("_build_ui")) or ""
+    ensure_source = ast.get_source_segment(source, _window_method_node("_ensure_auto_trade_focus_settings_window")) or ""
+
+    assert 'self.auto_trade_focus_settings_button = QPushButton("차트전환 설정")' in build_ui_source
+    assert "self.auto_trade_focus_settings_button.clicked.connect(self.show_auto_trade_focus_settings)" in build_ui_source
+    assert "right_layout.addLayout(chart_header_row)" in build_ui_source
+    assert "self.auto_trade_focus_signal_check" not in build_ui_source
+    assert 'window = QWidget(None, windowTitle="차트전환 설정")' in ensure_source
+    assert 'mode_combo.addItem("예상진입신호", "preview")' in ensure_source
+    assert 'mode_combo.addItem("진입신호 확정", "confirmed")' in ensure_source
 
 
 def test_status_strip_uses_uniform_spacing_and_label_heights() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import errno
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,8 @@ _FALLBACK_LOCK = threading.Lock()
 _FALLBACK_NEXT_AT: Dict[str, float] = {}
 _PROCESS_PATH_LOCKS: Dict[str, threading.Lock] = {}
 _PROCESS_PATH_LOCKS_GUARD = threading.Lock()
+_WINDOWS_LOCK_RETRY_SECONDS = 2.0
+_WINDOWS_LOCK_RETRY_SLEEP_SECONDS = 0.05
 
 
 def _runtime_dir() -> Path:
@@ -66,7 +69,17 @@ def _locked_state_file(path: Path) -> Iterator[Optional[object]]:
             import msvcrt
 
             handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            deadline = time.monotonic() + _WINDOWS_LOCK_RETRY_SECONDS
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError as exc:
+                    if exc.errno not in {errno.EDEADLK, errno.EACCES, errno.EDEADLOCK}:
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(_WINDOWS_LOCK_RETRY_SLEEP_SECONDS)
             try:
                 yield handle
             finally:

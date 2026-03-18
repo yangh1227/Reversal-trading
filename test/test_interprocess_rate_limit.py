@@ -1,8 +1,12 @@
 import multiprocessing as mp
 from pathlib import Path
+import sys
 import threading
 import time
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from alt_reversal_trader import interprocess_rate_limit
 from alt_reversal_trader.interprocess_rate_limit import reset_request_gate_for_tests, wait_for_request_slot
 
 
@@ -74,3 +78,24 @@ def test_wait_for_request_slot_serializes_within_process_threads(tmp_path) -> No
     assert len(finished_times) == 2
     finished_times.sort()
     assert finished_times[1] - finished_times[0] >= 0.15
+
+
+def test_locked_state_file_retries_windows_deadlock_error(tmp_path) -> None:
+    state_path = tmp_path / "shared_gate.json"
+    calls: list[int] = []
+
+    def fake_locking(_fd: int, mode: int, _size: int) -> None:
+        calls.append(mode)
+        if len(calls) == 1:
+            raise OSError(36, "Resource deadlock avoided")
+
+    fake_msvcrt = SimpleNamespace(LK_LOCK=1, LK_UNLCK=2, locking=fake_locking)
+    with patch.object(interprocess_rate_limit, "os", interprocess_rate_limit.os), patch.dict(sys.modules, {"msvcrt": fake_msvcrt}):
+        with patch.object(interprocess_rate_limit.os, "name", "nt"), patch.object(
+            interprocess_rate_limit, "_WINDOWS_LOCK_RETRY_SECONDS", 0.2
+        ), patch.object(interprocess_rate_limit, "_WINDOWS_LOCK_RETRY_SLEEP_SECONDS", 0.0):
+            with interprocess_rate_limit._locked_state_file(state_path) as handle:
+                assert handle is not None
+
+    assert calls.count(fake_msvcrt.LK_LOCK) >= 2
+    assert calls[-1] == fake_msvcrt.LK_UNLCK

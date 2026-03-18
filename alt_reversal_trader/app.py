@@ -1599,7 +1599,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_trade_cursor_entry_time_by_symbol: Dict[str, pd.Timestamp] = dict(
             self.settings.position_cursor_entry_times
         )
-        self.last_engine_entry_signal_by_key: Dict[Tuple[str, str], Tuple[str, int]] = {}
+        self.last_engine_entry_signal_by_key: Dict[Tuple[str, str, str], Tuple[str, int]] = {}
         self.order_worker_symbol: Optional[str] = None
         self.order_worker_is_auto_close = False
         self.order_worker_is_auto_trade = False
@@ -1622,6 +1622,9 @@ class AltReversalTraderWindow(QMainWindow):
         self.parameter_editors: Dict[str, object] = {}
         self.parameter_opt_boxes: Dict[str, QCheckBox] = {}
         self.parameter_opt_hint_labels: Dict[str, QLabel] = {}
+        self.auto_trade_focus_settings_window: Optional[QWidget] = None
+        self.auto_trade_focus_enable_check: Optional[QCheckBox] = None
+        self.auto_trade_focus_mode_combo: Optional[QComboBox] = None
         self.chart_transition_overlay: Optional[QWidget] = None
         self.chart_transition_effect: Optional[QGraphicsOpacityEffect] = None
         self.chart_transition_animation: Optional[QPropertyAnimation] = None
@@ -1777,10 +1780,17 @@ class AltReversalTraderWindow(QMainWindow):
         balance_layout.addWidget(self.optimization_chart_notice_label)
         balance_layout.addStretch(1)
         self._set_balance_label_status("API 미입력")
+        chart_header_row = QHBoxLayout()
+        chart_header_row.setContentsMargins(0, 0, 0, 0)
+        chart_header_row.addStretch(1)
+        self.auto_trade_focus_settings_button = QPushButton("차트전환 설정")
+        self.auto_trade_focus_settings_button.clicked.connect(self.show_auto_trade_focus_settings)
+        chart_header_row.addWidget(self.auto_trade_focus_settings_button)
         self.chart_host = QWidget()
         self.chart_host_layout = QVBoxLayout(self.chart_host)
         self.chart_host_layout.setContentsMargins(0, 0, 0, 0)
         self._init_chart_transition_overlay()
+        right_layout.addLayout(chart_header_row)
         right_layout.addWidget(self.chart_host, 8)
         right_layout.addWidget(balance_panel)
 
@@ -2051,7 +2061,6 @@ class AltReversalTraderWindow(QMainWindow):
         self.opt_process_spin.setRange(1, 16)
         self.optimize_timeframe_check = QCheckBox("1m / 2m 최적화")
         self.auto_trade_favorable_check = QCheckBox("유리한 가격 진입 허용")
-        self.auto_trade_focus_signal_check = QCheckBox("신호 발생 시 차트 전환")
         self.fee_spin = QDoubleSpinBox()
         self.fee_spin.setRange(0.0, 5.0)
         self.fee_spin.setDecimals(4)
@@ -2067,7 +2076,6 @@ class AltReversalTraderWindow(QMainWindow):
                 field_label.setText(label)
         self.optimize_timeframe_check.setText("1m / 2m 최적화")
         self.auto_trade_favorable_check.setChecked(bool(self.settings.auto_trade_use_favorable_price))
-        self.auto_trade_focus_signal_check.setChecked(bool(self.settings.auto_trade_focus_on_signal))
         layout.addRow("범위 ±%", self.opt_span_spin)
         layout.addRow("격자 단계수", self.opt_steps_spin)
         layout.addRow("정렬 기준", self.opt_rank_mode_combo)
@@ -2077,7 +2085,6 @@ class AltReversalTraderWindow(QMainWindow):
         layout.addRow("최적화 프로세스", self.opt_process_spin)
         layout.addRow("타임프레임", self.optimize_timeframe_check)
         layout.addRow("자동매매 유리한 가격", self.auto_trade_favorable_check)
-        layout.addRow("자동매매 차트 전환", self.auto_trade_focus_signal_check)
         layout.addRow("수수료 %", self.fee_spin)
         _set_row_label(self.opt_span_spin, "범위 스케일 (20=기본)")
         _set_row_label(self.opt_steps_spin, "항목별 샘플 상한")
@@ -2087,7 +2094,6 @@ class AltReversalTraderWindow(QMainWindow):
         _set_row_label(self.opt_process_spin, "최적화 프로세스")
         _set_row_label(self.optimize_timeframe_check, "타임프레임")
         _set_row_label(self.auto_trade_favorable_check, "자동매매 유리한 가격")
-        _set_row_label(self.auto_trade_focus_signal_check, "자동매매 차트 전환")
         _set_row_label(self.fee_spin, "수수료 %")
         self._refresh_optimization_rank_controls()
         return group
@@ -2693,7 +2699,12 @@ class AltReversalTraderWindow(QMainWindow):
         self.opt_process_spin.setValue(settings.optimize_processes)
         self.optimize_timeframe_check.setChecked(settings.optimize_timeframe)
         self.auto_trade_favorable_check.setChecked(bool(settings.auto_trade_use_favorable_price))
-        self.auto_trade_focus_signal_check.setChecked(bool(settings.auto_trade_focus_on_signal))
+        if self.auto_trade_focus_enable_check is not None:
+            self.auto_trade_focus_enable_check.setChecked(bool(settings.auto_trade_focus_on_signal))
+        if self.auto_trade_focus_mode_combo is not None:
+            mode_index = self.auto_trade_focus_mode_combo.findData(settings.auto_trade_focus_signal_mode)
+            if mode_index >= 0:
+                self.auto_trade_focus_mode_combo.setCurrentIndex(mode_index)
         self.fee_spin.setValue(settings.fee_rate * 100.0)
         self.simple_order_amount_spin.setValue(settings.simple_order_amount)
         if settings.order_mode == "simple":
@@ -2729,7 +2740,10 @@ class AltReversalTraderWindow(QMainWindow):
             history_days=int(self.history_days_spin.value()),
             auto_refresh_minutes=int(self.auto_refresh_minutes_spin.value()),
             auto_trade_use_favorable_price=bool(self.auto_trade_favorable_check.isChecked()),
-            auto_trade_focus_on_signal=bool(self.auto_trade_focus_signal_check.isChecked()),
+            auto_trade_focus_on_signal=bool(
+                self.auto_trade_focus_enable_check.isChecked() if self.auto_trade_focus_enable_check is not None else self.settings.auto_trade_focus_on_signal
+            ),
+            auto_trade_focus_signal_mode=self._auto_trade_focus_signal_mode(),
             kline_interval=self.interval_combo.currentText(),
             daily_volatility_min=float(self.daily_vol_spin.value()),
             quote_volume_min=float(self.quote_volume_spin.value()),
@@ -2953,14 +2967,16 @@ class AltReversalTraderWindow(QMainWindow):
             self._set_order_buttons_enabled(False)
             return
         if isinstance(event, EngineSignalEvent):
-            signal_key = (event.symbol, event.interval)
-            next_signal = (str(event.preview_entry_side or ""), int(event.preview_entry_zone or 0))
+            focus_mode = str(self.settings.auto_trade_focus_signal_mode)
+            signal_key = (event.symbol, event.interval, focus_mode)
+            if focus_mode == "confirmed":
+                next_signal = (str(event.entry_side or ""), int(event.entry_zone or 0))
+            else:
+                next_signal = (str(event.preview_entry_side or ""), int(event.preview_entry_zone or 0))
             previous_signal = self.last_engine_entry_signal_by_key.get(signal_key, ("", 0))
             self.last_engine_entry_signal_by_key[signal_key] = next_signal
             if (
                 self.settings.auto_trade_focus_on_signal
-                and
-                not self.settings.auto_trade_use_favorable_price
                 and next_signal[0]
                 and next_signal[1] > 0
                 and next_signal != previous_signal
@@ -6465,6 +6481,47 @@ class AltReversalTraderWindow(QMainWindow):
         self.backtest_summary_window.show()
         self.backtest_summary_window.raise_()
         self.backtest_summary_window.activateWindow()
+
+    def _auto_trade_focus_signal_mode(self) -> str:
+        if self.auto_trade_focus_mode_combo is None:
+            return str(self.settings.auto_trade_focus_signal_mode)
+        return str(self.auto_trade_focus_mode_combo.currentData() or self.settings.auto_trade_focus_signal_mode)
+
+    def _ensure_auto_trade_focus_settings_window(self) -> None:
+        if self.auto_trade_focus_settings_window is not None:
+            return
+        window = QWidget(None, windowTitle="차트전환 설정")
+        window.resize(320, 120)
+        layout = QFormLayout(window)
+        enable_check = QCheckBox("자동매매 신호 시 차트 전환")
+        enable_check.setChecked(bool(self.settings.auto_trade_focus_on_signal))
+        mode_combo = QComboBox()
+        mode_combo.addItem("예상진입신호", "preview")
+        mode_combo.addItem("진입신호 확정", "confirmed")
+        mode_index = mode_combo.findData(self.settings.auto_trade_focus_signal_mode)
+        if mode_index >= 0:
+            mode_combo.setCurrentIndex(mode_index)
+        layout.addRow("사용", enable_check)
+        layout.addRow("기준", mode_combo)
+        self.auto_trade_focus_settings_window = window
+        self.auto_trade_focus_enable_check = enable_check
+        self.auto_trade_focus_mode_combo = mode_combo
+
+    def show_auto_trade_focus_settings(self) -> None:
+        self._ensure_auto_trade_focus_settings_window()
+        assert self.auto_trade_focus_settings_window is not None
+        if self.auto_trade_focus_settings_window.isVisible():
+            self.auto_trade_focus_settings_window.hide()
+            return
+        assert self.auto_trade_focus_enable_check is not None
+        assert self.auto_trade_focus_mode_combo is not None
+        self.auto_trade_focus_enable_check.setChecked(bool(self.settings.auto_trade_focus_on_signal))
+        mode_index = self.auto_trade_focus_mode_combo.findData(self.settings.auto_trade_focus_signal_mode)
+        if mode_index >= 0:
+            self.auto_trade_focus_mode_combo.setCurrentIndex(mode_index)
+        self.auto_trade_focus_settings_window.show()
+        self.auto_trade_focus_settings_window.raise_()
+        self.auto_trade_focus_settings_window.activateWindow()
 
     def _set_balance_label_status(self, status: str) -> None:
         self.balance_status_label.setText(status)
