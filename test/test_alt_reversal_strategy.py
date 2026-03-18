@@ -324,7 +324,7 @@ def test_parameter_grid_uses_profiled_ranges() -> None:
     )
     assert trimmed is False
     assert sorted({settings.atr_period for settings in grid}) == [6, 8, 10, 12, 14]
-    assert sorted({settings.factor for settings in grid}) == [15.8, 16.4, 17.0, 17.6, 18.2]
+    assert sorted({settings.factor for settings in grid}) == [15.0, 16.0, 17.0, 18.0, 19.0]
 
 
 def test_signal_fraction_targets_use_total_position_sizes() -> None:
