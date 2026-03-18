@@ -14,18 +14,13 @@ export class ShiftDragMeasurePaneView implements ISeriesPrimitivePaneView {
     }
 
     update(): void {
+        // Y 좌표 직접 사용 (priceToCoordinate 변환 없음 — null 반환 문제 완전 제거)
+        this._startY = this._source.startY;
+        this._endY = this._source.endY;
+
         const start = this._source.startPrice;
         const end = this._source.endPrice;
-        if (start === null || end === null) {
-            this._startY = null;
-            this._endY = null;
-            this._pct = null;
-            return;
-        }
-        const series = this._source.series;
-        this._startY = series.priceToCoordinate(start) ?? null;
-        this._endY = series.priceToCoordinate(end) ?? null;
-        if (start !== 0) {
+        if (start !== null && end !== null && start !== 0) {
             this._pct = (end - start) / Math.abs(start) * 100;
         } else {
             this._pct = null;

@@ -4,6 +4,10 @@ import { PluginBase } from "../plugin-base";
 import { ShiftDragMeasurePaneView } from "./pane-view";
 
 export class ShiftDragMeasure extends PluginBase {
+    // Y 픽셀 좌표 직접 저장 (priceToCoordinate 변환 체인 제거)
+    public startY: number | null = null;
+    public endY: number | null = null;
+    // 퍼센트 계산용 가격 (null이면 % 표시 생략)
     public startPrice: number | null = null;
     public endPrice: number | null = null;
 
@@ -18,19 +22,23 @@ export class ShiftDragMeasure extends PluginBase {
         return this._paneViews;
     }
 
-    setPrices(start: number, end: number): void {
-        this.startPrice = start;
-        this.endPrice = end;
+    setPoints(startY: number, endY: number, startPrice: number | null, endPrice: number | null): void {
+        this.startY = startY;
+        this.endY = endY;
+        this.startPrice = startPrice;
+        this.endPrice = endPrice;
         this.requestUpdate();
     }
 
     clear(): void {
+        this.startY = null;
+        this.endY = null;
         this.startPrice = null;
         this.endPrice = null;
         this.requestUpdate();
     }
 
     isActive(): boolean {
-        return this.startPrice !== null;
+        return this.startY !== null;
     }
 }
