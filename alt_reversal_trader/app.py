@@ -5464,7 +5464,7 @@ class AltReversalTraderWindow(QMainWindow):
             return
         price_map = self._optimized_table_price_map(log_failures=False)
         favorable_row_brush = QColor(OPTIMIZED_TABLE_FAVORABLE_ROW_COLOR)
-        default_row_brush = QColor()
+        default_row_brush = self.optimized_table.palette().base().color()
         for row, result in enumerate(ordered):
             favorable_entry = self._optimized_result_has_favorable_entry(
                 result,

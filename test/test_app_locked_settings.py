@@ -287,6 +287,16 @@ def test_window_init_starts_optimized_table_highlight_timer() -> None:
     assert "self.optimized_table_highlight_timer.start()" in source_segment
 
 
+def test_optimized_table_highlight_refresh_restores_palette_base_for_non_favorable_rows() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_refresh_optimized_table_highlights"),
+    ) or ""
+
+    assert "self.optimized_table.palette().base().color()" in source_segment
+    assert "QColor()" not in source_segment
+
+
 def test_kline_stream_worker_uses_shared_two_minute_transform_helper() -> None:
     module = _load_app_module_ast()
     source = APP_PATH.read_text(encoding="utf-8")
