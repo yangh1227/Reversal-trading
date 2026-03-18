@@ -540,6 +540,7 @@ class BinanceFuturesClient:
         rsi_upper: float,
         use_atr_4h_filter: bool,
         atr_4h_min_pct: float,
+        use_surge_filter: bool = False,
         workers: int = 8,
         log_callback: Optional[Callable[[str], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
@@ -564,6 +565,32 @@ class BinanceFuturesClient:
             if should_stop and should_stop():
                 return None
             ticker = ticker_map[symbol]
+
+            if use_surge_filter:
+                # 급등종목 모드: 24h 등락률 >= +15%, 30m RSI >= 65
+                price_change = float(ticker.get("priceChangePercent", 0.0) or 0.0)
+                if price_change < 15.0:
+                    return None
+                rsi_30m_limit = min(max(14 * 3, 60), 99)
+                rsi_30m_df = _rows_to_ohlcv_frame(self.klines(symbol, "30m", limit=rsi_30m_limit, ttl_seconds=0.0))
+                if len(rsi_30m_df) < max(14 + 5, 30):
+                    return None
+                rsi_30m_value = _rsi_with_pandas_ta(rsi_30m_df["close"], 14)
+                if not np.isfinite(rsi_30m_value) or rsi_30m_value < 65.0:
+                    return None
+                if should_stop and should_stop():
+                    return None
+                return CandidateSymbol(
+                    symbol=symbol,
+                    last_price=float(ticker.get("lastPrice", 0.0) or 0.0),
+                    price_change_pct=price_change,
+                    quote_volume=float(ticker.get("quoteVolume", 0.0) or 0.0),
+                    daily_volatility_pct=0.0,
+                    rsi_1m=float(rsi_30m_value),
+                    atr_4h_pct=float("nan"),
+                )
+
+            # 변동성 모드 (기존 로직)
             daily_df = _rows_to_ohlcv_frame(self.klines(symbol, "1d", limit=3, ttl_seconds=0.0))
             daily_vol = _daily_volatility_from_klines(daily_df)
             if not np.isfinite(daily_vol) or daily_vol < daily_volatility_min:
@@ -624,18 +651,25 @@ class BinanceFuturesClient:
             ),
             reverse=True,
         )
-        active_filters = [
-            f"24h 거래량 {quote_volume_min:,.0f}+",
-            f"일변동성 {daily_volatility_min:.2f}%+",
-        ]
-        if use_rsi_filter:
-            active_filters.append(f"1m RSI <= {rsi_lower:.2f} or >= {rsi_upper:.2f}")
+        if use_surge_filter:
+            active_filters = [
+                f"24h 거래량 {quote_volume_min:,.0f}+",
+                "24h 등락률 +15%+",
+                "30m RSI >= 65",
+            ]
         else:
-            active_filters.append("1m RSI OFF")
-        if use_atr_4h_filter:
-            active_filters.append(f"4h ATR% >= {atr_4h_min_pct:.2f}")
-        else:
-            active_filters.append("4h ATR% OFF")
+            active_filters = [
+                f"24h 거래량 {quote_volume_min:,.0f}+",
+                f"일변동성 {daily_volatility_min:.2f}%+",
+            ]
+            if use_rsi_filter:
+                active_filters.append(f"1m RSI <= {rsi_lower:.2f} or >= {rsi_upper:.2f}")
+            else:
+                active_filters.append("1m RSI OFF")
+            if use_atr_4h_filter:
+                active_filters.append(f"4h ATR% >= {atr_4h_min_pct:.2f}")
+            else:
+                active_filters.append("4h ATR% OFF")
         log(
             f"후보 필터 완료 {len(candidates)}개: " + " / ".join(active_filters)
         )

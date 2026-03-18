@@ -14,6 +14,7 @@ APP_INTERVAL_OPTIONS = ("1m", "2m", "3m", "5m", "15m")
 OPTIMIZATION_RANK_MODE_OPTIONS = ("score", "return")
 AUTO_TRADE_FOCUS_SIGNAL_MODE_OPTIONS = ("preview", "confirmed")
 DEFAULT_HISTORY_DAYS = 3
+DEFAULT_CHART_DISPLAY_HOURS = 24
 DEFAULT_OPTIMIZATION_PROFILE_SCALE = 20.0
 QIP_SENSITIVITY_OPTIONS = (
     "1-Ultra Fine Max",
@@ -152,12 +153,13 @@ class AppSettings:
     simple_order_amount: float = 50.0
     fee_rate: float = 0.0005
     history_days: int = DEFAULT_HISTORY_DAYS
-    chart_display_days: int = DEFAULT_HISTORY_DAYS
+    chart_display_hours: int = DEFAULT_CHART_DISPLAY_HOURS
     auto_refresh_minutes: int = 30
     auto_trade_use_favorable_price: bool = True
     auto_trade_focus_on_signal: bool = True
     auto_trade_focus_signal_mode: str = "preview"
     kline_interval: str = "1m"
+    filter_preset: str = "변동성"
     daily_volatility_min: float = 20.0
     quote_volume_min: float = 10_000_000.0
     use_rsi_filter: bool = False
@@ -187,7 +189,7 @@ class AppSettings:
             self.order_mode = "compound"
         self.simple_order_amount = max(1.0, float(self.simple_order_amount))
         self.atr_4h_min_pct = max(0.0, float(self.atr_4h_min_pct))
-        self.chart_display_days = max(1, int(self.chart_display_days))
+        self.chart_display_hours = max(1, int(self.chart_display_hours))
         if self.optimization_rank_mode not in OPTIMIZATION_RANK_MODE_OPTIONS:
             self.optimization_rank_mode = OPTIMIZATION_RANK_MODE_OPTIONS[0]
         self.optimization_min_score = max(0.0, float(self.optimization_min_score))
@@ -223,12 +225,13 @@ class AppSettings:
             "simple_order_amount": self.simple_order_amount,
             "fee_rate": self.fee_rate,
             "history_days": self.history_days,
-            "chart_display_days": self.chart_display_days,
+            "chart_display_hours": self.chart_display_hours,
             "auto_refresh_minutes": self.auto_refresh_minutes,
             "auto_trade_use_favorable_price": self.auto_trade_use_favorable_price,
             "auto_trade_focus_on_signal": self.auto_trade_focus_on_signal,
             "auto_trade_focus_signal_mode": self.auto_trade_focus_signal_mode,
             "kline_interval": self.kline_interval,
+            "filter_preset": self.filter_preset,
             "daily_volatility_min": self.daily_volatility_min,
             "quote_volume_min": self.quote_volume_min,
             "use_rsi_filter": self.use_rsi_filter,
@@ -270,12 +273,21 @@ class AppSettings:
         position_filled_fractions = payload.pop("position_filled_fractions", {}) or {}
         position_cursor_entry_times = payload.pop("position_cursor_entry_times", {}) or {}
         simple_order_amount = payload.pop("simple_order_amount", None)
+        chart_display_hours = payload.pop("chart_display_hours", None)
+        legacy_chart_display_days = payload.pop("chart_display_days", None)
         legacy_simple_long = payload.pop("simple_long_order_amount", None)
         legacy_simple_short = payload.pop("simple_short_order_amount", None)
         if simple_order_amount is None:
             simple_order_amount = legacy_simple_long if legacy_simple_long is not None else legacy_simple_short
         if simple_order_amount is not None:
             payload["simple_order_amount"] = simple_order_amount
+        if chart_display_hours is None and legacy_chart_display_days is not None:
+            try:
+                chart_display_hours = max(1, int(legacy_chart_display_days)) * 24
+            except Exception:
+                chart_display_hours = DEFAULT_CHART_DISPLAY_HOURS
+        if chart_display_hours is not None:
+            payload["chart_display_hours"] = chart_display_hours
         strategy = StrategySettings(
             **{k: v for k, v in strategy_payload.items() if k in StrategySettings.__dataclass_fields__}
         )
