@@ -3,6 +3,5 @@ PyQtWebEngine
 pandas
 pandas_ta
 numpy
-plotly
 requests
 websocket-client

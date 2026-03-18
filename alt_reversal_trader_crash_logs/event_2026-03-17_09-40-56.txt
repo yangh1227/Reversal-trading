@@ -1,0 +1,13 @@
+[Qt Message]
+time: 2026-03-17T09:40:56.072683
+python: 3.12.10 (tags/v3.12.10:0cc8128, Apr  8 2025, 12:21:36) [MSC v.1943 64 bit (AMD64)]
+platform: Windows-10-10.0.19045-SP0
+pid: 23140
+thread: MainThread
+cwd: C:\Users\Dystopia\Desktop\lightweight-charts-python-main
+mode: 2
+file: file:///C:/Users/Dystopia/Desktop/lightweight-charts-python-main/lightweight_charts/js/index.html
+line: 188
+function: None
+
+Uncaught TypeError: window.dqyeiihh.chart.timeScale(...).subscribeVisibleLogicalRangeChange(...) is not a function
