@@ -1,5 +1,6 @@
 import {
     ColorType,
+    Coordinate,
     CrosshairMode,
     DeepPartial,
     HistogramStyleOptions,
@@ -15,6 +16,7 @@ import {
     Time,
     createChart
 } from "lightweight-charts";
+import { ShiftDragMeasure } from "../shift-drag-measure/shift-drag-measure";
 
 import { GlobalParams, globalParamInit } from "./global-params";
 import { Legend } from "./legend";
@@ -51,6 +53,7 @@ export class Handler {
     public spinner: HTMLDivElement | undefined;
 
     public _seriesList: ISeriesApi<SeriesType>[] = [];
+    private _shiftDragMeasure: ShiftDragMeasure = new ShiftDragMeasure();
 
     // TODO find a better solution rather than the 'position' parameter
     constructor(
@@ -91,6 +94,48 @@ export class Handler {
         })
         window.handlerInFocus = this.id;
         this.wrapper.addEventListener('mouseover', () => window.handlerInFocus = this.id)
+
+        // Shift+Drag 가격 측정 오버레이
+        this.series.attachPrimitive(this._shiftDragMeasure);
+
+        let _sdmDragging = false;
+        let _sdmStartPrice: number | null = null;
+
+        this.div.addEventListener('mousedown', (e: MouseEvent) => {
+            if (e.shiftKey) {
+                const rect = this.div.getBoundingClientRect();
+                const y = (e.clientY - rect.top) as Coordinate;
+                const price = this.series.coordinateToPrice(y);
+                if (price !== null) {
+                    _sdmStartPrice = price;
+                    _sdmDragging = true;
+                    this._shiftDragMeasure.setPrices(price, price);
+                }
+                e.preventDefault();  // 차트 드래그 스크롤 방지 (stopPropagation 제거 — chart 이벤트 차단 방지)
+            } else {
+                if (this._shiftDragMeasure.isActive()) {
+                    this._shiftDragMeasure.clear();
+                }
+            }
+        });
+
+        // document 리스너는 드래그가 div 밖으로 나가도 추적하기 위해 필요.
+        // 다중 Handler 인스턴스에서의 누적을 막기 위해 _sdmDragging 가드로 처리.
+        const _sdmMouseMove = (e: MouseEvent) => {
+            if (!_sdmDragging || _sdmStartPrice === null) return;
+            const rect = this.div.getBoundingClientRect();
+            const y = (e.clientY - rect.top) as Coordinate;
+            const price = this.series.coordinateToPrice(y);
+            if (price !== null) {
+                this._shiftDragMeasure.setPrices(_sdmStartPrice, price);
+            }
+        };
+        const _sdmMouseUp = () => {
+            _sdmDragging = false;
+            // 마우스 업 시 사각형 유지 (clear 하지 않음)
+        };
+        document.addEventListener('mousemove', _sdmMouseMove);
+        document.addEventListener('mouseup', _sdmMouseUp);
 
         this.reSize()
         if (!autoSize) return
