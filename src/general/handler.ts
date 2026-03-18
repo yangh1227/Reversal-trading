@@ -101,18 +101,9 @@ export class Handler {
         let _sdmDragging = false;
         let _sdmStartPrice: number | null = null;
 
-        // 차트 공식 API로 가격 추적: document.mousemove 대신 사용 (chart 프레임레이트에 맞춰 throttle됨)
-        this.chart.subscribeCrosshairMove((param: MouseEventParams) => {
-            if (!_sdmDragging || _sdmStartPrice === null || !param.point) return;
-            const price = this.series.coordinateToPrice(param.point.y);
-            if (price !== null) {
-                this._shiftDragMeasure.setPrices(_sdmStartPrice, price);
-            }
-        });
-
         this.div.addEventListener('mousedown', (e: MouseEvent) => {
             if (e.shiftKey) {
-                // 차트 scroll/scale 비활성화 — pan과의 충돌 방지 (렉 + 사각형 미표시 원인)
+                // pan과의 이중 렌더 충돌 방지: 드래그 측정 중 차트 스크롤 비활성화
                 this.chart.applyOptions({ handleScroll: false, handleScale: false });
                 const rect = this.div.getBoundingClientRect();
                 const y = (e.clientY - rect.top) as Coordinate;
@@ -129,9 +120,18 @@ export class Handler {
             }
         });
 
+        document.addEventListener('mousemove', (e: MouseEvent) => {
+            if (!_sdmDragging || _sdmStartPrice === null) return;
+            const rect = this.div.getBoundingClientRect();
+            const y = (e.clientY - rect.top) as Coordinate;
+            const price = this.series.coordinateToPrice(y);
+            if (price !== null) {
+                this._shiftDragMeasure.setPrices(_sdmStartPrice, price);
+            }
+        });
+
         document.addEventListener('mouseup', () => {
             if (_sdmDragging) {
-                // 드래그 종료 시 차트 scroll/scale 복원
                 this.chart.applyOptions({ handleScroll: { vertTouchDrag: true }, handleScale: true });
             }
             _sdmDragging = false;
