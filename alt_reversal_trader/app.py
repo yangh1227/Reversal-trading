@@ -1599,6 +1599,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_trade_cursor_entry_time_by_symbol: Dict[str, pd.Timestamp] = dict(
             self.settings.position_cursor_entry_times
         )
+        self.last_engine_entry_signal_by_key: Dict[Tuple[str, str], Tuple[str, int]] = {}
         self.order_worker_symbol: Optional[str] = None
         self.order_worker_is_auto_close = False
         self.order_worker_is_auto_trade = False
@@ -2049,6 +2050,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.opt_process_spin = QSpinBox()
         self.opt_process_spin.setRange(1, 16)
         self.optimize_timeframe_check = QCheckBox("1m / 2m 최적화")
+        self.auto_trade_favorable_check = QCheckBox("유리한 가격 진입 허용")
+        self.auto_trade_focus_signal_check = QCheckBox("신호 발생 시 차트 전환")
         self.fee_spin = QDoubleSpinBox()
         self.fee_spin.setRange(0.0, 5.0)
         self.fee_spin.setDecimals(4)
@@ -2063,6 +2066,8 @@ class AltReversalTraderWindow(QMainWindow):
             if field_label is not None:
                 field_label.setText(label)
         self.optimize_timeframe_check.setText("1m / 2m 최적화")
+        self.auto_trade_favorable_check.setChecked(bool(self.settings.auto_trade_use_favorable_price))
+        self.auto_trade_focus_signal_check.setChecked(bool(self.settings.auto_trade_focus_on_signal))
         layout.addRow("범위 ±%", self.opt_span_spin)
         layout.addRow("격자 단계수", self.opt_steps_spin)
         layout.addRow("정렬 기준", self.opt_rank_mode_combo)
@@ -2071,6 +2076,8 @@ class AltReversalTraderWindow(QMainWindow):
         layout.addRow("최대 조합수", self.max_combo_spin)
         layout.addRow("최적화 프로세스", self.opt_process_spin)
         layout.addRow("타임프레임", self.optimize_timeframe_check)
+        layout.addRow("자동매매 유리한 가격", self.auto_trade_favorable_check)
+        layout.addRow("자동매매 차트 전환", self.auto_trade_focus_signal_check)
         layout.addRow("수수료 %", self.fee_spin)
         _set_row_label(self.opt_span_spin, "범위 스케일 (20=기본)")
         _set_row_label(self.opt_steps_spin, "항목별 샘플 상한")
@@ -2079,6 +2086,8 @@ class AltReversalTraderWindow(QMainWindow):
         _set_row_label(self.max_combo_spin, "최대 조합수")
         _set_row_label(self.opt_process_spin, "최적화 프로세스")
         _set_row_label(self.optimize_timeframe_check, "타임프레임")
+        _set_row_label(self.auto_trade_favorable_check, "자동매매 유리한 가격")
+        _set_row_label(self.auto_trade_focus_signal_check, "자동매매 차트 전환")
         _set_row_label(self.fee_spin, "수수료 %")
         self._refresh_optimization_rank_controls()
         return group
@@ -2683,6 +2692,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.max_combo_spin.setValue(settings.max_grid_combinations)
         self.opt_process_spin.setValue(settings.optimize_processes)
         self.optimize_timeframe_check.setChecked(settings.optimize_timeframe)
+        self.auto_trade_favorable_check.setChecked(bool(settings.auto_trade_use_favorable_price))
+        self.auto_trade_focus_signal_check.setChecked(bool(settings.auto_trade_focus_on_signal))
         self.fee_spin.setValue(settings.fee_rate * 100.0)
         self.simple_order_amount_spin.setValue(settings.simple_order_amount)
         if settings.order_mode == "simple":
@@ -2717,6 +2728,8 @@ class AltReversalTraderWindow(QMainWindow):
             fee_rate=float(self.fee_spin.value()) / 100.0,
             history_days=int(self.history_days_spin.value()),
             auto_refresh_minutes=int(self.auto_refresh_minutes_spin.value()),
+            auto_trade_use_favorable_price=bool(self.auto_trade_favorable_check.isChecked()),
+            auto_trade_focus_on_signal=bool(self.auto_trade_focus_signal_check.isChecked()),
             kline_interval=self.interval_combo.currentText(),
             daily_volatility_min=float(self.daily_vol_spin.value()),
             quote_volume_min=float(self.quote_volume_spin.value()),
@@ -2881,6 +2894,7 @@ class AltReversalTraderWindow(QMainWindow):
                     default_strategy_settings=self.settings.strategy,
                     optimization_rank_mode=self._optimization_rank_mode(),
                     auto_trade_enabled=bool(self.auto_trade_enabled),
+                    auto_trade_use_favorable_price=bool(self.settings.auto_trade_use_favorable_price),
                     auto_close_enabled_symbols=tuple(sorted(self.auto_close_enabled_symbols)),
                     position_intervals=dict(self.settings.position_intervals),
                     position_strategy_settings=dict(self.settings.position_strategy_settings),
@@ -2939,6 +2953,23 @@ class AltReversalTraderWindow(QMainWindow):
             self._set_order_buttons_enabled(False)
             return
         if isinstance(event, EngineSignalEvent):
+            signal_key = (event.symbol, event.interval)
+            next_signal = (str(event.preview_entry_side or ""), int(event.preview_entry_zone or 0))
+            previous_signal = self.last_engine_entry_signal_by_key.get(signal_key, ("", 0))
+            self.last_engine_entry_signal_by_key[signal_key] = next_signal
+            if (
+                self.settings.auto_trade_focus_on_signal
+                and
+                not self.settings.auto_trade_use_favorable_price
+                and next_signal[0]
+                and next_signal[1] > 0
+                and next_signal != previous_signal
+            ):
+                self._request_symbol_load(
+                    event.symbol,
+                    event.interval,
+                    prefer_locked_position_settings=False,
+                )
             return
         if isinstance(event, EngineOrderCompletedEvent):
             self.engine_order_pending = False
@@ -3185,6 +3216,7 @@ class AltReversalTraderWindow(QMainWindow):
                     else 0.0,
                 ),
                 remembered_cursor_entry_time=self.auto_trade_cursor_entry_time_by_symbol.get(symbol),
+                allow_favorable_price_entries=bool(self.settings.auto_trade_use_favorable_price),
                 trigger_symbol=trigger_symbol,
                 trigger_interval=trigger_interval,
                 trigger_bar_time=normalized_trigger_time,

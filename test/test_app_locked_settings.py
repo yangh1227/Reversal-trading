@@ -65,6 +65,20 @@ def test_handle_trade_engine_event_reloads_auto_trade_with_locked_settings() -> 
     assert any(_call_has_locked_settings_keyword(call) for call in matching_calls)
 
 
+def test_engine_signal_event_auto_focuses_chart_when_favorable_price_toggle_is_off() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_handle_trade_engine_event"),
+    ) or ""
+
+    assert "self.settings.auto_trade_focus_on_signal" in source_segment
+    assert "not self.settings.auto_trade_use_favorable_price" in source_segment
+    assert 'event.preview_entry_side' in source_segment
+    assert 'event.preview_entry_zone' in source_segment
+    assert "next_signal != previous_signal" in source_segment
+    assert "prefer_locked_position_settings=False" in source_segment
+
+
 def test_lightweight_chart_initializes_optimization_overlay() -> None:
     matching_calls = _self_method_calls("_init_lightweight_chart", "_init_lightweight_optimization_overlay")
 
@@ -248,6 +262,8 @@ def test_collect_settings_preserves_auto_refresh_minutes_and_locked_positions() 
     ) or ""
 
     assert "auto_refresh_minutes=int(self.auto_refresh_minutes_spin.value())" in source_segment
+    assert "auto_trade_use_favorable_price=bool(self.auto_trade_favorable_check.isChecked())" in source_segment
+    assert "auto_trade_focus_on_signal=bool(self.auto_trade_focus_signal_check.isChecked())" in source_segment
     assert "position_strategy_settings=dict(self.settings.position_strategy_settings)" in source_segment
     assert "position_filled_fractions=dict(self.settings.position_filled_fractions)" in source_segment
     assert "position_cursor_entry_times=dict(self.settings.position_cursor_entry_times)" in source_segment
@@ -414,7 +430,17 @@ def test_fallback_auto_trade_cycle_uses_shared_runtime_evaluator() -> None:
 
     assert "evaluate_auto_trade_candidate(" in source_segment
     assert "pick_auto_trade_candidate(" in source_segment
+    assert "allow_favorable_price_entries=bool(self.settings.auto_trade_use_favorable_price)" in source_segment
     assert "self._pick_auto_trade_candidate(" not in source_segment
+
+
+def test_trade_engine_sync_includes_favorable_price_toggle() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_sync_trade_engine_state"),
+    ) or ""
+
+    assert "auto_trade_use_favorable_price=bool(self.settings.auto_trade_use_favorable_price)" in source_segment
 
 
 def test_positions_table_includes_leverage_column() -> None:

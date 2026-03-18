@@ -27,6 +27,7 @@ from .live_chart_utils import seed_two_minute_aggregate as _seed_two_minute_aggr
 from .live_chart_utils import transform_two_minute_bar as _transform_two_minute_bar
 from .strategy import (
     BacktestResult,
+    evaluate_latest_state,
     estimate_warmup_bars,
     latest_confirmed_entry_event,
     prepare_ohlcv,
@@ -69,6 +70,7 @@ class EngineSyncCommand:
     default_strategy_settings: StrategySettings
     optimization_rank_mode: str
     auto_trade_enabled: bool
+    auto_trade_use_favorable_price: bool
     auto_close_enabled_symbols: Tuple[str, ...]
     position_intervals: Dict[str, str]
     position_strategy_settings: Dict[str, StrategySettings]
@@ -148,6 +150,8 @@ class EngineSignalEvent:
     interval: str
     entry_side: str = ""
     entry_zone: int = 0
+    preview_entry_side: str = ""
+    preview_entry_zone: int = 0
     exit_reason: str = ""
     bar_time: Optional[pd.Timestamp] = None
 
@@ -276,6 +280,77 @@ def _latest_backtest_exit_event(backtest: Optional[BacktestResult]) -> Optional[
             "reason": str(trade.reason),
             "bar_time": latest_time,
         }
+    return None
+
+
+def _preview_exit_reason(position_qty: float, latest_state: Dict[str, object]) -> Optional[str]:
+    if position_qty > 0:
+        if bool(latest_state.get("trend_to_short")):
+            return "trend_to_short"
+        if bool(latest_state.get("final_bear")):
+            return "opposite_signal"
+        return None
+    if position_qty < 0:
+        if bool(latest_state.get("trend_to_long")):
+            return "trend_to_long"
+        if bool(latest_state.get("final_bull")):
+            return "opposite_signal"
+    return None
+
+
+def _preview_entry_signal(cursor, latest_state: Dict[str, object], settings: StrategySettings) -> Optional[Tuple[str, int]]:
+    if cursor is None:
+        return None
+    position_qty = float(getattr(cursor, "position_qty", 0.0))
+    long_zone_used = list(getattr(cursor, "long_zone_used", (False, False, False)))
+    short_zone_used = list(getattr(cursor, "short_zone_used", (False, False, False)))
+    last_long_zone = int(getattr(cursor, "last_long_zone", 0))
+    last_short_zone = int(getattr(cursor, "last_short_zone", 0))
+
+    def reset_zones() -> None:
+        nonlocal last_long_zone, last_short_zone
+        long_zone_used[:] = [False, False, False]
+        short_zone_used[:] = [False, False, False]
+        last_long_zone = 0
+        last_short_zone = 0
+
+    if abs(position_qty) < 1e-12:
+        reset_zones()
+    if _preview_exit_reason(position_qty, latest_state) is not None:
+        position_qty = 0.0
+        reset_zones()
+    if abs(position_qty) < 1e-12:
+        reset_zones()
+
+    lev_zone = int(latest_state.get("zone") or 0)
+    if lev_zone not in {1, 2, 3}:
+        return None
+
+    trend = str(latest_state.get("trend", "")).upper()
+    is_long_trend = trend == "LONG"
+    is_short_trend = trend == "SHORT"
+    final_bull = bool(latest_state.get("final_bull"))
+    final_bear = bool(latest_state.get("final_bear"))
+
+    can_long_z1 = (not settings.beast_mode) and is_long_trend and final_bull and lev_zone == 1 and (not long_zone_used[0]) and last_long_zone == 0
+    can_long_z2 = is_long_trend and final_bull and lev_zone == 2 and (not long_zone_used[1]) and last_long_zone in (0, 1)
+    can_long_z3 = is_long_trend and final_bull and lev_zone == 3 and (not long_zone_used[2]) and last_long_zone in (0, 2)
+    can_short_z1 = (not settings.beast_mode) and is_short_trend and final_bear and lev_zone == 1 and (not short_zone_used[0]) and last_short_zone == 0
+    can_short_z2 = is_short_trend and final_bear and lev_zone == 2 and (not short_zone_used[1]) and last_short_zone in (0, 1)
+    can_short_z3 = is_short_trend and final_bear and lev_zone == 3 and (not short_zone_used[2]) and last_short_zone in (0, 2)
+
+    if can_long_z1:
+        return ("long", 1)
+    if can_long_z2:
+        return ("long", 2)
+    if can_long_z3:
+        return ("long", 3)
+    if can_short_z1:
+        return ("short", 1)
+    if can_short_z2:
+        return ("short", 2)
+    if can_short_z3:
+        return ("short", 3)
     return None
 
 
@@ -654,6 +729,7 @@ class _TradeEngine:
         self.default_strategy_settings = StrategySettings()
         self.optimization_rank_mode = "score"
         self.auto_trade_enabled = False
+        self.auto_trade_use_favorable_price = True
         self.auto_close_enabled_symbols: set[str] = set()
         self.position_intervals: Dict[str, str] = {}
         self.watchlist: Dict[Tuple[str, str], EngineWatchlistItem] = {}
@@ -823,6 +899,7 @@ class _TradeEngine:
         self.default_strategy_settings = command.default_strategy_settings
         self.optimization_rank_mode = command.optimization_rank_mode if command.optimization_rank_mode in {"score", "return"} else "score"
         self.auto_trade_enabled = bool(command.auto_trade_enabled)
+        self.auto_trade_use_favorable_price = bool(command.auto_trade_use_favorable_price)
         self.auto_close_enabled_symbols = {str(symbol) for symbol in command.auto_close_enabled_symbols}
         self.position_intervals = {
             str(symbol): str(interval)
@@ -1334,12 +1411,25 @@ class _TradeEngine:
             return
         signal = _auto_trade_signal_from_backtest(state.backtest)
         exit_event = _latest_backtest_exit_event(state.backtest)
+        preview_side = ""
+        preview_zone = 0
+        if state.history is not None and not state.history.empty and state.backtest.cursor is not None:
+            latest_state, _ = evaluate_latest_state(
+                state.history,
+                state.backtest.settings,
+                cursor=state.backtest.cursor.indicator_cursor,
+            )
+            preview_signal = _preview_entry_signal(state.backtest.cursor, latest_state, state.backtest.settings)
+            if preview_signal is not None:
+                preview_side, preview_zone = preview_signal
         self.emit(
             EngineSignalEvent(
                 symbol=state.symbol,
                 interval=state.interval,
                 entry_side="" if signal is None else str(signal["side"]),
                 entry_zone=0 if signal is None else int(signal["zone"]),
+                preview_entry_side=preview_side,
+                preview_entry_zone=preview_zone,
                 exit_reason="" if exit_event is None else str(exit_event.get("reason", "")),
                 bar_time=None if exit_event is None else pd.Timestamp(exit_event.get("bar_time")),
             )
@@ -1526,6 +1616,7 @@ class _TradeEngine:
                     else 0.0,
                 ),
                 remembered_cursor_entry_time=self.auto_trade_cursor_entry_time.get(item.symbol),
+                allow_favorable_price_entries=self.auto_trade_use_favorable_price,
                 trigger_symbol=trigger_symbol,
                 trigger_interval=trigger_interval,
                 trigger_bar_time=normalized_trigger_time,

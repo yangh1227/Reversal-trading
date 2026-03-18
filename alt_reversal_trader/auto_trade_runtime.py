@@ -126,6 +126,7 @@ def evaluate_auto_trade_candidate(
     remembered_interval: Optional[str],
     filled_fraction: float,
     remembered_cursor_entry_time: Optional[pd.Timestamp],
+    allow_favorable_price_entries: bool = True,
     trigger_symbol: str = "",
     trigger_interval: str = "",
     trigger_bar_time: Optional[pd.Timestamp] = None,
@@ -170,6 +171,8 @@ def evaluate_auto_trade_candidate(
         if fraction <= 1e-9:
             return AutoTradeEvaluationResult()
         if not has_fresh_confirmed_entry:
+            if not allow_favorable_price_entries:
+                return AutoTradeEvaluationResult()
             favorable_fraction = zone_favorable_fraction(
                 side,
                 float(current_price),
@@ -182,6 +185,8 @@ def evaluate_auto_trade_candidate(
             fraction = min(fraction, favorable_fraction)
     else:
         if not has_fresh_confirmed_entry:
+            if not allow_favorable_price_entries:
+                return AutoTradeEvaluationResult()
             favorable_fraction = zone_favorable_fraction(
                 side,
                 float(current_price),

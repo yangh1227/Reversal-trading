@@ -1066,6 +1066,38 @@ def test_trade_engine_enters_on_favorable_price_without_fresh_confirmed_trigger(
     assert round(float(submitted[0]["fraction"]), 2) == 0.50
 
 
+def test_trade_engine_skips_favorable_price_entry_when_toggle_disabled() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.auto_trade_enabled = True
+    engine.auto_trade_use_favorable_price = False
+    engine.client = FakeTickerClient({"TESTUSDT": 95.0})
+    backtest = make_signal_backtest(
+        zone=2,
+        signal_time="2026-01-01 00:15:00",
+        latest_time="2026-01-01 00:16:00",
+    )
+    key = ("TESTUSDT", "1m")
+    engine.watchlist[key] = EngineWatchlistItem(
+        symbol="TESTUSDT",
+        interval="1m",
+        score=7.0,
+        return_pct=12.0,
+        strategy_settings=StrategySettings(),
+    )
+    engine.symbol_states[key] = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="1m",
+        strategy_settings=StrategySettings(),
+        backtest=backtest,
+    )
+    submitted: list[dict[str, object]] = []
+    engine._enqueue_open_order = lambda **kwargs: submitted.append(kwargs)
+
+    engine._evaluate_auto_trade()
+
+    assert submitted == []
+
+
 def test_trade_engine_enters_on_displayed_stale_signal_even_without_backtest_position() -> None:
     engine = _TradeEngine(mp.Queue(), mp.Queue())
     engine.auto_trade_enabled = True

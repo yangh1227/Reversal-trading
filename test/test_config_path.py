@@ -48,6 +48,8 @@ class TestConfigPath(unittest.TestCase):
             self.assertEqual(loaded.leverage, 2)
             self.assertEqual(loaded.history_days, 3)
             self.assertEqual(loaded.auto_refresh_minutes, 30)
+            self.assertTrue(loaded.auto_trade_use_favorable_price)
+            self.assertTrue(loaded.auto_trade_focus_on_signal)
             self.assertEqual(loaded.daily_volatility_min, 20.0)
             self.assertEqual(loaded.quote_volume_min, 10_000_000.0)
             self.assertFalse(loaded.use_rsi_filter)
@@ -135,6 +137,8 @@ class TestConfigPath(unittest.TestCase):
             config_path = Path(temp_dir) / self.config.APP_CONFIG_FILENAME
             locked_settings = self.config.StrategySettings(atr_period=7, factor=3.5)
             settings = self.config.AppSettings(
+                auto_trade_use_favorable_price=False,
+                auto_trade_focus_on_signal=False,
                 position_intervals={"BTCUSDT": "5m"},
                 position_strategy_settings={"BTCUSDT": locked_settings},
                 position_filled_fractions={"BTCUSDT": 0.5},
@@ -145,6 +149,8 @@ class TestConfigPath(unittest.TestCase):
             loaded = self.config.AppSettings.load(config_path)
 
             self.assertEqual(loaded.position_intervals["BTCUSDT"], "5m")
+            self.assertFalse(loaded.auto_trade_use_favorable_price)
+            self.assertFalse(loaded.auto_trade_focus_on_signal)
             self.assertEqual(loaded.position_strategy_settings["BTCUSDT"], locked_settings)
             self.assertEqual(loaded.position_filled_fractions["BTCUSDT"], 0.5)
             self.assertEqual(loaded.position_cursor_entry_times["BTCUSDT"], pd.Timestamp("2026-01-01 00:10:00"))
