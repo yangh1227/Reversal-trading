@@ -972,13 +972,17 @@ def test_order_executor_formats_insufficient_margin_errors_for_logs() -> None:
         symbol="TESTUSDT",
         side="BUY",
         leverage=2,
+        apply_leverage=True,
         fraction=0.5,
         margin=None,
+        price=None,
         interval="1m",
         auto_close=False,
         auto_trade=True,
         reason=None,
         strategy_settings=StrategySettings(),
+        close_side=None,
+        close_quantity=None,
         api_key="key",
         api_secret="secret",
     )
@@ -990,6 +994,43 @@ def test_order_executor_formats_insufficient_margin_errors_for_logs() -> None:
 
     assert "insufficient margin" in message.lower()
     assert "TESTUSDT" in message
+
+
+def test_trade_engine_enqueue_close_order_uses_cached_position_quantity() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.client = object()  # type: ignore[assignment]
+    engine.api_key = "key"
+    engine.api_secret = "secret"
+    engine.open_positions["TESTUSDT"] = make_position()
+
+    engine._enqueue_close_order("TESTUSDT", reason="manual", auto_close=False)
+
+    _priority, _sequence, request = engine.order_request_queue.get_nowait()
+    assert request.close_side == "SELL"
+    assert request.close_quantity == 1.0
+
+
+def test_trade_engine_enqueue_open_order_reuses_stream_price_and_cached_leverage() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.client = FakeTickerClient({"TESTUSDT": 101.0})
+    engine.api_key = "key"
+    engine.api_secret = "secret"
+    engine.leverage = 3
+    engine.latest_stream_price_by_symbol["TESTUSDT"] = 102.5
+    engine.applied_leverage_by_symbol["TESTUSDT"] = 3
+
+    engine._enqueue_open_order(
+        symbol="TESTUSDT",
+        interval="1m",
+        side="BUY",
+        fraction=0.5,
+        auto_trade=False,
+        strategy_settings=StrategySettings(),
+    )
+
+    _priority, _sequence, request = engine.order_request_queue.get_nowait()
+    assert request.price == 102.5
+    assert request.apply_leverage is False
 
 
 def test_trade_engine_enters_on_favorable_price_without_fresh_confirmed_trigger() -> None:

@@ -178,13 +178,17 @@ class _OrderRequest:
     symbol: str
     side: Optional[str]
     leverage: int
+    apply_leverage: bool
     fraction: Optional[float]
     margin: Optional[float]
+    price: Optional[float]
     interval: Optional[str]
     auto_close: bool
     auto_trade: bool
     reason: Optional[str]
     strategy_settings: Optional[StrategySettings]
+    close_side: Optional[str]
+    close_quantity: Optional[float]
     api_key: str
     api_secret: str
 
@@ -474,8 +478,17 @@ class _OrderExecutor(threading.Thread):
             try:
                 client = BinanceFuturesClient(request.api_key, request.api_secret)
                 if request.side is None:
-                    result = client.close_position(request.symbol)
-                    no_open_position = result is None
+                    if request.close_side is not None and request.close_quantity is not None and request.close_quantity > 0:
+                        result = client.place_market_order(
+                            request.symbol,
+                            request.close_side,
+                            request.close_quantity,
+                            reduce_only=True,
+                        )
+                        no_open_position = False
+                    else:
+                        result = client.close_position(request.symbol)
+                        no_open_position = result is None
                     message = (
                         f"{request.symbol} close skipped: no open position"
                         if no_open_position
@@ -501,8 +514,14 @@ class _OrderExecutor(threading.Thread):
                         margin = balance.available_balance * float(request.fraction or 0.0)
                     if margin <= 0:
                         raise RuntimeError("order amount must be positive")
-                    client.set_leverage(request.symbol, request.leverage)
-                    quantity = client.build_order_quantity(request.symbol, margin, request.leverage)
+                    if request.apply_leverage:
+                        client.set_leverage(request.symbol, request.leverage)
+                    quantity = client.build_order_quantity(
+                        request.symbol,
+                        margin,
+                        request.leverage,
+                        price=request.price,
+                    )
                     result = client.place_market_order(request.symbol, request.side, quantity)
                     payload = _OrderExecutionResult(
                         symbol=request.symbol,
@@ -644,6 +663,7 @@ class _TradeEngine:
         self.filled_fraction_by_symbol: Dict[str, float] = {}
         self.auto_trade_cursor_entry_time: Dict[str, pd.Timestamp] = {}
         self.position_strategy_by_symbol: Dict[str, StrategySettings] = {}
+        self.applied_leverage_by_symbol: Dict[str, int] = {}
         self.pending_order_symbols: Dict[str, float] = {}
         self.auto_close_last_trigger_time: Dict[str, pd.Timestamp] = {}
         self.auto_close_last_attempt_at: Dict[str, float] = {}
@@ -738,10 +758,12 @@ class _TradeEngine:
                 self.open_positions.pop(result.symbol, None)
                 self.filled_fraction_by_symbol.pop(result.symbol, None)
                 self.auto_trade_cursor_entry_time.pop(result.symbol, None)
+                self.applied_leverage_by_symbol.pop(result.symbol, None)
             if result.no_open_position:
                 self.open_positions.pop(result.symbol, None)
                 self.filled_fraction_by_symbol.pop(result.symbol, None)
                 self.auto_trade_cursor_entry_time.pop(result.symbol, None)
+                self.applied_leverage_by_symbol.pop(result.symbol, None)
             if result.auto_close and result.success:
                 self.auto_close_last_trigger_time.pop(result.symbol, None)
                 self.auto_close_last_attempt_at.pop(result.symbol, None)
@@ -750,6 +772,8 @@ class _TradeEngine:
                     self.position_intervals[result.symbol] = str(result.interval)
                 if result.strategy_settings is not None:
                     self.position_strategy_by_symbol[result.symbol] = result.strategy_settings
+                if not result.close_order:
+                    self.applied_leverage_by_symbol[result.symbol] = int(self.leverage)
                 if result.auto_trade:
                     current_fraction = float(self.filled_fraction_by_symbol.get(result.symbol, 0.0))
                     self.filled_fraction_by_symbol[result.symbol] = min(
@@ -1627,6 +1651,13 @@ class _TradeEngine:
                 fraction=float(fraction or 0.0),
             )
         )
+        latest_price = float(self.latest_stream_price_by_symbol.get(symbol, 0.0) or 0.0)
+        if latest_price <= 0:
+            try:
+                latest_price = float(self.client.get_latest_price(symbol))
+            except Exception:
+                latest_price = 0.0
+        apply_leverage = self.applied_leverage_by_symbol.get(symbol) != int(self.leverage)
         self.order_sequence += 1
         self.order_request_queue.put(
             (
@@ -1636,13 +1667,17 @@ class _TradeEngine:
                     symbol=symbol,
                     side=side,
                     leverage=self.leverage,
+                    apply_leverage=apply_leverage,
                     fraction=fraction,
                     margin=margin,
+                    price=latest_price if latest_price > 0 else None,
                     interval=interval,
                     auto_close=False,
                     auto_trade=auto_trade,
                     reason=None,
                     strategy_settings=strategy_settings,
+                    close_side=None,
+                    close_quantity=None,
                     api_key=self.api_key,
                     api_secret=self.api_secret,
                 ),
@@ -1678,6 +1713,12 @@ class _TradeEngine:
                 interval=self.position_intervals.get(symbol),
             )
         )
+        position = self.open_positions.get(symbol)
+        close_side: Optional[str] = None
+        close_quantity: Optional[float] = None
+        if position is not None and abs(float(position.amount)) > 1e-12:
+            close_side = "SELL" if float(position.amount) > 0 else "BUY"
+            close_quantity = abs(float(position.amount))
         self.order_sequence += 1
         self.order_request_queue.put(
             (
@@ -1687,13 +1728,17 @@ class _TradeEngine:
                     symbol=symbol,
                     side=None,
                     leverage=self.leverage,
+                    apply_leverage=False,
                     fraction=None,
                     margin=None,
+                    price=None,
                     interval=self.position_intervals.get(symbol),
                     auto_close=auto_close,
                     auto_trade=False,
                     reason=reason,
                     strategy_settings=self.position_strategy_by_symbol.get(symbol),
+                    close_side=close_side,
+                    close_quantity=close_quantity,
                     api_key=self.api_key,
                     api_secret=self.api_secret,
                 ),
