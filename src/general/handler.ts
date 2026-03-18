@@ -101,8 +101,19 @@ export class Handler {
         let _sdmDragging = false;
         let _sdmStartPrice: number | null = null;
 
+        // 차트 공식 API로 가격 추적: document.mousemove 대신 사용 (chart 프레임레이트에 맞춰 throttle됨)
+        this.chart.subscribeCrosshairMove((param: MouseEventParams) => {
+            if (!_sdmDragging || _sdmStartPrice === null || !param.point) return;
+            const price = this.series.coordinateToPrice(param.point.y);
+            if (price !== null) {
+                this._shiftDragMeasure.setPrices(_sdmStartPrice, price);
+            }
+        });
+
         this.div.addEventListener('mousedown', (e: MouseEvent) => {
             if (e.shiftKey) {
+                // 차트 scroll/scale 비활성화 — pan과의 충돌 방지 (렉 + 사각형 미표시 원인)
+                this.chart.applyOptions({ handleScroll: false, handleScale: false });
                 const rect = this.div.getBoundingClientRect();
                 const y = (e.clientY - rect.top) as Coordinate;
                 const price = this.series.coordinateToPrice(y);
@@ -111,7 +122,6 @@ export class Handler {
                     _sdmDragging = true;
                     this._shiftDragMeasure.setPrices(price, price);
                 }
-                e.preventDefault();  // 차트 드래그 스크롤 방지 (stopPropagation 제거 — chart 이벤트 차단 방지)
             } else {
                 if (this._shiftDragMeasure.isActive()) {
                     this._shiftDragMeasure.clear();
@@ -119,23 +129,13 @@ export class Handler {
             }
         });
 
-        // document 리스너는 드래그가 div 밖으로 나가도 추적하기 위해 필요.
-        // 다중 Handler 인스턴스에서의 누적을 막기 위해 _sdmDragging 가드로 처리.
-        const _sdmMouseMove = (e: MouseEvent) => {
-            if (!_sdmDragging || _sdmStartPrice === null) return;
-            const rect = this.div.getBoundingClientRect();
-            const y = (e.clientY - rect.top) as Coordinate;
-            const price = this.series.coordinateToPrice(y);
-            if (price !== null) {
-                this._shiftDragMeasure.setPrices(_sdmStartPrice, price);
+        document.addEventListener('mouseup', () => {
+            if (_sdmDragging) {
+                // 드래그 종료 시 차트 scroll/scale 복원
+                this.chart.applyOptions({ handleScroll: { vertTouchDrag: true }, handleScale: true });
             }
-        };
-        const _sdmMouseUp = () => {
             _sdmDragging = false;
-            // 마우스 업 시 사각형 유지 (clear 하지 않음)
-        };
-        document.addEventListener('mousemove', _sdmMouseMove);
-        document.addEventListener('mouseup', _sdmMouseUp);
+        });
 
         this.reSize()
         if (!autoSize) return
