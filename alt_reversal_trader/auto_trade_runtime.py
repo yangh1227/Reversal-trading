@@ -57,6 +57,31 @@ def zone_favorable_fraction(
     return 0.0
 
 
+def favorable_auto_trade_fraction(
+    latest_backtest: Optional[BacktestResult],
+    current_price: Optional[float],
+    open_position: Optional[PositionSnapshot],
+    filled_fraction: float,
+) -> float:
+    if latest_backtest is None or current_price is None or current_price <= 0:
+        return 0.0
+    signal = auto_trade_signal_from_backtest(latest_backtest)
+    if signal is None:
+        return 0.0
+    side = str(signal["side"])
+    if open_position is not None:
+        position_side = "long" if float(open_position.amount) > 0 else "short"
+        if side != position_side:
+            return 0.0
+    return zone_favorable_fraction(
+        side,
+        float(current_price),
+        float(signal["price"]),
+        dict(signal.get("zone_prices") or {}),
+        float(filled_fraction),
+    )
+
+
 def inferred_auto_trade_fraction(backtest: BacktestResult, position: Optional[PositionSnapshot]) -> float:
     cursor = backtest.cursor
     if cursor is None or position is None or abs(float(position.amount)) < 1e-12:

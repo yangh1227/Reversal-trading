@@ -15,6 +15,7 @@ import websocket
 
 from .auto_trade_runtime import (
     evaluate_auto_trade_candidate,
+    favorable_auto_trade_fraction,
     history_can_resume_backtest as _history_can_resume_backtest,
     inferred_auto_trade_fraction as _inferred_auto_trade_fraction,
     pick_auto_trade_candidate,
@@ -50,6 +51,7 @@ from .qt_compat import (
     VERTICAL,
     QApplication,
     QCheckBox,
+    QColor,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
@@ -116,6 +118,7 @@ RECENT_DELTA_REFRESH_BARS = 180
 RECENT_DELTA_OVERLAP_BARS = 20
 LIVE_RENDER_INTERVAL_MS = 120
 OPTIMIZED_TABLE_REFRESH_MS = 250
+OPTIMIZED_TABLE_HIGHLIGHT_REFRESH_MS = 1_000
 HISTORY_CACHE_SYMBOL_LIMIT = 10
 RECENT_SYMBOL_CACHE_LIMIT = 8
 FULL_HISTORY_REFRESH_COOLDOWN_SECONDS = 300.0
@@ -124,6 +127,7 @@ AUTO_TRADE_INTERVAL_MS = 1_000
 AUTO_CLOSE_RETRY_INTERVAL_MS = 10_000
 TRADE_ENGINE_POLL_INTERVAL_MS = 100
 _SNAPSHOT_KEEP = object()
+OPTIMIZED_TABLE_FAVORABLE_ROW_COLOR = "#d8f0de"
 
 
 @dataclass
@@ -1606,6 +1610,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_refresh_timer = QTimer(self)
         self.live_update_timer = QTimer(self)
         self.optimized_table_timer = QTimer(self)
+        self.optimized_table_highlight_timer = QTimer(self)
         self.trade_engine_poll_timer = QTimer(self)
         self.backtest_progress_total_cases = 0
         self.backtest_progress_completed_cases = 0
@@ -1646,6 +1651,9 @@ class AltReversalTraderWindow(QMainWindow):
         self.live_update_timer.timeout.connect(self._flush_live_update)
         self.optimized_table_timer.setSingleShot(True)
         self.optimized_table_timer.timeout.connect(self._flush_optimized_table)
+        self.optimized_table_highlight_timer.setInterval(OPTIMIZED_TABLE_HIGHLIGHT_REFRESH_MS)
+        self.optimized_table_highlight_timer.timeout.connect(self._refresh_optimized_table_highlights)
+        self.optimized_table_highlight_timer.start()
         self.trade_engine_poll_timer.setInterval(TRADE_ENGINE_POLL_INTERVAL_MS)
         self.trade_engine_poll_timer.timeout.connect(self._poll_trade_engine_events)
         self.price_label_timer.setInterval(250)
@@ -5396,13 +5404,91 @@ class AltReversalTraderWindow(QMainWindow):
             ]
         return [result for result in ordered if result.score >= minimum_score]
 
+    def _optimized_table_price_map(self, *, log_failures: bool = False) -> Dict[str, float]:
+        symbols = {result.symbol for result in self._ordered_optimized_results()}
+        if not symbols:
+            return {}
+        try:
+            ticker_map = self.public_client.ticker_24h()
+        except Exception as exc:
+            if log_failures:
+                self.log(f"최적화 종목 현재가 조회 실패: {exc}")
+            return {}
+        prices: Dict[str, float] = {}
+        for symbol in symbols:
+            ticker = ticker_map.get(symbol)
+            if not ticker:
+                continue
+            current_price = float(ticker.get("lastPrice", 0.0) or 0.0)
+            if current_price > 0:
+                prices[symbol] = current_price
+        return prices
+
+    def _optimized_result_has_favorable_entry(self, result: OptimizationResult, current_price: Optional[float]) -> bool:
+        if current_price is None or current_price <= 0:
+            return False
+        symbol = str(result.symbol)
+        interval = str(result.best_interval or self.settings.kline_interval)
+        open_position = self._find_open_position(symbol)
+        latest_backtest: Optional[BacktestResult] = None
+        if (
+            self.current_symbol == symbol
+            and self.current_interval == interval
+            and self.current_backtest is not None
+            and self.current_backtest.settings == result.best_backtest.settings
+        ):
+            latest_backtest = self.current_backtest
+        else:
+            cached_backtest = self.backtest_cache.get(self._symbol_interval_key(symbol, interval))
+            if cached_backtest is not None and cached_backtest.settings == result.best_backtest.settings:
+                latest_backtest = cached_backtest
+        if latest_backtest is None:
+            return False
+        filled_fraction = self.auto_trade_filled_fraction_by_symbol.get(
+            symbol,
+            _inferred_auto_trade_fraction(latest_backtest, open_position) if open_position is not None else 0.0,
+        )
+        return favorable_auto_trade_fraction(
+            latest_backtest,
+            float(current_price),
+            open_position,
+            filled_fraction,
+        ) > 1e-9
+
+    def _refresh_optimized_table_highlights(self) -> None:
+        if not hasattr(self, "optimized_table"):
+            return
+        ordered = self._ordered_optimized_results()
+        if self.optimized_table.rowCount() != len(ordered):
+            self.update_optimized_table()
+            return
+        price_map = self._optimized_table_price_map(log_failures=False)
+        favorable_row_brush = QColor(OPTIMIZED_TABLE_FAVORABLE_ROW_COLOR)
+        default_row_brush = QColor()
+        for row, result in enumerate(ordered):
+            favorable_entry = self._optimized_result_has_favorable_entry(
+                result,
+                price_map.get(result.symbol),
+            )
+            brush = favorable_row_brush if favorable_entry else default_row_brush
+            for col in range(self.optimized_table.columnCount()):
+                item = self.optimized_table.item(row, col)
+                if item is not None:
+                    item.setBackground(brush)
+
     def update_optimized_table(self) -> None:
         self.optimized_table.setUpdatesEnabled(False)
         ordered = self._ordered_optimized_results()
+        price_map = self._optimized_table_price_map(log_failures=True)
+        favorable_row_brush = QColor(OPTIMIZED_TABLE_FAVORABLE_ROW_COLOR)
         self.optimized_table.setRowCount(len(ordered))
         for row, result in enumerate(ordered):
             metrics = result.best_backtest.metrics
             result_interval = result.best_interval or self.settings.kline_interval
+            favorable_entry = self._optimized_result_has_favorable_entry(
+                result,
+                price_map.get(result.symbol),
+            )
             values = [
                 result.symbol,
                 result_interval,
@@ -5417,6 +5503,8 @@ class AltReversalTraderWindow(QMainWindow):
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setData(USER_ROLE, (result.symbol, result_interval))
+                if favorable_entry:
+                    item.setBackground(favorable_row_brush)
                 self.optimized_table.setItem(row, col, item)
         self.optimized_table.setUpdatesEnabled(True)
         self._sync_trade_engine_state()
@@ -6696,6 +6784,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.auto_refresh_timer.stop()
             self.live_update_timer.stop()
             self.optimized_table_timer.stop()
+            self.optimized_table_highlight_timer.stop()
             self.auto_close_retry_timer.stop()
             self.auto_trade_timer.stop()
             self.trade_engine_poll_timer.stop()

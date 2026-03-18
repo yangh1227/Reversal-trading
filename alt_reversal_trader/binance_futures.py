@@ -71,6 +71,22 @@ def _normalize_unrealized_pnl(amount: float, entry_price: float, mark_price: flo
     return float(fallback)
 
 
+def _response_error_message(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        code = payload.get("code")
+        message = str(payload.get("msg", "") or "").strip()
+        if message:
+            return f"[{code}] {message}" if code is not None else message
+    text = str(response.text or "").strip()
+    if text:
+        return text
+    return f"{response.status_code} {response.reason}".strip()
+
+
 def _interval_to_ms(interval: str) -> int:
     unit = interval[-1]
     value = int(interval[:-1])
@@ -292,7 +308,8 @@ class BinanceFuturesClient:
                 if response.status_code >= 500:
                     time.sleep(0.75 * (attempt + 1))
                     continue
-                response.raise_for_status()
+                if response.status_code >= 400:
+                    raise RuntimeError(_response_error_message(response))
                 return response.json()
             except RuntimeError:
                 raise

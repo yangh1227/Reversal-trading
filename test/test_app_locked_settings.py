@@ -253,6 +253,40 @@ def test_collect_settings_preserves_auto_refresh_minutes_and_locked_positions() 
     assert "position_cursor_entry_times=dict(self.settings.position_cursor_entry_times)" in source_segment
 
 
+def test_optimized_table_marks_favorable_rows_light_green() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("update_optimized_table"),
+    ) or ""
+
+    assert "OPTIMIZED_TABLE_FAVORABLE_ROW_COLOR" in APP_PATH.read_text(encoding="utf-8")
+    assert "favorable_auto_trade_fraction(" in APP_PATH.read_text(encoding="utf-8")
+    assert "item.setBackground(favorable_row_brush)" in source_segment
+
+
+def test_optimized_table_favorable_highlight_avoids_stale_optimization_backtests() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_optimized_result_has_favorable_entry"),
+    ) or ""
+
+    assert "latest_backtest: Optional[BacktestResult] = None" in source_segment
+    assert "return result.best_backtest" not in source_segment
+    assert "if latest_backtest is None:" in source_segment
+
+
+def test_window_init_starts_optimized_table_highlight_timer() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("__init__"),
+    ) or ""
+
+    assert "self.optimized_table_highlight_timer = QTimer(self)" in source_segment
+    assert "self.optimized_table_highlight_timer.setInterval(OPTIMIZED_TABLE_HIGHLIGHT_REFRESH_MS)" in source_segment
+    assert "self.optimized_table_highlight_timer.timeout.connect(self._refresh_optimized_table_highlights)" in source_segment
+    assert "self.optimized_table_highlight_timer.start()" in source_segment
+
+
 def test_kline_stream_worker_uses_shared_two_minute_transform_helper() -> None:
     module = _load_app_module_ast()
     source = APP_PATH.read_text(encoding="utf-8")

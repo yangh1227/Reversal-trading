@@ -15,6 +15,7 @@ import websocket
 from .auto_trade_runtime import (
     auto_trade_signal_from_backtest as _auto_trade_signal_from_backtest,
     evaluate_auto_trade_candidate,
+    favorable_auto_trade_fraction,
     history_can_resume_backtest as _history_can_resume_backtest,
     inferred_auto_trade_fraction as _inferred_auto_trade_fraction,
     pick_auto_trade_candidate,
@@ -523,7 +524,7 @@ class _OrderExecutor(threading.Thread):
                 payload = _OrderExecutionResult(
                     symbol=request.symbol,
                     success=False,
-                    message=traceback.format_exc(),
+                    message=self._format_order_failure_message(request, traceback.format_exc()),
                     auto_close=request.auto_close,
                     auto_trade=request.auto_trade,
                     close_order=request.side is None,
@@ -537,6 +538,27 @@ class _OrderExecutor(threading.Thread):
                 except Exception:
                     # Queue itself failed — log only. Pending timeout (#1) handles unlock.
                     traceback.print_exc()
+
+
+    @staticmethod
+    def _format_order_failure_message(request: _OrderRequest, raw_error: str) -> str:
+        message = str(raw_error or "").strip()
+        compact = " ".join(line.strip() for line in message.splitlines() if line.strip())
+        if not compact:
+            return f"{request.symbol} order failed"
+        lowered = compact.lower()
+        if (
+            "insufficient margin" in lowered
+            or "margin is insufficient" in lowered
+            or "balance is insufficient" in lowered
+            or "insufficient balance" in lowered
+            or "[-2019]" in lowered
+            or "code=-2019" in lowered
+        ):
+            return f"{request.symbol} order failed: insufficient margin ({compact})"
+        if request.side is None:
+            return f"{request.symbol} close failed: {compact}"
+        return f"{request.symbol} order failed: {compact}"
 
 
 class TradeEngineController:

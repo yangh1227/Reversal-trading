@@ -13,6 +13,8 @@ from alt_reversal_trader.trade_engine import (
     EngineSyncCommand,
     EngineWatchlistItem,
     _EngineSymbolState,
+    _OrderRequest,
+    _OrderExecutor,
     _OrderExecutionResult,
     _TradeEngine,
 )
@@ -963,6 +965,31 @@ def test_trade_engine_skips_favorable_reentry_after_latest_state_exit_signal() -
     engine._evaluate_auto_trade()
 
     assert submitted == []
+
+
+def test_order_executor_formats_insufficient_margin_errors_for_logs() -> None:
+    request = _OrderRequest(
+        symbol="TESTUSDT",
+        side="BUY",
+        leverage=2,
+        fraction=0.5,
+        margin=None,
+        interval="1m",
+        auto_close=False,
+        auto_trade=True,
+        reason=None,
+        strategy_settings=StrategySettings(),
+        api_key="key",
+        api_secret="secret",
+    )
+
+    message = _OrderExecutor._format_order_failure_message(
+        request,
+        "RuntimeError: [-2019] Margin is insufficient.",
+    )
+
+    assert "insufficient margin" in message.lower()
+    assert "TESTUSDT" in message
 
 
 def test_trade_engine_enters_on_favorable_price_without_fresh_confirmed_trigger() -> None:
