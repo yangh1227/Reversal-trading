@@ -264,6 +264,7 @@ def test_collect_settings_preserves_auto_refresh_minutes_and_locked_positions() 
     ) or ""
 
     assert "auto_refresh_minutes=int(self.auto_refresh_minutes_spin.value())" in source_segment
+    assert "chart_display_days=int(" in source_segment
     assert "auto_trade_use_favorable_price=bool(self.auto_trade_favorable_check.isChecked())" in source_segment
     assert "auto_trade_focus_on_signal=bool(" in source_segment
     assert "auto_trade_focus_signal_mode=self._auto_trade_focus_signal_mode()" in source_segment
@@ -399,8 +400,8 @@ def test_filter_group_exposes_chart_backtest_history_days_setting() -> None:
     ) or ""
 
     assert 'self.history_days_spin.setSuffix(" 일")' in source_segment
-    assert 'self.history_days_spin.setToolTip("차트 로드와 백테스트에 사용할 히스토리 일수")' in source_segment
-    assert 'layout.addRow("차트/백테스트 일수", self.history_days_spin)' in source_segment
+    assert 'self.history_days_spin.setToolTip("백테스트와 최적화에 사용할 히스토리 일수")' in source_segment
+    assert 'layout.addRow("백테스트 일수", self.history_days_spin)' in source_segment
 
 
 def test_optimization_result_buffers_pending_backtests_when_preserving_lists() -> None:
@@ -478,18 +479,17 @@ def test_backtest_summary_moves_to_button_dialog_and_frees_chart_space() -> None
     assert 'QMessageBox.information(self, "백테스트 서머리", "표시할 백테스트 서머리가 없습니다.")' in show_source
 
 
-def test_chart_focus_settings_button_sits_above_chart_and_uses_popup_controls() -> None:
+def test_chart_focus_settings_controls_are_inline_above_chart() -> None:
     source = APP_PATH.read_text(encoding="utf-8")
     build_ui_source = ast.get_source_segment(source, _window_method_node("_build_ui")) or ""
-    ensure_source = ast.get_source_segment(source, _window_method_node("_ensure_auto_trade_focus_settings_window")) or ""
 
-    assert 'self.auto_trade_focus_settings_button = QPushButton("차트전환 설정")' in build_ui_source
-    assert "self.auto_trade_focus_settings_button.clicked.connect(self.show_auto_trade_focus_settings)" in build_ui_source
     assert "right_layout.addLayout(chart_header_row)" in build_ui_source
-    assert "self.auto_trade_focus_signal_check" not in build_ui_source
-    assert 'window = QWidget(None, windowTitle="차트전환 설정")' in ensure_source
-    assert 'mode_combo.addItem("예상진입신호", "preview")' in ensure_source
-    assert 'mode_combo.addItem("진입신호 확정", "confirmed")' in ensure_source
+    assert 'chart_header_row.addWidget(QLabel("차트 전환"))' in build_ui_source
+    assert 'self.auto_trade_focus_enable_check = QCheckBox("사용")' in build_ui_source
+    assert 'self.auto_trade_focus_mode_combo.addItem("예상진입신호", "preview")' in build_ui_source
+    assert 'self.auto_trade_focus_mode_combo.addItem("진입신호 확정", "confirmed")' in build_ui_source
+    assert 'chart_header_row.addWidget(QLabel("차트 표시"))' in build_ui_source
+    assert "self.chart_display_days_popup_spin = QSpinBox()" in build_ui_source
 
 
 def test_status_strip_uses_uniform_spacing_and_label_heights() -> None:

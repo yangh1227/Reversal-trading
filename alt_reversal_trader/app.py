@@ -337,23 +337,38 @@ def _initial_chart_bar_limit(interval: str) -> int:
     return max(INITIAL_CHART_BAR_FLOOR, visible_bars + INITIAL_CHART_WARMUP_BARS)
 
 
-def _slice_recent_ohlcv(frame: Optional[pd.DataFrame], interval: str, max_bars: Optional[int] = None) -> pd.DataFrame:
+def _slice_recent_ohlcv(
+    frame: Optional[pd.DataFrame],
+    interval: str,
+    max_bars: Optional[int] = None,
+    lookback_days: Optional[int] = None,
+) -> pd.DataFrame:
     if frame is None or frame.empty:
         return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
     limit = max_bars or _initial_chart_bar_limit(interval)
     prepared = prepare_ohlcv(frame.copy())
     if prepared.empty:
         return prepared
+    if lookback_days is not None and lookback_days > 0 and "time" in prepared.columns:
+        last_time = pd.Timestamp(prepared["time"].iloc[-1])
+        cutoff = last_time - pd.Timedelta(days=int(lookback_days))
+        sliced = prepared[pd.to_datetime(prepared["time"]) >= cutoff].reset_index(drop=True)
+        if not sliced.empty:
+            prepared = sliced
     return prepared.tail(limit).reset_index(drop=True)
 
 
-def _ohlcv_from_indicator_frame(frame: Optional[pd.DataFrame], interval: str) -> pd.DataFrame:
+def _ohlcv_from_indicator_frame(
+    frame: Optional[pd.DataFrame],
+    interval: str,
+    lookback_days: Optional[int] = None,
+) -> pd.DataFrame:
     if frame is None or frame.empty:
         return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
     columns = [column for column in ("time", "open", "high", "low", "close", "volume", "quote_volume") if column in frame.columns]
     if not columns:
         return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
-    return _slice_recent_ohlcv(frame[columns], interval)
+    return _slice_recent_ohlcv(frame[columns], interval, lookback_days=lookback_days)
 
 
 def _frame_matches_interval(frame: Optional[pd.DataFrame], interval: str) -> bool:
@@ -1101,12 +1116,22 @@ class SymbolLoadWorker(QThread):
             chart_history = self.chart_history
             chart_limit = _initial_chart_bar_limit(self.interval)
             if chart_history is None:
-                chart_history = _slice_recent_ohlcv(history, self.interval, max_bars=chart_limit)
+                chart_history = _slice_recent_ohlcv(
+                    history,
+                    self.interval,
+                    max_bars=chart_limit,
+                    lookback_days=self.settings.chart_display_days,
+                )
             else:
                 target_rows = min(max(len(chart_history), chart_limit), CHART_HISTORY_BAR_LIMIT)
                 chart_history = _merge_ohlcv_frames(
                     chart_history,
-                    _slice_recent_ohlcv(history, self.interval, max_bars=target_rows),
+                    _slice_recent_ohlcv(
+                        history,
+                        self.interval,
+                        max_bars=target_rows,
+                        lookback_days=self.settings.chart_display_days,
+                    ),
                     max_rows=target_rows,
                 )
             chart_history = prepare_ohlcv(chart_history)
@@ -1625,6 +1650,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_trade_focus_settings_window: Optional[QWidget] = None
         self.auto_trade_focus_enable_check: Optional[QCheckBox] = None
         self.auto_trade_focus_mode_combo: Optional[QComboBox] = None
+        self.chart_display_days_popup_spin: Optional[QSpinBox] = None
         self.chart_transition_overlay: Optional[QWidget] = None
         self.chart_transition_effect: Optional[QGraphicsOpacityEffect] = None
         self.chart_transition_animation: Optional[QPropertyAnimation] = None
@@ -1782,10 +1808,20 @@ class AltReversalTraderWindow(QMainWindow):
         self._set_balance_label_status("API 미입력")
         chart_header_row = QHBoxLayout()
         chart_header_row.setContentsMargins(0, 0, 0, 0)
+        chart_header_row.addWidget(QLabel("차트 전환"))
+        self.auto_trade_focus_enable_check = QCheckBox("사용")
+        chart_header_row.addWidget(self.auto_trade_focus_enable_check)
+        chart_header_row.addWidget(QLabel("기준"))
+        self.auto_trade_focus_mode_combo = QComboBox()
+        self.auto_trade_focus_mode_combo.addItem("예상진입신호", "preview")
+        self.auto_trade_focus_mode_combo.addItem("진입신호 확정", "confirmed")
+        chart_header_row.addWidget(self.auto_trade_focus_mode_combo)
+        chart_header_row.addWidget(QLabel("차트 표시"))
+        self.chart_display_days_popup_spin = QSpinBox()
+        self.chart_display_days_popup_spin.setRange(1, 30)
+        self.chart_display_days_popup_spin.setSuffix(" 일")
+        chart_header_row.addWidget(self.chart_display_days_popup_spin)
         chart_header_row.addStretch(1)
-        self.auto_trade_focus_settings_button = QPushButton("차트전환 설정")
-        self.auto_trade_focus_settings_button.clicked.connect(self.show_auto_trade_focus_settings)
-        chart_header_row.addWidget(self.auto_trade_focus_settings_button)
         self.chart_host = QWidget()
         self.chart_host_layout = QVBoxLayout(self.chart_host)
         self.chart_host_layout.setContentsMargins(0, 0, 0, 0)
@@ -2013,7 +2049,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.history_days_spin = QSpinBox()
         self.history_days_spin.setRange(1, 30)
         self.history_days_spin.setSuffix(" 일")
-        self.history_days_spin.setToolTip("차트 로드와 백테스트에 사용할 히스토리 일수")
+        self.history_days_spin.setToolTip("백테스트와 최적화에 사용할 히스토리 일수")
         self.scan_workers_spin = QSpinBox()
         self.scan_workers_spin.setRange(1, 24)
         self.auto_refresh_minutes_spin = QSpinBox()
@@ -2030,7 +2066,7 @@ class AltReversalTraderWindow(QMainWindow):
         layout.addRow("4h ATR% 필터", self.atr_4h_filter_check)
         layout.addRow("4h ATR% >=", self.atr_4h_spin)
         layout.addRow("백테스트 봉", self.interval_combo)
-        layout.addRow("차트/백테스트 일수", self.history_days_spin)
+        layout.addRow("백테스트 일수", self.history_days_spin)
         layout.addRow("스캔 워커", self.scan_workers_spin)
         layout.addRow("자동 갱신", self.auto_refresh_minutes_spin)
         return group
@@ -2705,6 +2741,8 @@ class AltReversalTraderWindow(QMainWindow):
             mode_index = self.auto_trade_focus_mode_combo.findData(settings.auto_trade_focus_signal_mode)
             if mode_index >= 0:
                 self.auto_trade_focus_mode_combo.setCurrentIndex(mode_index)
+        if self.chart_display_days_popup_spin is not None:
+            self.chart_display_days_popup_spin.setValue(int(settings.chart_display_days))
         self.fee_spin.setValue(settings.fee_rate * 100.0)
         self.simple_order_amount_spin.setValue(settings.simple_order_amount)
         if settings.order_mode == "simple":
@@ -2738,6 +2776,11 @@ class AltReversalTraderWindow(QMainWindow):
             simple_order_amount=float(self.simple_order_amount_spin.value()),
             fee_rate=float(self.fee_spin.value()) / 100.0,
             history_days=int(self.history_days_spin.value()),
+            chart_display_days=int(
+                self.chart_display_days_popup_spin.value()
+                if self.chart_display_days_popup_spin is not None
+                else self.settings.chart_display_days
+            ),
             auto_refresh_minutes=int(self.auto_refresh_minutes_spin.value()),
             auto_trade_use_favorable_price=bool(self.auto_trade_favorable_check.isChecked()),
             auto_trade_focus_on_signal=bool(
@@ -2792,6 +2835,10 @@ class AltReversalTraderWindow(QMainWindow):
             self.current_chart_indicators = None
             self.current_chart_snapshot = None
             self.price_precision_cache.clear()
+        if previous.chart_display_days != self.settings.chart_display_days:
+            self.chart_history_cache.clear()
+            self.chart_history_exhausted.clear()
+            self.current_chart_snapshot = None
         if previous != self.settings:
             self.backtest_cache.clear()
             self.chart_indicator_cache.clear()
@@ -3800,9 +3847,17 @@ class AltReversalTraderWindow(QMainWindow):
         cached_backtest: Optional[BacktestResult],
     ) -> Optional[pd.DataFrame]:
         if cached_history is not None and not cached_history.empty:
-            return _slice_recent_ohlcv(cached_history, interval)
+            return _slice_recent_ohlcv(
+                cached_history,
+                interval,
+                lookback_days=self.settings.chart_display_days,
+            )
         if cached_backtest is not None and not cached_backtest.indicators.empty:
-            return _ohlcv_from_indicator_frame(cached_backtest.indicators, interval)
+            return _ohlcv_from_indicator_frame(
+                cached_backtest.indicators,
+                interval,
+                lookback_days=self.settings.chart_display_days,
+            )
         return None
 
     def _sync_chart_indicator_cache(self, symbol: str) -> None:
@@ -6491,7 +6546,7 @@ class AltReversalTraderWindow(QMainWindow):
         if self.auto_trade_focus_settings_window is not None:
             return
         window = QWidget(None, windowTitle="차트전환 설정")
-        window.resize(320, 120)
+        window.resize(320, 160)
         layout = QFormLayout(window)
         enable_check = QCheckBox("자동매매 신호 시 차트 전환")
         enable_check.setChecked(bool(self.settings.auto_trade_focus_on_signal))
@@ -6501,11 +6556,17 @@ class AltReversalTraderWindow(QMainWindow):
         mode_index = mode_combo.findData(self.settings.auto_trade_focus_signal_mode)
         if mode_index >= 0:
             mode_combo.setCurrentIndex(mode_index)
+        chart_display_days_spin = QSpinBox()
+        chart_display_days_spin.setRange(1, 30)
+        chart_display_days_spin.setSuffix(" 일")
+        chart_display_days_spin.setValue(int(self.settings.chart_display_days))
         layout.addRow("사용", enable_check)
         layout.addRow("기준", mode_combo)
+        layout.addRow("차트 표시 일수", chart_display_days_spin)
         self.auto_trade_focus_settings_window = window
         self.auto_trade_focus_enable_check = enable_check
         self.auto_trade_focus_mode_combo = mode_combo
+        self.chart_display_days_popup_spin = chart_display_days_spin
 
     def show_auto_trade_focus_settings(self) -> None:
         self._ensure_auto_trade_focus_settings_window()
@@ -6515,10 +6576,12 @@ class AltReversalTraderWindow(QMainWindow):
             return
         assert self.auto_trade_focus_enable_check is not None
         assert self.auto_trade_focus_mode_combo is not None
+        assert self.chart_display_days_popup_spin is not None
         self.auto_trade_focus_enable_check.setChecked(bool(self.settings.auto_trade_focus_on_signal))
         mode_index = self.auto_trade_focus_mode_combo.findData(self.settings.auto_trade_focus_signal_mode)
         if mode_index >= 0:
             self.auto_trade_focus_mode_combo.setCurrentIndex(mode_index)
+        self.chart_display_days_popup_spin.setValue(int(self.settings.chart_display_days))
         self.auto_trade_focus_settings_window.show()
         self.auto_trade_focus_settings_window.raise_()
         self.auto_trade_focus_settings_window.activateWindow()

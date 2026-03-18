@@ -152,6 +152,7 @@ class AppSettings:
     simple_order_amount: float = 50.0
     fee_rate: float = 0.0005
     history_days: int = DEFAULT_HISTORY_DAYS
+    chart_display_days: int = DEFAULT_HISTORY_DAYS
     auto_refresh_minutes: int = 30
     auto_trade_use_favorable_price: bool = True
     auto_trade_focus_on_signal: bool = True
@@ -186,6 +187,7 @@ class AppSettings:
             self.order_mode = "compound"
         self.simple_order_amount = max(1.0, float(self.simple_order_amount))
         self.atr_4h_min_pct = max(0.0, float(self.atr_4h_min_pct))
+        self.chart_display_days = max(1, int(self.chart_display_days))
         if self.optimization_rank_mode not in OPTIMIZATION_RANK_MODE_OPTIONS:
             self.optimization_rank_mode = OPTIMIZATION_RANK_MODE_OPTIONS[0]
         self.optimization_min_score = max(0.0, float(self.optimization_min_score))
@@ -221,6 +223,7 @@ class AppSettings:
             "simple_order_amount": self.simple_order_amount,
             "fee_rate": self.fee_rate,
             "history_days": self.history_days,
+            "chart_display_days": self.chart_display_days,
             "auto_refresh_minutes": self.auto_refresh_minutes,
             "auto_trade_use_favorable_price": self.auto_trade_use_favorable_price,
             "auto_trade_focus_on_signal": self.auto_trade_focus_on_signal,
