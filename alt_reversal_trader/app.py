@@ -1612,6 +1612,9 @@ class AltReversalTraderWindow(QMainWindow):
         self.optimized_table_timer = QTimer(self)
         self.optimized_table_highlight_timer = QTimer(self)
         self.trade_engine_poll_timer = QTimer(self)
+        self.backtest_summary_text = ""
+        self.backtest_summary_window: Optional[QWidget] = None
+        self.backtest_summary_box: Optional[QPlainTextEdit] = None
         self.backtest_progress_total_cases = 0
         self.backtest_progress_completed_cases = 0
         self.backtest_progress_phase = "idle"
@@ -1697,12 +1700,15 @@ class AltReversalTraderWindow(QMainWindow):
 
         actions_row = QHBoxLayout()
         self.save_settings_button = QPushButton("설정 저장")
+        self.backtest_summary_button = QPushButton("백테스트 서머리")
         self.scan_button = QPushButton("후보 스캔 + 최적화")
         self.auto_trade_button = QPushButton()
         self.auto_trade_button.toggled.connect(self._toggle_auto_trade_mode)
         self.save_settings_button.clicked.connect(self.save_settings_with_feedback)
+        self.backtest_summary_button.clicked.connect(self.show_backtest_summary)
         self.scan_button.clicked.connect(self.run_scan_and_optimize)
         actions_row.addWidget(self.save_settings_button)
+        actions_row.addWidget(self.backtest_summary_button)
         actions_row.addWidget(self.scan_button)
         actions_row.addWidget(self.auto_trade_button)
         left_layout.addLayout(actions_row)
@@ -1718,36 +1724,55 @@ class AltReversalTraderWindow(QMainWindow):
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
-        summary_group = QGroupBox("Backtest Summary")
-        summary_layout = QVBoxLayout(summary_group)
-        self.summary_box = QPlainTextEdit()
-        self.summary_box.setReadOnly(True)
-        summary_layout.addWidget(self.summary_box)
-        right_layout.addWidget(summary_group, 2)
-
         balance_panel = QWidget()
         balance_layout = QHBoxLayout(balance_panel)
         balance_layout.setContentsMargins(8, 2, 8, 2)
+        balance_layout.setSpacing(12)
         status_strip_font_style = "font-weight: 700; font-size: 12px;"
         self.symbol_label = QLabel("종목: -")
         self.signal_label = QLabel("신호: -")
         self.current_price_label = QLabel("현재가: -")
         self.position_label = QLabel("포지션: -")
-        self.balance_label = QLabel("잔고: API 미입력")
-        self.balance_label.setStyleSheet(status_strip_font_style)
+        self.balance_label = QLabel("잔고:")
+        self.balance_label.setStyleSheet(f"color: #111827; {status_strip_font_style}")
+        self.balance_label.setFixedHeight(18)
         balance_layout.addWidget(self.balance_label)
+        self.balance_status_label = QLabel("API 미입력")
+        self.balance_status_label.setStyleSheet(f"color: #111827; {status_strip_font_style}")
+        self.balance_status_label.setFixedHeight(18)
+        balance_layout.addWidget(self.balance_status_label)
+        self.balance_equity_value_label = QLabel("")
+        self.balance_equity_value_label.setStyleSheet(f"color: #1546b0; {status_strip_font_style}")
+        self.balance_equity_value_label.setFixedHeight(18)
+        self.balance_equity_value_label.hide()
+        balance_layout.addWidget(self.balance_equity_value_label)
+        self.balance_equity_unit_label = QLabel("USDT | 가용")
+        self.balance_equity_unit_label.setStyleSheet(f"color: #111827; {status_strip_font_style}")
+        self.balance_equity_unit_label.setFixedHeight(18)
+        self.balance_equity_unit_label.hide()
+        balance_layout.addWidget(self.balance_equity_unit_label)
+        self.balance_available_value_label = QLabel("")
+        self.balance_available_value_label.setStyleSheet(f"color: #1546b0; {status_strip_font_style}")
+        self.balance_available_value_label.setFixedHeight(18)
+        self.balance_available_value_label.hide()
+        balance_layout.addWidget(self.balance_available_value_label)
+        self.balance_available_unit_label = QLabel("USDT")
+        self.balance_available_unit_label.setStyleSheet(f"color: #111827; {status_strip_font_style}")
+        self.balance_available_unit_label.setFixedHeight(18)
+        self.balance_available_unit_label.hide()
+        balance_layout.addWidget(self.balance_available_unit_label)
         self.chart_interval_label = QLabel("차트TF: -")
         self.chart_interval_label.setStyleSheet(f"color: #111827; {status_strip_font_style}")
-        balance_layout.addSpacing(12)
+        self.chart_interval_label.setFixedHeight(18)
         balance_layout.addWidget(self.chart_interval_label)
         self.bar_close_countdown_label = QLabel("봉마감: -")
         self.bar_close_countdown_label.setStyleSheet(f"color: #d63b53; {status_strip_font_style}")
-        balance_layout.addSpacing(12)
+        self.bar_close_countdown_label.setFixedHeight(18)
         balance_layout.addWidget(self.bar_close_countdown_label)
         self.optimization_chart_notice_label = QLabel("")
         self.optimization_chart_notice_label.setStyleSheet(f"color: #f59e0b; {status_strip_font_style}")
+        self.optimization_chart_notice_label.setFixedHeight(18)
         self.optimization_chart_notice_label.hide()
-        balance_layout.addSpacing(12)
         balance_layout.addWidget(self.optimization_chart_notice_label)
         balance_layout.addStretch(1)
         self._set_balance_label_status("API 미입력")
@@ -2162,8 +2187,8 @@ class AltReversalTraderWindow(QMainWindow):
     def _build_positions_group(self) -> QGroupBox:
         group = QGroupBox("Open Positions")
         layout = QVBoxLayout(group)
-        self.positions_table = QTableWidget(0, 7)
-        self.positions_table.setHorizontalHeaderLabels(["Symbol", "Side", "Amount USDT", "Entry", "UPnL", "수익률", "Action"])
+        self.positions_table = QTableWidget(0, 8)
+        self.positions_table.setHorizontalHeaderLabels(["Symbol", "Side", "Leverage", "Amount USDT", "Entry", "UPnL", "수익률", "Action"])
         self.positions_table.setSelectionBehavior(SELECT_ROWS)
         self.positions_table.setSelectionMode(SINGLE_SELECTION)
         self.positions_table.setEditTriggers(NO_EDIT_TRIGGERS)
@@ -5219,6 +5244,7 @@ class AltReversalTraderWindow(QMainWindow):
             [
                 self._position_symbol_text(position.symbol),
                 side,
+                f"{position.leverage}x",
                 f"{notional_usdt:.2f}",
                 entry_text,
                 f"{upnl_value:.2f}",
@@ -5258,11 +5284,11 @@ class AltReversalTraderWindow(QMainWindow):
     def _populate_position_row(self, row: int, position: PositionSnapshot) -> None:
         values, upnl_value, return_pct = self._position_display_values(position)
         for col, value in enumerate(values):
-            if col in (4, 5):
+            if col in (5, 6):
                 placeholder = QTableWidgetItem("")
                 placeholder.setData(USER_ROLE, position.symbol)
                 self.positions_table.setItem(row, col, placeholder)
-                metric_value = upnl_value if col == 4 else return_pct
+                metric_value = upnl_value if col == 5 else return_pct
                 widget = self._build_position_metric_widget(value, metric_value)
                 self.positions_table.setCellWidget(row, col, widget)
                 continue
@@ -5361,7 +5387,7 @@ class AltReversalTraderWindow(QMainWindow):
                 action_layout.addWidget(auto_button)
                 action_layout.addStretch(1)
 
-                self.positions_table.setCellWidget(row, 6, action_widget)
+                self.positions_table.setCellWidget(row, 7, action_widget)
                 self.position_close_buttons.append(button)
             self._set_position_close_buttons_enabled(not self._is_order_pending())
         finally:
@@ -6382,26 +6408,50 @@ class AltReversalTraderWindow(QMainWindow):
                 + (" (trimmed)" if optimization.trimmed_grid else "")
                 + f", {optimization.duration_seconds:.2f}s"
             )
-        self.summary_box.setPlainText("\n".join(lines))
+        self.backtest_summary_text = "\n".join(lines)
+        if self.backtest_summary_box is not None:
+            self.backtest_summary_box.setPlainText(self.backtest_summary_text)
 
-    def _balance_label_html(self, body: str) -> str:
-        return (
-            '<span style="color: #000000; font-weight: 700;">잔고:</span> '
-            f'<span style="color: #000000; font-weight: 700;">{body}</span>'
-        )
+    def show_backtest_summary(self) -> None:
+        if not self.backtest_summary_text.strip():
+            QMessageBox.information(self, "백테스트 서머리", "표시할 백테스트 서머리가 없습니다.")
+            return
+        if self.backtest_summary_window is not None and self.backtest_summary_window.isVisible():
+            self.backtest_summary_window.hide()
+            return
+        if self.backtest_summary_window is None:
+            window = QWidget(None, windowTitle="백테스트 서머리")
+            window.resize(520, 680)
+            layout = QVBoxLayout(window)
+            summary_box = QPlainTextEdit()
+            summary_box.setReadOnly(True)
+            layout.addWidget(summary_box)
+            self.backtest_summary_window = window
+            self.backtest_summary_box = summary_box
+        assert self.backtest_summary_box is not None
+        self.backtest_summary_box.setPlainText(self.backtest_summary_text)
+        self.backtest_summary_window.show()
+        self.backtest_summary_window.raise_()
+        self.backtest_summary_window.activateWindow()
 
     def _set_balance_label_status(self, status: str) -> None:
-        self.balance_label.setText(self._balance_label_html(status))
+        self.balance_status_label.setText(status)
+        self.balance_status_label.show()
+        self.balance_equity_value_label.hide()
+        self.balance_equity_unit_label.hide()
+        self.balance_available_value_label.hide()
+        self.balance_available_unit_label.hide()
 
     def _set_balance_label_values(self, equity: float, available: float) -> None:
-        body = (
-            'Equity <span style="color: #1546b0; font-weight: 700;">'
-            f"{equity:.2f}"
-            '</span> USDT | Available <span style="color: #1546b0; font-weight: 700;">'
-            f"{available:.2f}"
-            "</span> USDT"
-        )
-        self.balance_label.setText(self._balance_label_html(body))
+        self.balance_status_label.hide()
+        self.balance_equity_value_label.setText(f"{equity:.2f}")
+        self.balance_equity_unit_label.setText("USDT | 가용")
+        self.balance_available_value_label.setText(f"{available:.2f}")
+        self.balance_available_unit_label.setText("USDT")
+        self.balance_equity_value_label.show()
+        self.balance_equity_unit_label.show()
+        self.balance_available_value_label.show()
+        self.balance_available_unit_label.show()
 
     def _live_total_unrealized_pnl(self) -> float:
         return float(sum(float(position.unrealized_pnl) for position in self.open_positions))

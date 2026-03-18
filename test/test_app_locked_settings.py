@@ -415,3 +415,54 @@ def test_fallback_auto_trade_cycle_uses_shared_runtime_evaluator() -> None:
     assert "evaluate_auto_trade_candidate(" in source_segment
     assert "pick_auto_trade_candidate(" in source_segment
     assert "self._pick_auto_trade_candidate(" not in source_segment
+
+
+def test_positions_table_includes_leverage_column() -> None:
+    source = APP_PATH.read_text(encoding="utf-8")
+    display_source = ast.get_source_segment(source, _window_method_node("_position_display_values")) or ""
+    populate_source = ast.get_source_segment(source, _window_method_node("_populate_position_row")) or ""
+    update_source = ast.get_source_segment(source, _window_method_node("update_positions_table")) or ""
+
+    assert 'self.positions_table = QTableWidget(0, 8)' in source
+    assert '["Symbol", "Side", "Leverage", "Amount USDT", "Entry", "UPnL", "수익률", "Action"]' in source
+    assert 'f"{position.leverage}x"' in display_source
+    assert "if col in (5, 6):" in populate_source
+    assert "self.positions_table.setCellWidget(row, 7, action_widget)" in update_source
+
+
+def test_backtest_summary_moves_to_button_dialog_and_frees_chart_space() -> None:
+    source = APP_PATH.read_text(encoding="utf-8")
+    build_ui_source = ast.get_source_segment(source, _window_method_node("_build_ui")) or ""
+    update_source = ast.get_source_segment(source, _window_method_node("update_summary")) or ""
+    show_source = ast.get_source_segment(source, _window_method_node("show_backtest_summary")) or ""
+
+    assert 'self.backtest_summary_button = QPushButton("백테스트 서머리")' in build_ui_source
+    assert "self.backtest_summary_button.clicked.connect(self.show_backtest_summary)" in build_ui_source
+    assert "actions_row.addWidget(self.backtest_summary_button)" in build_ui_source
+    assert 'summary_group = QGroupBox("Backtest Summary")' not in build_ui_source
+    assert "self.summary_box" not in source
+    assert "self.backtest_summary_text = \"\\n\".join(lines)" in update_source
+    assert "self.backtest_summary_box.setPlainText(self.backtest_summary_text)" in update_source
+    assert "self.backtest_summary_window is not None and self.backtest_summary_window.isVisible()" in show_source
+    assert "self.backtest_summary_window.hide()" in show_source
+    assert 'QWidget(None, windowTitle="백테스트 서머리")' in show_source
+    assert 'QMessageBox.information(self, "백테스트 서머리", "표시할 백테스트 서머리가 없습니다.")' in show_source
+
+
+def test_status_strip_uses_uniform_spacing_and_label_heights() -> None:
+    build_ui_source = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_build_ui"),
+    ) or ""
+
+    assert "balance_layout.setSpacing(12)" in build_ui_source
+    assert "self.balance_label.setFixedHeight(18)" in build_ui_source
+    assert "self.balance_status_label = QLabel(" in build_ui_source
+    assert "self.balance_equity_value_label = QLabel(" in build_ui_source
+    assert 'self.balance_equity_value_label.setStyleSheet(f"color: #1546b0; {status_strip_font_style}")' in build_ui_source
+    assert "self.balance_available_value_label = QLabel(" in build_ui_source
+    assert 'self.balance_available_value_label.setStyleSheet(f"color: #1546b0; {status_strip_font_style}")' in build_ui_source
+    assert "self.chart_interval_label.setFixedHeight(18)" in build_ui_source
+    assert "self.bar_close_countdown_label.setFixedHeight(18)" in build_ui_source
+    assert "self.optimization_chart_notice_label.setFixedHeight(18)" in build_ui_source
+    assert "balance_layout.addSpacing(12)" not in build_ui_source
