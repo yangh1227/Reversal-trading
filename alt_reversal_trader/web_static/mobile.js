@@ -5,48 +5,50 @@ let lineSeries = {};
 let currentChartKey = "";
 let dashboardTimer = null;
 let chartTimer = null;
+let liveSocket = null;
+let liveSocketRetryTimer = null;
+let countdownTimer = null;
+let countdownDeadlineMs = null;
 
 const els = {
-  loginView:       document.getElementById("login-view"),
-  appView:         document.getElementById("app-view"),
-  loginUsername:   document.getElementById("login-username"),
-  loginPassword:   document.getElementById("login-password"),
-  loginSubmit:     document.getElementById("login-submit"),
-  loginError:      document.getElementById("login-error"),
-  serverUrls:      document.getElementById("server-urls"),
-  equityValue:     document.getElementById("equity-value"),
-  availableValue:  document.getElementById("available-value"),
-  currentSymbol:   document.getElementById("current-symbol"),
+  loginView: document.getElementById("login-view"),
+  appView: document.getElementById("app-view"),
+  loginUsername: document.getElementById("login-username"),
+  loginPassword: document.getElementById("login-password"),
+  loginSubmit: document.getElementById("login-submit"),
+  loginError: document.getElementById("login-error"),
+  serverUrls: document.getElementById("server-urls"),
+  equityValue: document.getElementById("equity-value"),
+  availableValue: document.getElementById("available-value"),
+  currentSymbol: document.getElementById("current-symbol"),
   currentInterval: document.getElementById("current-interval"),
-  barCountdown:    document.getElementById("bar-countdown"),
-  signalText:      document.getElementById("signal-text"),
-  favorableCount:  document.getElementById("favorable-count"),
-  favorableList:   document.getElementById("favorable-list"),
-  optimizedList:   document.getElementById("optimized-list"),
-  positionsList:   document.getElementById("positions-list"),
-  closeAllButton:  document.getElementById("close-all-button"),
+  barCountdown: document.getElementById("bar-countdown"),
+  signalText: document.getElementById("signal-text"),
+  favorableCount: document.getElementById("favorable-count"),
+  favorableList: document.getElementById("favorable-list"),
+  optimizedList: document.getElementById("optimized-list"),
+  positionsList: document.getElementById("positions-list"),
+  closeAllButton: document.getElementById("close-all-button"),
   autoTradeToggle: document.getElementById("auto-trade-toggle"),
-  chartContainer:  document.getElementById("chart-container"),
-  chartLoading:    document.getElementById("chart-loading"),
-  refreshButton:   document.getElementById("refresh-button"),
-  logoutButton:    document.getElementById("logout-button"),
-  simpleAmount:    document.getElementById("simple-amount"),
-  modeCompound:    document.getElementById("mode-compound"),
-  modeSimple:      document.getElementById("mode-simple"),
-  compoundOrders:  document.getElementById("compound-orders"),
-  simpleOrders:    document.getElementById("simple-orders"),
-  simpleLong:      document.getElementById("simple-long"),
-  simpleShort:     document.getElementById("simple-short"),
-  toastContainer:  document.getElementById("toast-container"),
+  chartContainer: document.getElementById("chart-container"),
+  chartLoading: document.getElementById("chart-loading"),
+  refreshButton: document.getElementById("refresh-button"),
+  logoutButton: document.getElementById("logout-button"),
+  simpleAmount: document.getElementById("simple-amount"),
+  modeCompound: document.getElementById("mode-compound"),
+  modeSimple: document.getElementById("mode-simple"),
+  compoundOrders: document.getElementById("compound-orders"),
+  simpleOrders: document.getElementById("simple-orders"),
+  simpleLong: document.getElementById("simple-long"),
+  simpleShort: document.getElementById("simple-short"),
+  toastContainer: document.getElementById("toast-container"),
 };
 
-// ── Toast ─────────────────────────────────────────────────────────────────────
-function showToast(msg, type = "info", duration = 3000) {
+function showToast(message, type = "info", duration = 3000) {
   const toast = document.createElement("div");
   toast.className = `toast toast-${type}`;
-  toast.textContent = msg;
+  toast.textContent = message;
   els.toastContainer.appendChild(toast);
-  // 이중 rAF으로 transition 발동
   requestAnimationFrame(() => requestAnimationFrame(() => toast.classList.add("show")));
   setTimeout(() => {
     toast.classList.remove("show");
@@ -54,7 +56,6 @@ function showToast(msg, type = "info", duration = 3000) {
   }, duration);
 }
 
-// ── API ───────────────────────────────────────────────────────────────────────
 function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
   if (csrfToken && options.method && options.method !== "GET") {
@@ -76,7 +77,6 @@ function api(path, options = {}) {
   });
 }
 
-// ── Chart ─────────────────────────────────────────────────────────────────────
 function showChartLoading(show) {
   if (els.chartLoading) {
     els.chartLoading.style.display = show ? "flex" : "none";
@@ -84,7 +84,9 @@ function showChartLoading(show) {
 }
 
 function initChart() {
-  if (chart) return;
+  if (chart) {
+    return;
+  }
   chart = LightweightCharts.createChart(els.chartContainer, {
     autoSize: true,
     layout: { background: { color: "#0b1220" }, textColor: "#d1d5db" },
@@ -102,11 +104,25 @@ function initChart() {
   });
   lineSeries = {
     supertrend: chart.addLineSeries({ color: "#00d2ff", lineWidth: 2 }),
-    zone2:      chart.addLineSeries({ color: "#d4a62a", lineWidth: 1 }),
-    zone3:      chart.addLineSeries({ color: "#d36b6b", lineWidth: 1 }),
-    emaFast:    chart.addLineSeries({ color: "#9ed8f2", lineWidth: 1 }),
-    emaSlow:    chart.addLineSeries({ color: "#e3d995", lineWidth: 1 }),
+    zone2: chart.addLineSeries({ color: "#d4a62a", lineWidth: 1 }),
+    zone3: chart.addLineSeries({ color: "#d36b6b", lineWidth: 1 }),
+    emaFast: chart.addLineSeries({ color: "#9ed8f2", lineWidth: 1 }),
+    emaSlow: chart.addLineSeries({ color: "#e3d995", lineWidth: 1 }),
   };
+}
+
+function applyPriceFormat(format) {
+  if (!format || !candleSeries) {
+    return;
+  }
+  const precision = Number(format.precision);
+  const minMove = Number(format.minMove);
+  if (!Number.isFinite(precision) || !Number.isFinite(minMove) || precision < 0 || minMove <= 0) {
+    return;
+  }
+  const priceFormat = { type: "price", precision, minMove };
+  candleSeries.applyOptions({ priceFormat });
+  Object.values(lineSeries).forEach((series) => series.applyOptions({ priceFormat }));
 }
 
 function toUnix(timeText) {
@@ -114,7 +130,7 @@ function toUnix(timeText) {
 }
 
 function markerShape(shape) {
-  if (shape === "arrow_up")   return "arrowUp";
+  if (shape === "arrow_up") return "arrowUp";
   if (shape === "arrow_down") return "arrowDown";
   return "circle";
 }
@@ -123,43 +139,112 @@ function markerPosition(position) {
   return position === "below" ? "belowBar" : "aboveBar";
 }
 
+function applyChartPayload(payload, options = {}) {
+  if (!payload || !payload.ready) {
+    return;
+  }
+  initChart();
+  applyPriceFormat(payload.priceFormat);
+  candleSeries.setData(
+    (payload.candles || []).map((candle) => ({
+      time: toUnix(candle.time),
+      open: candle.open,
+      high: candle.high,
+      low: candle.low,
+      close: candle.close,
+    }))
+  );
+  lineSeries.supertrend.setData(
+    (payload.indicators?.supertrend || [])
+      .filter((item) => item.value !== null)
+      .map((item) => ({ time: toUnix(item.time), value: item.value }))
+  );
+  lineSeries.zone2.setData(
+    (payload.indicators?.zone2 || [])
+      .filter((item) => item.value !== null)
+      .map((item) => ({ time: toUnix(item.time), value: item.value }))
+  );
+  lineSeries.zone3.setData(
+    (payload.indicators?.zone3 || [])
+      .filter((item) => item.value !== null)
+      .map((item) => ({ time: toUnix(item.time), value: item.value }))
+  );
+  lineSeries.emaFast.setData(
+    (payload.indicators?.emaFast || [])
+      .filter((item) => item.value !== null)
+      .map((item) => ({ time: toUnix(item.time), value: item.value }))
+  );
+  lineSeries.emaSlow.setData(
+    (payload.indicators?.emaSlow || [])
+      .filter((item) => item.value !== null)
+      .map((item) => ({ time: toUnix(item.time), value: item.value }))
+  );
+  candleSeries.setMarkers(
+    (payload.markers || [])
+      .filter((marker) => marker.time)
+      .map((marker) => ({
+        time: toUnix(marker.time),
+        position: markerPosition(marker.position),
+        shape: markerShape(marker.shape),
+        color: marker.color,
+        text: marker.text || "",
+      }))
+  );
+  if (options.fitContent) {
+    chart.timeScale().fitContent();
+  }
+}
+
 async function refreshChart(force = false) {
   const dashboard = window.__dashboardState;
-  if (!dashboard?.current?.symbol) return;
+  if (!dashboard?.current?.symbol) {
+    return;
+  }
   const chartKey = `${dashboard.current.symbol}:${dashboard.current.interval}:${dashboard.current.chartVersion || ""}`;
-  if (!force && chartKey === currentChartKey) return;
+  if (!force && chartKey === currentChartKey) {
+    return;
+  }
   initChart();
   showChartLoading(true);
   try {
     const payload = await api("/api/chart/current");
-    if (!payload.ready) return;
+    if (!payload.ready) {
+      return;
+    }
     currentChartKey = chartKey;
-    candleSeries.setData(payload.candles.map((c) => ({
-      time:  toUnix(c.time),
-      open:  c.open,
-      high:  c.high,
-      low:   c.low,
-      close: c.close,
-    })));
-    lineSeries.supertrend.setData(payload.indicators.supertrend.filter((x) => x.value !== null).map((x) => ({ time: toUnix(x.time), value: x.value })));
-    lineSeries.zone2.setData(     payload.indicators.zone2.filter(     (x) => x.value !== null).map((x) => ({ time: toUnix(x.time), value: x.value })));
-    lineSeries.zone3.setData(     payload.indicators.zone3.filter(     (x) => x.value !== null).map((x) => ({ time: toUnix(x.time), value: x.value })));
-    lineSeries.emaFast.setData(   payload.indicators.emaFast.filter(   (x) => x.value !== null).map((x) => ({ time: toUnix(x.time), value: x.value })));
-    lineSeries.emaSlow.setData(   payload.indicators.emaSlow.filter(   (x) => x.value !== null).map((x) => ({ time: toUnix(x.time), value: x.value })));
-    candleSeries.setMarkers(payload.markers.filter((m) => m.time).map((m) => ({
-      time:     toUnix(m.time),
-      position: markerPosition(m.position),
-      shape:    markerShape(m.shape),
-      color:    m.color,
-      text:     m.text || "",
-    })));
-    chart.timeScale().fitContent();
+    applyChartPayload(payload, { fitContent: true });
   } finally {
     showChartLoading(false);
   }
 }
 
-// ── Render helpers ────────────────────────────────────────────────────────────
+function renderCountdown(deadlineMs) {
+  if (!deadlineMs || !Number.isFinite(deadlineMs)) {
+    els.barCountdown.textContent = "-";
+    return;
+  }
+  const remainingSeconds = Math.max(0, Math.floor((deadlineMs - Date.now()) / 1000));
+  const hours = Math.floor(remainingSeconds / 3600);
+  const minutes = Math.floor((remainingSeconds % 3600) / 60);
+  const seconds = remainingSeconds % 60;
+  els.barCountdown.textContent = hours > 0
+    ? `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
+    : `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function startCountdown(deadlineMs) {
+  countdownDeadlineMs = Number(deadlineMs) || null;
+  if (countdownTimer) {
+    clearInterval(countdownTimer);
+    countdownTimer = null;
+  }
+  renderCountdown(countdownDeadlineMs);
+  if (!countdownDeadlineMs) {
+    return;
+  }
+  countdownTimer = setInterval(() => renderCountdown(countdownDeadlineMs), 1000);
+}
+
 function renderFavorable(symbols) {
   els.favorableList.innerHTML = "";
   els.favorableCount.textContent = String(symbols.length);
@@ -176,9 +261,9 @@ function renderFavorable(symbols) {
   });
 }
 
-function parseUpnlNum(upnlStr) {
-  const n = parseFloat(String(upnlStr).replace(/[^\d.\-+]/g, ""));
-  return isNaN(n) ? 0 : n;
+function parseUpnlNum(upnl) {
+  const value = parseFloat(String(upnl).replace(/[^\d.\-+]/g, ""));
+  return Number.isNaN(value) ? 0 : value;
 }
 
 function renderOptimized(items) {
@@ -191,7 +276,7 @@ function renderOptimized(items) {
         <strong>${item.symbol}</strong>
         <span class="interval-badge">${item.interval}</span>
       </div>
-      <div class="list-meta">Score ${item.score} &nbsp;·&nbsp; Return ${item.returnPct}% &nbsp;·&nbsp; MDD ${item.mddPct}% &nbsp;·&nbsp; Trades ${item.trades}</div>
+      <div class="list-meta">Score ${item.score} · Return ${item.returnPct}% · MDD ${item.mddPct}% · Trades ${item.trades}</div>
       <div class="list-meta">${item.currentPrice ? `현재가 ${item.currentPrice}` : "현재가 -"}</div>
       <div class="list-actions">
         <button class="ghost">차트 보기</button>
@@ -210,11 +295,11 @@ function renderPositions(items) {
   }
   items.forEach((item) => {
     const row = document.createElement("div");
-    const isLong   = /BUY|LONG/i.test(String(item.side));
-    const sideKey  = isLong ? "long"  : "short";
+    const isLong = /BUY|LONG/i.test(String(item.side));
+    const sideKey = isLong ? "long" : "short";
     const sideLabel = isLong ? "LONG" : "SHORT";
-    const upnlNum  = parseUpnlNum(item.upnl);
-    const upnlCls  = upnlNum >= 0 ? "positive" : "negative";
+    const upnlNum = parseUpnlNum(item.upnl);
+    const upnlCls = upnlNum >= 0 ? "positive" : "negative";
 
     row.className = `list-item ${sideKey}-pos`;
     row.innerHTML = `
@@ -222,10 +307,10 @@ function renderPositions(items) {
         <strong>${item.symbol}</strong>
         <span class="side-badge ${sideKey}">${sideLabel} ${item.leverage}</span>
       </div>
-      <div class="list-meta">진입 ${item.entryPrice} &nbsp;·&nbsp; ${item.amountUsdt} USDT</div>
+      <div class="list-meta">진입 ${item.entryPrice} · ${item.amountUsdt} USDT</div>
       <div class="list-meta">
         <span class="upnl ${upnlCls}">UPnL ${item.upnl}</span>
-        &nbsp;·&nbsp; ${item.returnPct}%
+        · ${item.returnPct}%
       </div>
       <div class="list-actions">
         <button class="danger">청산</button>
@@ -245,38 +330,78 @@ function renderPositions(items) {
   });
 }
 
-// ── Dashboard refresh ─────────────────────────────────────────────────────────
-async function refreshDashboard(forceChart = false) {
-  const state = await api("/api/dashboard");
+function applyDashboardState(state) {
   window.__dashboardState = state;
-
-  els.serverUrls.textContent      = state.serverUrls.join("  |  ");
-  els.equityValue.textContent     = state.balance.equity    == null ? "-" : `${state.balance.equity.toFixed(2)} USDT`;
-  els.availableValue.textContent  = state.balance.available == null ? "-" : `${state.balance.available.toFixed(2)} USDT`;
-  els.currentSymbol.textContent   = state.current.symbol   || "차트 로드 중";
+  els.serverUrls.textContent = (state.serverUrls || []).join("  |  ");
+  els.equityValue.textContent = state.balance.equity == null ? "-" : `${state.balance.equity.toFixed(2)} USDT`;
+  els.availableValue.textContent = state.balance.available == null ? "-" : `${state.balance.available.toFixed(2)} USDT`;
+  els.currentSymbol.textContent = state.current.symbol || "차트 로드 중";
   els.currentInterval.textContent = state.current.interval || "-";
-  els.barCountdown.textContent    = state.current.countdown || "-";
+  startCountdown(state.current.barCloseDeadlineMs);
 
-  // Signal text + 색상
-  const sig = state.current.signalText || "";
-  els.signalText.textContent = sig;
-  els.signalText.className   = "signal-text" +
-    (/LONG|롱|매수/i.test(sig)  ? " sig-long"  :
-     /SHORT|숏|매도/i.test(sig) ? " sig-short" : "");
+  const signal = state.current.signalText || "";
+  els.signalText.textContent = signal;
+  els.signalText.className = "signal-text" +
+    (/LONG|롱|매수/i.test(signal) ? " sig-long" :
+      /SHORT|숏|매도/i.test(signal) ? " sig-short" : "");
 
   els.autoTradeToggle.checked = !!state.autoTradeEnabled;
-  els.simpleAmount.value      = state.simpleOrderAmount ?? 50;
+  els.simpleAmount.value = state.simpleOrderAmount ?? 50;
 
   renderFavorable(state.favorableSymbols || []);
-  renderOptimized(state.optimized        || []);
-  renderPositions(state.positions        || []);
+  renderOptimized(state.optimized || []);
+  renderPositions(state.positions || []);
+}
+
+async function refreshDashboard(forceChart = false) {
+  const state = await api("/api/dashboard");
+  applyDashboardState(state);
   await refreshChart(forceChart);
 }
 
-// ── Auth ──────────────────────────────────────────────────────────────────────
+function connectLiveSocket() {
+  if (liveSocket && (liveSocket.readyState === WebSocket.OPEN || liveSocket.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+  if (liveSocketRetryTimer) {
+    clearTimeout(liveSocketRetryTimer);
+    liveSocketRetryTimer = null;
+  }
+  const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+  liveSocket = new WebSocket(`${scheme}://${window.location.host}/ws/live`);
+
+  liveSocket.onmessage = (event) => {
+    const payload = JSON.parse(event.data || "{}");
+    if (payload.type === "dashboard" && payload.data) {
+      applyDashboardState(payload.data);
+      return;
+    }
+    if (payload.type === "chart" && payload.data) {
+      currentChartKey = `${payload.data.symbol || ""}:${payload.data.interval || ""}:${window.__dashboardState?.current?.chartVersion || ""}`;
+      showChartLoading(false);
+      applyChartPayload(payload.data, { fitContent: false });
+    }
+  };
+
+  liveSocket.onclose = () => {
+    liveSocket = null;
+    liveSocketRetryTimer = setTimeout(() => {
+      if (!els.appView.classList.contains("hidden")) {
+        connectLiveSocket();
+      }
+    }, 2000);
+  };
+
+  liveSocket.onerror = () => {
+    if (liveSocket) {
+      liveSocket.close();
+    }
+  };
+}
+
 function showLogin(show) {
   els.loginView.classList.toggle("hidden", !show);
-  els.appView.classList.toggle("hidden",  show);
+  els.appView.classList.toggle("hidden", show);
 }
 
 async function login() {
@@ -292,7 +417,7 @@ async function login() {
     csrfToken = payload.csrfToken;
     showLogin(false);
     await refreshDashboard(true);
-    startPolling();
+    connectLiveSocket();
   } catch (error) {
     els.loginError.textContent = error.message;
   }
@@ -301,45 +426,58 @@ async function login() {
 async function bootstrap() {
   try {
     const payload = await api("/api/me");
-    if (!payload.authenticated) { showLogin(true); return; }
+    if (!payload.authenticated) {
+      showLogin(true);
+      return;
+    }
     csrfToken = payload.csrfToken;
     showLogin(false);
     await refreshDashboard(true);
-    startPolling();
+    connectLiveSocket();
   } catch {
     showLogin(true);
   }
 }
 
-// ── Polling ───────────────────────────────────────────────────────────────────
 function startPolling() {
   stopPolling();
   dashboardTimer = setInterval(() => refreshDashboard(false).catch(console.error), 2000);
-  chartTimer     = setInterval(() => refreshChart(false).catch(console.error),     5000);
+  chartTimer = setInterval(() => refreshChart(false).catch(console.error), 5000);
 }
 
 function stopPolling() {
   if (dashboardTimer) clearInterval(dashboardTimer);
-  if (chartTimer)     clearInterval(chartTimer);
+  if (chartTimer) clearInterval(chartTimer);
+  if (countdownTimer) clearInterval(countdownTimer);
+  if (liveSocketRetryTimer) clearTimeout(liveSocketRetryTimer);
+  if (liveSocket) {
+    liveSocket.onclose = null;
+    liveSocket.close();
+  }
   dashboardTimer = null;
-  chartTimer     = null;
+  chartTimer = null;
+  countdownTimer = null;
+  liveSocketRetryTimer = null;
+  liveSocket = null;
 }
 
 async function logout() {
   await api("/api/logout", { method: "POST" });
   stopPolling();
   csrfToken = null;
+  currentChartKey = "";
+  countdownDeadlineMs = null;
   showLogin(true);
 }
 
-// ── Trading actions ───────────────────────────────────────────────────────────
 async function selectSymbol(symbol, interval = "") {
   await api("/api/chart/select", {
     method: "POST",
     body: JSON.stringify({ symbol, interval }),
   });
   currentChartKey = "";
-  setTimeout(() => refreshDashboard(true).catch(console.error), 400);
+  showChartLoading(true);
+  setTimeout(() => refreshDashboard(true).catch((error) => showToast(error.message, "error")), 250);
 }
 
 async function submitFractional(side, fraction) {
@@ -355,10 +493,10 @@ async function submitSimple(side) {
   await api("/api/order/simple", {
     method: "POST",
     body: JSON.stringify({
-      symbol:   current.symbol,
+      symbol: current.symbol,
       interval: current.interval,
       side,
-      amount:   Number(els.simpleAmount.value || 0),
+      amount: Number(els.simpleAmount.value || 0),
     }),
   });
 }
@@ -387,12 +525,11 @@ async function toggleAutoTrade(enabled) {
 
 function setOrderMode(mode) {
   els.modeCompound.classList.toggle("active", mode === "compound");
-  els.modeSimple.classList.toggle("active",   mode === "simple");
+  els.modeSimple.classList.toggle("active", mode === "simple");
   els.compoundOrders.classList.toggle("hidden", mode !== "compound");
-  els.simpleOrders.classList.toggle("hidden",   mode !== "simple");
+  els.simpleOrders.classList.toggle("hidden", mode !== "simple");
 }
 
-// ── Event listeners ───────────────────────────────────────────────────────────
 document.querySelectorAll("[data-fraction]").forEach((button) => {
   button.addEventListener("click", () =>
     submitFractional(button.dataset.side, Number(button.dataset.fraction))
@@ -414,7 +551,9 @@ els.simpleShort.addEventListener("click", () =>
 );
 
 els.closeAllButton.addEventListener("click", () => {
-  if (!confirm("모든 포지션을 청산하시겠습니까?")) return;
+  if (!confirm("모든 포지션을 청산하시겠습니까?")) {
+    return;
+  }
   closeAll()
     .then(() => showToast("전체 청산 완료", "success"))
     .catch((error) => showToast(error.message, "error"));
@@ -427,7 +566,7 @@ els.autoTradeToggle.addEventListener("change", (event) =>
 );
 
 els.modeCompound.addEventListener("click", () => setOrderMode("compound"));
-els.modeSimple.addEventListener("click",   () => setOrderMode("simple"));
+els.modeSimple.addEventListener("click", () => setOrderMode("simple"));
 
 els.refreshButton.addEventListener("click", () =>
   refreshDashboard(true).catch((error) => showToast(error.message, "error"))
@@ -439,12 +578,14 @@ els.logoutButton.addEventListener("click", () =>
 
 els.loginSubmit.addEventListener("click", () => login());
 
-// Enter key on login inputs
-[els.loginUsername, els.loginPassword].forEach((el) =>
-  el.addEventListener("keydown", (e) => { if (e.key === "Enter") login(); })
+[els.loginUsername, els.loginPassword].forEach((element) =>
+  element.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      login();
+    }
+  })
 );
 
-// ── Bootstrap ─────────────────────────────────────────────────────────────────
 bootstrap().catch((error) => {
   els.loginError.textContent = error.message;
   showLogin(true);

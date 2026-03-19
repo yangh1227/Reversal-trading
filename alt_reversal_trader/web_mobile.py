@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
 import secrets
 import socket
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
@@ -59,6 +60,30 @@ def _serialize_series_frame(frame: pd.DataFrame, value_column: str) -> list[dict
         for _, row in frame.iterrows()
         if row.get("time") is not None
     ]
+
+
+def _decimal_places(value: object) -> int:
+    if value is None or pd.isna(value):
+        return 0
+    try:
+        text = f"{float(value):.12f}".rstrip("0").rstrip(".")
+    except Exception:
+        return 0
+    if "." not in text:
+        return 0
+    return len(text.split(".", 1)[1])
+
+
+def _price_format_from_frames(candle_df: pd.DataFrame, indicators: pd.DataFrame) -> dict[str, object]:
+    precision = 0
+    for column in ("open", "high", "low", "close"):
+        if column in candle_df.columns:
+            precision = max(precision, max((_decimal_places(v) for v in candle_df[column].tail(300)), default=0))
+    for column in ("supertrend", "zone2_line", "zone3_line", "ema_fast", "ema_slow"):
+        if column in indicators.columns:
+            precision = max(precision, max((_decimal_places(v) for v in indicators[column].tail(300)), default=0))
+    precision = max(precision, 2)
+    return {"precision": precision, "minMove": 10 ** (-precision)}
 
 
 def _safe_port(start_port: int = WEB_DEFAULT_PORT) -> int:
@@ -198,7 +223,7 @@ class MobileWebServer:
                 "script-src 'self'; "
                 "style-src 'self' 'unsafe-inline'; "
                 "img-src 'self' data:; "
-                "connect-src 'self'; "
+                "connect-src 'self' ws: wss:; "
                 "font-src 'self' data:; "
                 "frame-ancestors 'none'; "
                 "base-uri 'self'; "
@@ -276,6 +301,29 @@ class MobileWebServer:
             self._require_session(request)
             return JSONResponse(self.invoker.call(self._build_current_chart_payload))
 
+        @app.websocket("/ws/live")
+        async def ws_live(websocket: WebSocket) -> None:
+            session = self._session_from_websocket(websocket)
+            if session is None:
+                await websocket.close(code=4401)
+                return
+            origin = str(websocket.headers.get("origin", "")).strip()
+            if origin:
+                expected_origin = f"{websocket.url.scheme.replace('ws', 'http')}://{websocket.headers.get('host', '')}".rstrip("/")
+                if origin.rstrip("/") != expected_origin:
+                    await websocket.close(code=4403)
+                    return
+            await websocket.accept()
+            try:
+                while True:
+                    dashboard = self.invoker.call(self._build_dashboard_state)
+                    chart = self.invoker.call(self._build_current_chart_payload)
+                    await websocket.send_json({"type": "dashboard", "data": dashboard})
+                    await websocket.send_json({"type": "chart", "data": chart})
+                    await asyncio.sleep(1.0)
+            except WebSocketDisconnect:
+                return
+
         @app.post("/api/chart/select")
         async def api_chart_select(request: Request) -> JSONResponse:
             self._require_session(request, require_csrf=True)
@@ -340,6 +388,13 @@ class MobileWebServer:
 
     def _session_from_request(self, request: Request) -> Optional[_SessionState]:
         token = request.cookies.get(WEB_SESSION_COOKIE, "")
+        return self._session_from_token(token)
+
+    def _session_from_websocket(self, websocket: WebSocket) -> Optional[_SessionState]:
+        token = websocket.cookies.get(WEB_SESSION_COOKIE, "")
+        return self._session_from_token(token)
+
+    def _session_from_token(self, token: str) -> Optional[_SessionState]:
         if not token:
             return None
         session = self._sessions.get(token)
@@ -395,7 +450,7 @@ class MobileWebServer:
         self._price_cache_at = now
         return dict(self._price_cache)
 
-    def _current_countdown(self) -> Optional[str]:
+    def _current_bar_close_deadline_ms(self) -> Optional[int]:
         symbol = self.window.current_symbol
         if not symbol:
             return None
@@ -403,9 +458,14 @@ class MobileWebServer:
         if chart_history is None or chart_history.empty:
             return None
         latest_time = pd.Timestamp(chart_history["time"].iloc[-1])
-        now = pd.Timestamp.now().tz_localize(None)
         bar_end = latest_time + pd.Timedelta(milliseconds=_interval_to_ms(self.window.current_interval))
-        remaining_seconds = max(0, int((bar_end - now).total_seconds()))
+        return int(bar_end.timestamp() * 1000)
+
+    def _current_countdown(self) -> Optional[str]:
+        deadline_ms = self._current_bar_close_deadline_ms()
+        if deadline_ms is None:
+            return None
+        remaining_seconds = max(0, int((deadline_ms - int(time.time() * 1000)) / 1000))
         hours, remainder = divmod(remaining_seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
         if hours:
@@ -467,6 +527,7 @@ class MobileWebServer:
                 "symbol": self.window.current_symbol,
                 "interval": self.window.current_interval,
                 "countdown": self._current_countdown(),
+                "barCloseDeadlineMs": self._current_bar_close_deadline_ms(),
                 "signalText": self.window.signal_label.text() if hasattr(self.window, "signal_label") else "",
                 "chartVersion": repr(self.window.chart_render_signature),
             },
@@ -498,6 +559,7 @@ class MobileWebServer:
             "ready": True,
             "symbol": symbol,
             "interval": interval,
+            "priceFormat": _price_format_from_frames(candle_df, indicators),
             "candles": [
                 {
                     "time": _serialize_timestamp(row["time"]),
