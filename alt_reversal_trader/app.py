@@ -826,6 +826,7 @@ class ScanWorker(QThread):
 
 class OptimizeWorker(QThread):
     progress = Signal(str)
+    phase_update = Signal(object)
     case_plan = Signal(object)
     result_ready = Signal(object)
     completed = Signal()
@@ -861,6 +862,13 @@ class OptimizeWorker(QThread):
     def run(self) -> None:
         try:
             process_count = max(1, min(int(self.settings.optimize_processes), len(self.candidates) or 1))
+            self.phase_update.emit(
+                {
+                    "phase": "optimize_start",
+                    "total_candidates": len(self.candidates),
+                    "process_count": process_count,
+                }
+            )
             self.progress.emit(f"최적화 워커 시작: 종목 {len(self.candidates)}개, 프로세스 {process_count}개")
             if process_count <= 1 or len(self.candidates) <= 1:
                 self._run_sequential()
@@ -883,6 +891,14 @@ class OptimizeWorker(QThread):
         for index, candidate in enumerate(self.candidates, start=1):
             if self.isInterruptionRequested():
                 return
+            self.phase_update.emit(
+                {
+                    "phase": "history_loading",
+                    "candidate": candidate.symbol,
+                    "index": index,
+                    "total_candidates": len(self.candidates),
+                }
+            )
             self.progress.emit(
                 f"[{index}/{len(self.candidates)}] {candidate.symbol} "
                 f"{self.settings.history_days}일 백테스트 + 웜업 K라인 로드"
@@ -891,7 +907,26 @@ class OptimizeWorker(QThread):
             if not histories:
                 self.progress.emit(f"{candidate.symbol}: 히스토리 없음")
                 continue
+            self.phase_update.emit(
+                {
+                    "phase": "history_ready",
+                    "candidate": candidate.symbol,
+                    "index": index,
+                    "total_candidates": len(self.candidates),
+                    "cases": len(histories),
+                }
+            )
             self.case_plan.emit({"candidate": candidate.symbol, "cases": len(histories)})
+            self.phase_update.emit(
+                {
+                    "phase": "case_running",
+                    "candidate": candidate.symbol,
+                    "index": index,
+                    "total_candidates": len(self.candidates),
+                    "active_jobs": 1,
+                    "process_count": 1,
+                }
+            )
             interval_results = optimize_symbol_interval_results(
                 symbol=candidate.symbol,
                 histories_by_interval=histories,
@@ -949,6 +984,14 @@ class OptimizeWorker(QThread):
             terminated = True
 
         def submit_one(candidate: CandidateSymbol, index: int) -> bool:
+            self.phase_update.emit(
+                {
+                    "phase": "history_loading",
+                    "candidate": candidate.symbol,
+                    "index": index,
+                    "total_candidates": len(self.candidates),
+                }
+            )
             self.progress.emit(
                 f"[{index}/{len(self.candidates)}] {candidate.symbol} "
                 f"{self.settings.history_days}일 백테스트 + 웜업 K라인 로드"
@@ -957,6 +1000,15 @@ class OptimizeWorker(QThread):
             if not histories:
                 self.progress.emit(f"{candidate.symbol}: 히스토리 없음")
                 return False
+            self.phase_update.emit(
+                {
+                    "phase": "history_ready",
+                    "candidate": candidate.symbol,
+                    "index": index,
+                    "total_candidates": len(self.candidates),
+                    "cases": len(histories),
+                }
+            )
             self.case_plan.emit({"candidate": candidate.symbol, "cases": len(histories)})
             job = pool.apply_async(
                 optimize_symbol_interval_results,
@@ -973,8 +1025,18 @@ class OptimizeWorker(QThread):
                     "rank_mode": self.settings.optimization_rank_mode,
                         "backtest_start_time": backtest_start_time,
                     },
-                )
+            )
             active_jobs.append((candidate, job))
+            self.phase_update.emit(
+                {
+                    "phase": "case_running",
+                    "candidate": candidate.symbol,
+                    "index": index,
+                    "total_candidates": len(self.candidates),
+                    "active_jobs": len(active_jobs),
+                    "process_count": process_count,
+                }
+            )
             self.progress.emit(f"{candidate.symbol}: 프로세스 최적화 시작 ({len(active_jobs)}/{process_count})")
             return True
 
@@ -1628,6 +1690,9 @@ class AltReversalTraderWindow(QMainWindow):
         self.backtest_summary_box: Optional[QPlainTextEdit] = None
         self.backtest_progress_total_cases = 0
         self.backtest_progress_completed_cases = 0
+        self.backtest_progress_total_candidates = 0
+        self.backtest_progress_prepared_candidates = 0
+        self.backtest_progress_status_text = ""
         self.backtest_progress_phase = "idle"
         self.parameter_editors: Dict[str, object] = {}
         self.parameter_opt_boxes: Dict[str, QCheckBox] = {}
@@ -5735,6 +5800,9 @@ class AltReversalTraderWindow(QMainWindow):
         self.backtest_progress_phase = "idle"
         self.backtest_progress_total_cases = 0
         self.backtest_progress_completed_cases = 0
+        self.backtest_progress_total_candidates = 0
+        self.backtest_progress_prepared_candidates = 0
+        self.backtest_progress_status_text = text
         self.backtest_progress_label.setText(text)
         self.backtest_progress_bar.setRange(0, 1)
         self.backtest_progress_bar.setValue(0)
@@ -5744,17 +5812,70 @@ class AltReversalTraderWindow(QMainWindow):
         self.backtest_progress_phase = "scan"
         self.backtest_progress_total_cases = 0
         self.backtest_progress_completed_cases = 0
+        self.backtest_progress_total_candidates = 0
+        self.backtest_progress_prepared_candidates = 0
+        self.backtest_progress_status_text = "후보 스캔중..."
         self.backtest_progress_label.setText("후보 스캔중...")
         self.backtest_progress_bar.setRange(0, 0)
         self.backtest_progress_bar.setFormat("스캔중")
 
-    def _begin_backtest_progress(self) -> None:
+    def _begin_backtest_progress(self, total_candidates: int) -> None:
         self.backtest_progress_phase = "optimize"
         self.backtest_progress_total_cases = 0
         self.backtest_progress_completed_cases = 0
-        self.backtest_progress_label.setText("백테스트중 0/0")
-        self.backtest_progress_bar.setRange(0, 0)
-        self.backtest_progress_bar.setFormat("준비중")
+        self.backtest_progress_total_candidates = max(0, int(total_candidates))
+        self.backtest_progress_prepared_candidates = 0
+        self.backtest_progress_status_text = "준비중"
+        self.backtest_progress_bar.setRange(0, 1000)
+        self.backtest_progress_bar.setValue(0)
+        self.backtest_progress_bar.setFormat("%p%")
+        self._refresh_backtest_progress_display()
+
+    def _refresh_backtest_progress_display(self) -> None:
+        if self.backtest_progress_phase != "optimize":
+            return
+        total_candidates = max(self.backtest_progress_total_candidates, 1)
+        prep_ratio = min(1.0, self.backtest_progress_prepared_candidates / total_candidates)
+        if self.backtest_progress_total_cases > 0:
+            exec_ratio = min(1.0, self.backtest_progress_completed_cases / max(self.backtest_progress_total_cases, 1))
+        else:
+            exec_ratio = 0.0
+        progress_ratio = (prep_ratio * 0.35) + (exec_ratio * 0.65)
+        self.backtest_progress_bar.setRange(0, 1000)
+        self.backtest_progress_bar.setValue(int(round(progress_ratio * 1000)))
+        detail = f"{self.backtest_progress_completed_cases}/{max(self.backtest_progress_total_cases, self.backtest_progress_completed_cases, 0)}"
+        if self.backtest_progress_total_cases <= 0:
+            detail = f"{self.backtest_progress_prepared_candidates}/{self.backtest_progress_total_candidates or 0}"
+        self.backtest_progress_label.setText(f"{self.backtest_progress_status_text} | {detail}")
+
+    def _update_backtest_progress_phase(self, payload: object) -> None:
+        result = dict(payload or {})
+        if self.backtest_progress_phase != "optimize":
+            return
+        phase = str(result.get("phase") or "")
+        candidate = str(result.get("candidate") or "")
+        if phase == "optimize_start":
+            self.backtest_progress_total_candidates = max(0, int(result.get("total_candidates", 0)))
+            process_count = max(1, int(result.get("process_count", 1)))
+            self.backtest_progress_status_text = f"프로세스 준비중 ({process_count}개)"
+        elif phase == "history_loading":
+            total_candidates = max(0, int(result.get("total_candidates", self.backtest_progress_total_candidates)))
+            if total_candidates:
+                self.backtest_progress_total_candidates = total_candidates
+            index = max(1, int(result.get("index", 1)))
+            self.backtest_progress_status_text = f"히스토리 로드중 {index}/{self.backtest_progress_total_candidates or total_candidates} | {candidate}"
+        elif phase == "history_ready":
+            total_candidates = max(0, int(result.get("total_candidates", self.backtest_progress_total_candidates)))
+            if total_candidates:
+                self.backtest_progress_total_candidates = total_candidates
+            index = max(1, int(result.get("index", 1)))
+            self.backtest_progress_prepared_candidates = max(self.backtest_progress_prepared_candidates, index)
+            self.backtest_progress_status_text = f"히스토리 준비완료 {self.backtest_progress_prepared_candidates}/{self.backtest_progress_total_candidates or total_candidates} | {candidate}"
+        elif phase == "case_running":
+            active_jobs = max(1, int(result.get("active_jobs", 1)))
+            process_count = max(1, int(result.get("process_count", 1)))
+            self.backtest_progress_status_text = f"프로세스 준비중 {active_jobs}/{process_count} | {candidate}"
+        self._refresh_backtest_progress_display()
 
     def _register_backtest_case_plan(self, cases: int) -> None:
         if self.backtest_progress_phase != "optimize":
@@ -5762,25 +5883,16 @@ class AltReversalTraderWindow(QMainWindow):
         if cases <= 0:
             return
         self.backtest_progress_total_cases += int(cases)
-        maximum = max(self.backtest_progress_total_cases, self.backtest_progress_completed_cases, 1)
-        self.backtest_progress_bar.setRange(0, maximum)
-        self.backtest_progress_bar.setValue(min(self.backtest_progress_completed_cases, maximum))
-        self.backtest_progress_bar.setFormat("%p%")
-        self.backtest_progress_label.setText(
-            f"백테스트중 {self.backtest_progress_completed_cases}/{self.backtest_progress_total_cases}"
-        )
+        if not self.backtest_progress_status_text.startswith("백테스트중"):
+            self.backtest_progress_status_text = "백테스트중"
+        self._refresh_backtest_progress_display()
 
     def _advance_backtest_progress(self, symbol: str, interval: str) -> None:
         if self.backtest_progress_phase != "optimize":
             return
         self.backtest_progress_completed_cases += 1
-        maximum = max(self.backtest_progress_total_cases, self.backtest_progress_completed_cases, 1)
-        self.backtest_progress_bar.setRange(0, maximum)
-        self.backtest_progress_bar.setValue(min(self.backtest_progress_completed_cases, maximum))
-        self.backtest_progress_bar.setFormat("%p%")
-        self.backtest_progress_label.setText(
-            f"백테스트중 {self.backtest_progress_completed_cases}/{maximum} | {symbol} [{interval}]"
-        )
+        self.backtest_progress_status_text = f"백테스트중 | {symbol} [{interval}]"
+        self._refresh_backtest_progress_display()
 
     def _finish_backtest_progress(self, text: Optional[str] = None) -> None:
         maximum = max(self.backtest_progress_total_cases, self.backtest_progress_completed_cases, 1)
@@ -5856,10 +5968,11 @@ class AltReversalTraderWindow(QMainWindow):
             self._set_refresh_running(False)
             return
         self.log(f"최적화 시작: {len(targets)}개 종목")
-        self._begin_backtest_progress()
+        self._begin_backtest_progress(len(targets))
         self.optimize_worker = OptimizeWorker(self.settings, targets)
         self._track_thread(self.optimize_worker, "optimize_worker")
         self.optimize_worker.progress.connect(self.log)
+        self.optimize_worker.phase_update.connect(self._update_backtest_progress_phase)
         self.optimize_worker.case_plan.connect(self.on_optimization_case_plan)
         self.optimize_worker.result_ready.connect(self.on_optimization_result)
         self.optimize_worker.completed.connect(self.on_optimization_completed)

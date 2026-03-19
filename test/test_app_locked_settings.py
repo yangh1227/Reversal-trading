@@ -508,6 +508,23 @@ def test_chart_display_days_controls_initial_visible_range_only() -> None:
     assert "lookback_days" not in initial_history_source
 
 
+def test_backtest_progress_uses_staged_status_updates() -> None:
+    source = APP_PATH.read_text(encoding="utf-8")
+    begin_source = ast.get_source_segment(source, _window_method_node("_begin_backtest_progress")) or ""
+    refresh_source = ast.get_source_segment(source, _window_method_node("_refresh_backtest_progress_display")) or ""
+    update_source = ast.get_source_segment(source, _window_method_node("_update_backtest_progress_phase")) or ""
+    start_source = ast.get_source_segment(source, _window_method_node("start_optimization")) or ""
+
+    assert "self.backtest_progress_bar.setRange(0, 1000)" in begin_source
+    assert "progress_ratio = (prep_ratio * 0.35) + (exec_ratio * 0.65)" in refresh_source
+    assert '"phase": "history_loading"' in source
+    assert '"phase": "history_ready"' in source
+    assert '"phase": "case_running"' in source
+    assert "self.optimize_worker.phase_update.connect(self._update_backtest_progress_phase)" in start_source
+    assert 'self.backtest_progress_status_text = f"히스토리 로드중' in update_source
+    assert 'self.backtest_progress_status_text = f"프로세스 준비중' in update_source
+
+
 def test_status_strip_uses_uniform_spacing_and_label_heights() -> None:
     build_ui_source = ast.get_source_segment(
         APP_PATH.read_text(encoding="utf-8"),
