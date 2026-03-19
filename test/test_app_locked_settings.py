@@ -264,7 +264,7 @@ def test_collect_settings_preserves_auto_refresh_minutes_and_locked_positions() 
     ) or ""
 
     assert "auto_refresh_minutes=int(self.auto_refresh_minutes_spin.value())" in source_segment
-    assert "chart_display_days=int(" in source_segment
+    assert "chart_display_hours=int(" in source_segment
     assert "auto_trade_use_favorable_price=bool(self.auto_trade_favorable_check.isChecked())" in source_segment
     assert "auto_trade_focus_on_signal=bool(" in source_segment
     assert "auto_trade_focus_signal_mode=self._auto_trade_focus_signal_mode()" in source_segment
@@ -488,8 +488,24 @@ def test_chart_focus_settings_controls_are_inline_above_chart() -> None:
     assert 'self.auto_trade_focus_enable_check = QCheckBox("사용")' in build_ui_source
     assert 'self.auto_trade_focus_mode_combo.addItem("예상진입신호", "preview")' in build_ui_source
     assert 'self.auto_trade_focus_mode_combo.addItem("진입신호 확정", "confirmed")' in build_ui_source
-    assert 'chart_header_row.addWidget(QLabel("차트 표시"))' in build_ui_source
+    assert 'chart_header_row.addWidget(QLabel("차트 표시 시간 범위"))' in build_ui_source
     assert "self.chart_display_days_popup_spin = QSpinBox()" in build_ui_source
+    assert 'self.chart_display_days_popup_spin.setSuffix(" 시간")' in build_ui_source
+
+
+def test_chart_display_days_controls_initial_visible_range_only() -> None:
+    default_range_source = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_default_lightweight_logical_range"),
+    ) or ""
+    initial_history_source = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_build_initial_chart_history"),
+    ) or ""
+
+    assert "self.settings.chart_display_hours" in default_range_source
+    assert "3_600_000" in default_range_source
+    assert "lookback_days" not in initial_history_source
 
 
 def test_status_strip_uses_uniform_spacing_and_label_heights() -> None:

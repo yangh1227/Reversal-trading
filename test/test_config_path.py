@@ -47,7 +47,7 @@ class TestConfigPath(unittest.TestCase):
 
             self.assertEqual(loaded.leverage, 2)
             self.assertEqual(loaded.history_days, 3)
-            self.assertEqual(loaded.chart_display_days, 3)
+            self.assertEqual(loaded.chart_display_hours, 24)
             self.assertEqual(loaded.auto_refresh_minutes, 30)
             self.assertTrue(loaded.auto_trade_use_favorable_price)
             self.assertTrue(loaded.auto_trade_focus_on_signal)
@@ -142,7 +142,7 @@ class TestConfigPath(unittest.TestCase):
                 auto_trade_use_favorable_price=False,
                 auto_trade_focus_on_signal=False,
                 auto_trade_focus_signal_mode="confirmed",
-                chart_display_days=5,
+                chart_display_hours=12,
                 position_intervals={"BTCUSDT": "5m"},
                 position_strategy_settings={"BTCUSDT": locked_settings},
                 position_filled_fractions={"BTCUSDT": 0.5},
@@ -156,10 +156,19 @@ class TestConfigPath(unittest.TestCase):
             self.assertFalse(loaded.auto_trade_use_favorable_price)
             self.assertFalse(loaded.auto_trade_focus_on_signal)
             self.assertEqual(loaded.auto_trade_focus_signal_mode, "confirmed")
-            self.assertEqual(loaded.chart_display_days, 5)
+            self.assertEqual(loaded.chart_display_hours, 12)
             self.assertEqual(loaded.position_strategy_settings["BTCUSDT"], locked_settings)
             self.assertEqual(loaded.position_filled_fractions["BTCUSDT"], 0.5)
             self.assertEqual(loaded.position_cursor_entry_times["BTCUSDT"], pd.Timestamp("2026-01-01 00:10:00"))
+
+    def test_legacy_chart_display_days_migrates_to_hours(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / self.config.APP_CONFIG_FILENAME
+            config_path.write_text(json.dumps({"chart_display_days": 2}), encoding="utf-8")
+
+            loaded = self.config.AppSettings.load(config_path)
+
+            self.assertEqual(loaded.chart_display_hours, 48)
 
     def test_default_app_settings_use_dynamic_optimize_process_count(self) -> None:
         settings = self.config.AppSettings()
