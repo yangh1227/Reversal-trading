@@ -104,11 +104,13 @@ function initChart() {
     timeScale: { borderColor: "#1f2937", timeVisible: true, secondsVisible: false },
   });
   candleSeries = chart.addCandlestickSeries({
-    upColor: "#d1d5db",
-    downColor: "#d1d5db",
-    borderVisible: false,
-    wickUpColor: "#d1d5db",
-    wickDownColor: "#d1d5db",
+    upColor: "#a3acb7",
+    downColor: "rgba(0, 0, 0, 0)",
+    borderVisible: true,
+    borderUpColor: "#a3acb7",
+    borderDownColor: "#a3acb7",
+    wickUpColor: "#a3acb7",
+    wickDownColor: "#a3acb7",
     priceLineVisible: false,
   });
   lineSeries = {
@@ -373,6 +375,7 @@ function renderPositions(items) {
     const upnlCls = upnlNum >= 0 ? "positive" : "negative";
 
     row.className = `list-item ${sideKey}-pos`;
+    row.style.cursor = "pointer";
     row.innerHTML = `
       <div class="list-title">
         <strong>${item.symbol}</strong>
@@ -394,9 +397,15 @@ function renderPositions(items) {
         </label>
       </div>
     `;
-    row.querySelector("button").onclick = () => closePosition(item.symbol);
-    row.querySelector('input[type="checkbox"]').onchange = (event) =>
+    row.addEventListener("click", () => selectSymbol(item.symbol));
+    row.querySelector("button").onclick = (event) => {
+      event.stopPropagation();
+      closePosition(item.symbol);
+    };
+    row.querySelector('input[type="checkbox"]').onchange = (event) => {
+      event.stopPropagation();
       toggleAutoClose(item.symbol, event.target.checked);
+    };
     els.positionsList.appendChild(row);
   });
 }
