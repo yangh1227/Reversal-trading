@@ -1585,7 +1585,7 @@ class _TradeEngine:
 
         open_positions_by_symbol = dict(self.open_positions)
         candidates: List[Dict[str, object]] = []
-        _dbg_trigger = bool(trigger_symbol)
+        _dbg_trigger = bool(trigger_symbol) and normalized_trigger_time is not None
         for item in eligible_items:
             if item.symbol in self.pending_order_symbols:
                 if _dbg_trigger and item.symbol == trigger_symbol:
