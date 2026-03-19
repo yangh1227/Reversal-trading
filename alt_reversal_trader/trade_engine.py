@@ -1228,14 +1228,39 @@ class _TradeEngine:
             self._evaluate_backtest_auto_close(state)
             signal_on_load = _auto_trade_signal_from_backtest(backtest)
             if trigger_bar_time is not None:
-                print(f"[자동매매 진단] {state.symbol}/{state.interval} 로드완료: 신선한 진입봉={trigger_bar_time}, 신호={signal_on_load and (signal_on_load['side'] + '/존' + str(signal_on_load['zone'])) or '없음'}")
+                sig_str = (signal_on_load['side'] + '/존' + str(signal_on_load['zone']) + '/가격' + str(round(signal_on_load['price'], 4))) if signal_on_load else '없음'
+                print(f"[자동매매 진단] {state.symbol}/{state.interval} 로드완료 ✓ | 신선한 진입봉={trigger_bar_time} | 신호={sig_str} | 봉마감 평가 시작")
                 self._evaluate_auto_trade(
                     trigger_symbol=state.symbol,
                     trigger_interval=state.interval,
                     trigger_bar_time=trigger_bar_time,
                 )
             else:
-                print(f"[자동매매 진단] {state.symbol}/{state.interval} 로드완료: 신선한 진입봉 없음, 신호={signal_on_load and (signal_on_load['side'] + '/존' + str(signal_on_load['zone'])) or '없음'} → 주기점검으로만 진입가능")
+                if signal_on_load:
+                    sig_str = signal_on_load['side'] + '/존' + str(signal_on_load['zone']) + '/가격' + str(round(signal_on_load['price'], 4))
+                    sig_time = signal_on_load.get('time')
+                    now_utc = pd.Timestamp.now(tz='UTC').tz_localize(None)
+                    freshness_window_ms = _interval_to_ms(state.interval) * 1.5
+                    freshness_window = pd.Timedelta(milliseconds=freshness_window_ms)
+                    latest_bar = backtest.indicators['time'].iloc[-1] if backtest is not None and not backtest.indicators.empty else None
+                    if latest_bar is not None:
+                        latest_bar_ts = pd.Timestamp(latest_bar).tz_localize(None)
+                        age = now_utc - latest_bar_ts
+                        print(f"[자동매매 진단] {state.symbol}/{state.interval} 로드완료 | 신호={sig_str}")
+                        print(f"  → 신선한 진입봉 없음: 최신봉={latest_bar_ts} (현재로부터 {age}전) | 신선도 기준={freshness_window}")
+                        if age > freshness_window:
+                            print(f"  → 원인: 신호봉이 {freshness_window} 기준보다 오래됨 ({age} > {freshness_window})")
+                        else:
+                            print(f"  → 원인: 최신봉({latest_bar_ts})에서 신규 진입 없음 (신호는 이전 봉에서 발생)")
+                        favor_mode = "유리가격ON" if self.auto_trade_use_favorable_price else "유리가격OFF"
+                        if self.auto_trade_use_favorable_price:
+                            print(f"  → {favor_mode}: 주기점검에서 유리한 가격 되면 진입 가능")
+                        else:
+                            print(f"  → {favor_mode}: 다음 존 진입 조건 충족되는 봉 마감 시까지 대기")
+                    else:
+                        print(f"[자동매매 진단] {state.symbol}/{state.interval} 로드완료 | 신호={sig_str} | 지표 데이터 없음")
+                else:
+                    print(f"[자동매매 진단] {state.symbol}/{state.interval} 로드완료 | 신호 없음 | 신규 진입 조건 대기 중")
                 self._evaluate_auto_trade()
         except Exception:
             self.log(traceback.format_exc())
@@ -1636,18 +1661,45 @@ class _TradeEngine:
             )
             if _dbg_trigger:
                 signal = _auto_trade_signal_from_backtest(latest_backtest)
-                sig_info = f"신호={signal['side']}/존{signal['zone']}/가격{signal['price']:.4f}" if signal else "신호없음"
+                favor_mode = "유리가격ON" if self.auto_trade_use_favorable_price else "유리가격OFF"
                 pos_info = f"포지션={open_position.amount:.4f}" if open_position else "포지션없음"
                 price_info = f"현재가={current_price}" if current_price else "현재가없음"
-                favor_mode = "유리가격ON" if self.auto_trade_use_favorable_price else "유리가격OFF"
-                filled_info = f"채움={filled_fraction:.3f}"
-                trigger_info = f"트리거봉={normalized_trigger_time}"
+                filled_info = f"채움비율={filled_fraction:.3f}"
                 if evaluation.candidate:
-                    print(f"[자동매매 진단] {item.symbol}/{item.interval}: 진입후보 생성 ✓ | {sig_info} | {pos_info} | {price_info} | {favor_mode} | {filled_info} | {trigger_info}")
+                    sig_info = f"신호={signal['side']}/존{signal['zone']}/가격{signal['price']:.4f}" if signal else "신호없음"
+                    print(f"[자동매매 진단] {item.symbol}/{item.interval} ✅ 진입후보 생성 | {sig_info} | {pos_info} | {price_info} | {favor_mode} | {filled_info}")
                 elif evaluation.reentry_position_side:
-                    print(f"[자동매매 진단] {item.symbol}/{item.interval}: 재진입 청산 트리거 | {sig_info} | {pos_info}")
+                    print(f"[자동매매 진단] {item.symbol}/{item.interval} 🔄 재진입 청산 트리거 | {pos_info}")
                 else:
-                    print(f"[자동매매 진단] {item.symbol}/{item.interval}: 진입 차단 | {sig_info} | {pos_info} | {price_info} | {favor_mode} | {filled_info} | {trigger_info}")
+                    # 차단 원인 상세 분석
+                    if signal is None:
+                        print(f"[자동매매 진단] {item.symbol}/{item.interval} ❌ 차단: 활성 신호 없음 | {pos_info} | {price_info}")
+                    else:
+                        sig_info = f"신호={signal['side']}/존{signal['zone']}/가격{signal['price']:.4f}"
+                        # has_fresh_confirmed_entry 재계산
+                        confirmed = latest_confirmed_entry_event(latest_backtest, normalized_trigger_time)
+                        if confirmed is None:
+                            sig_time = signal.get('time')
+                            print(f"[자동매매 진단] {item.symbol}/{item.interval} ❌ 차단: 이번 봉({normalized_trigger_time})에서 신규진입 없음")
+                            print(f"  → {sig_info} | 신호발생봉={sig_time} | 이미 지나간 신호")
+                            print(f"  → {favor_mode}: {'다음 존 조건 충족 봉 대기' if not self.auto_trade_use_favorable_price else '유리한 가격이면 주기점검에서 진입 가능'}")
+                        elif str(confirmed['side']) != str(signal['side']) or int(confirmed['zone']) != int(signal['zone']):
+                            print(f"[자동매매 진단] {item.symbol}/{item.interval} ❌ 차단: 확인된 진입과 신호 불일치")
+                            print(f"  → 신호={signal['side']}/존{signal['zone']} vs 확인={confirmed['side']}/존{confirmed['zone']}")
+                        else:
+                            # has_fresh_confirmed_entry=True인데 차단 → 다른 이유
+                            fraction_target = float(signal['fraction'])
+                            remaining = max(0.0, fraction_target - filled_fraction)
+                            if remaining <= 1e-9:
+                                print(f"[자동매매 진단] {item.symbol}/{item.interval} ❌ 차단: 이미 최대 비율 채움 | {sig_info} | {filled_info} | 목표={fraction_target:.3f}")
+                            elif open_position is not None:
+                                pos_side = "long" if float(open_position.amount) > 0 else "short"
+                                if pos_side != signal['side']:
+                                    print(f"[자동매매 진단] {item.symbol}/{item.interval} ❌ 차단: 포지션 방향 불일치 | 포지션={pos_side} vs 신호={signal['side']}")
+                                else:
+                                    print(f"[자동매매 진단] {item.symbol}/{item.interval} ❌ 차단: 기타(추세 반전 감지?) | {sig_info} | {pos_info} | {price_info}")
+                            else:
+                                print(f"[자동매매 진단] {item.symbol}/{item.interval} ❌ 차단: 기타 | {sig_info} | {pos_info} | {price_info} | {favor_mode}")
             if evaluation.reentry_position_side:
                 self._trigger_reentry_auto_close(item.symbol, evaluation.reentry_position_side, latest_backtest)
                 continue
