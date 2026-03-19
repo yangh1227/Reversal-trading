@@ -3,35 +3,42 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>Alt Reversal Trader Mobile</title>
+  <meta name="theme-color" content="#0d1117">
+  <title>Alt Reversal Trader</title>
   <link rel="stylesheet" href="/mobile-static/mobile.css">
 </head>
 <body>
+
+  <!-- ── 로그인 ── -->
   <div id="login-view" class="screen">
     <div class="card auth-card">
-      <h1>모바일 트레이딩</h1>
-      <p class="muted">로그인 후 최적화 종목, 차트, 주문, 청산을 사용할 수 있습니다.</p>
-      <label>아이디</label>
+      <h1>Alt Reversal</h1>
+      <p class="muted">계정에 로그인하여 트레이딩을 시작합니다.</p>
+      <label for="login-username">아이디</label>
       <input id="login-username" value="yangh1227" autocomplete="username">
-      <label>비밀번호</label>
+      <label for="login-password">비밀번호</label>
       <input id="login-password" type="password" value="yang1227" autocomplete="current-password">
       <button id="login-submit" class="primary">로그인</button>
       <p id="login-error" class="error"></p>
     </div>
   </div>
 
+  <!-- ── 앱 ── -->
   <div id="app-view" class="screen hidden">
+
+    <!-- Topbar -->
     <header class="topbar">
-      <div>
-        <div class="eyebrow">모바일 대시보드</div>
+      <div class="topbar-left">
+        <div class="app-title">📈 Alt Reversal</div>
         <div id="server-urls" class="server-urls"></div>
       </div>
       <div class="header-actions">
-        <button id="refresh-button" class="ghost">새로고침</button>
+        <button id="refresh-button" class="ghost">↻ 새로고침</button>
         <button id="logout-button" class="ghost">로그아웃</button>
       </div>
     </header>
 
+    <!-- 잔고 통계 -->
     <section class="card stats-grid">
       <div class="stat">
         <span>잔고</span>
@@ -42,7 +49,7 @@
         <strong id="available-value">-</strong>
       </div>
       <div class="stat">
-        <span>차트TF</span>
+        <span>차트 TF</span>
         <strong id="current-interval">-</strong>
       </div>
       <div class="stat">
@@ -51,32 +58,42 @@
       </div>
     </section>
 
+    <!-- 차트 -->
     <section class="card">
-      <div class="row between center">
+      <div class="row between center chart-header">
         <div>
           <div class="eyebrow">현재 차트</div>
           <h2 id="current-symbol">-</h2>
         </div>
         <label class="switch-wrap">
           <span>자동매매</span>
-          <input id="auto-trade-toggle" type="checkbox">
+          <span class="toggle">
+            <input id="auto-trade-toggle" type="checkbox">
+            <span class="toggle-track"></span>
+          </span>
         </label>
       </div>
       <div id="signal-text" class="signal-text"></div>
-      <div id="chart-container"></div>
+      <div id="chart-container">
+        <div class="chart-loading" id="chart-loading">
+          <div class="spinner"></div>
+        </div>
+      </div>
     </section>
 
+    <!-- 유리한 가격 -->
     <section class="card">
       <div class="row between center">
-        <h3>유리한 가격</h3>
+        <h3 class="section-title">유리한 가격</h3>
         <span id="favorable-count" class="chip">0</span>
       </div>
       <div id="favorable-list" class="chip-list"></div>
     </section>
 
+    <!-- 주문 -->
     <section class="card">
-      <div class="row between center">
-        <h3>주문</h3>
+      <div class="row between center" style="margin-bottom:14px">
+        <h3 class="section-title">주문</h3>
         <div class="order-mode">
           <button id="mode-compound" class="mode-btn active">퍼센트</button>
           <button id="mode-simple" class="mode-btn">단리</button>
@@ -84,10 +101,10 @@
       </div>
       <div id="compound-orders">
         <div class="button-grid">
-          <button data-side="BUY" data-fraction="0.33" class="long">LONG 33%</button>
-          <button data-side="BUY" data-fraction="0.50" class="long">LONG 50%</button>
-          <button data-side="BUY" data-fraction="0.66" class="long">LONG 66%</button>
-          <button data-side="BUY" data-fraction="0.99" class="long">LONG 99%</button>
+          <button data-side="BUY"  data-fraction="0.33" class="long">LONG 33%</button>
+          <button data-side="BUY"  data-fraction="0.50" class="long">LONG 50%</button>
+          <button data-side="BUY"  data-fraction="0.66" class="long">LONG 66%</button>
+          <button data-side="BUY"  data-fraction="0.99" class="long">LONG 99%</button>
           <button data-side="SELL" data-fraction="0.33" class="short">SHORT 33%</button>
           <button data-side="SELL" data-fraction="0.50" class="short">SHORT 50%</button>
           <button data-side="SELL" data-fraction="0.66" class="short">SHORT 66%</button>
@@ -95,28 +112,34 @@
         </div>
       </div>
       <div id="simple-orders" class="hidden">
-        <label>주문 금액 (USDT)</label>
+        <label for="simple-amount">주문 금액 (USDT)</label>
         <input id="simple-amount" type="number" min="1" step="1">
-        <div class="button-grid two">
-          <button id="simple-long" class="long">LONG</button>
+        <div class="button-grid">
+          <button id="simple-long"  class="long">LONG</button>
           <button id="simple-short" class="short">SHORT</button>
         </div>
       </div>
     </section>
 
+    <!-- 포지션 -->
     <section class="card">
-      <div class="row between center">
-        <h3>포지션</h3>
-        <button id="close-all-button" class="danger">전체청산</button>
+      <div class="row between center" style="margin-bottom:8px">
+        <h3 class="section-title">포지션</h3>
+        <button id="close-all-button" class="danger">전체 청산</button>
       </div>
       <div id="positions-list" class="list"></div>
     </section>
 
+    <!-- 최적화 종목 -->
     <section class="card">
-      <h3>최적화 종목</h3>
+      <h3 class="section-title" style="margin-bottom:10px">최적화 종목</h3>
       <div id="optimized-list" class="list"></div>
     </section>
+
   </div>
+
+  <!-- Toast 컨테이너 -->
+  <div id="toast-container"></div>
 
   <script src="/vendor/lightweight-charts.js"></script>
   <script src="/mobile-static/mobile.js"></script>
