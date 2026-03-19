@@ -86,6 +86,15 @@ def _price_format_from_frames(candle_df: pd.DataFrame, indicators: pd.DataFrame)
     return {"precision": precision, "minMove": 10 ** (-precision)}
 
 
+def _format_compact_number(value: object) -> Optional[str]:
+    if value is None or pd.isna(value):
+        return None
+    try:
+        return f"{float(value):.12f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(value)
+
+
 def _safe_port(start_port: int = WEB_DEFAULT_PORT) -> int:
     for port in range(start_port, start_port + 20):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -451,14 +460,25 @@ class MobileWebServer:
         return dict(self._price_cache)
 
     def _current_bar_close_deadline_ms(self) -> Optional[int]:
-        symbol = self.window.current_symbol
-        if not symbol:
+        interval = str(self.window.current_interval or self.window.settings.kline_interval or "").strip()
+        if not interval:
             return None
-        chart_history = self.window._current_chart_history(symbol)
-        if chart_history is None or chart_history.empty:
+        try:
+            value = int(interval[:-1])
+        except Exception:
             return None
-        latest_time = pd.Timestamp(chart_history["time"].iloc[-1])
-        bar_end = latest_time + pd.Timedelta(milliseconds=_interval_to_ms(self.window.current_interval))
+        unit = interval[-1]
+        if unit == "m":
+            floor_freq = f"{value}min"
+        elif unit == "h":
+            floor_freq = f"{value}h"
+        elif unit == "d":
+            floor_freq = f"{value}d"
+        else:
+            return None
+        now = pd.Timestamp.now(tz="UTC").tz_convert(None)
+        bar_start = now.floor(floor_freq)
+        bar_end = bar_start + pd.Timedelta(milliseconds=_interval_to_ms(interval))
         return int(bar_end.timestamp() * 1000)
 
     def _current_countdown(self) -> Optional[str]:
@@ -495,7 +515,7 @@ class MobileWebServer:
                     "mddPct": round(float(metrics.max_drawdown_pct), 2),
                     "trades": int(metrics.trade_count),
                     "favorable": favorable,
-                    "currentPrice": price_map.get(result.symbol),
+                    "currentPrice": _format_compact_number(price_map.get(result.symbol)),
                     "isCurrent": result.symbol == self.window.current_symbol,
                 }
             )
@@ -544,17 +564,25 @@ class MobileWebServer:
         interval = self.window.current_interval
         if not symbol or self.window.current_backtest is None:
             return {"symbol": symbol, "interval": interval, "ready": False}
-        snapshot = self.window.current_chart_snapshot
-        if snapshot is None:
-            snapshot = self.window._sync_current_chart_snapshot(
-                symbol,
-                interval,
-                backtest=self.window.current_backtest,
-                chart_indicators=self.window.current_chart_indicators,
-            )
+        preview_bar = self.window._current_live_preview_for(symbol, interval)
+        snapshot = self.window._sync_current_chart_snapshot(
+            symbol,
+            interval,
+            backtest=self.window.current_backtest,
+            chart_indicators=self.window.current_chart_indicators,
+            preview_bar=preview_bar,
+        )
         if snapshot is None:
             return {"symbol": symbol, "interval": interval, "ready": False}
         candle_df, indicators, _, markers = self.window._build_chart_render_payload(snapshot)
+        live_chart_history = snapshot.display_chart_history()
+        if live_chart_history is not None and not live_chart_history.empty:
+            candle_df = (
+                live_chart_history[["time", "open", "high", "low", "close"]]
+                .sort_values("time")
+                .drop_duplicates(subset=["time"])
+                .reset_index(drop=True)
+            )
         return {
             "ready": True,
             "symbol": symbol,

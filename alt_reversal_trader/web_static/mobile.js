@@ -94,7 +94,13 @@ function initChart() {
     layout: { background: { color: "#0b1220" }, textColor: "#d1d5db" },
     grid: { vertLines: { color: "#1f2937" }, horzLines: { color: "#1f2937" } },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-    rightPriceScale: { borderColor: "#1f2937" },
+    localization: { priceFormatter: (price) => formatCompactPrice(price, "") },
+    rightPriceScale: {
+      borderColor: "#1f2937",
+      minimumWidth: 0,
+      entireTextOnly: false,
+      scaleMargins: { top: 0.08, bottom: 0.08 },
+    },
     timeScale: { borderColor: "#1f2937", timeVisible: true, secondsVisible: false },
   });
   candleSeries = chart.addCandlestickSeries({
@@ -117,6 +123,14 @@ function initChart() {
 function parsePrice(value) {
   const parsed = parseFloat(String(value ?? "").replace(/,/g, ""));
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatCompactPrice(value, fallback = "-") {
+  const parsed = parsePrice(value);
+  if (parsed == null) {
+    return fallback;
+  }
+  return parsed.toFixed(8).replace(/\.?0+$/, "");
 }
 
 function setPriceLine(target, options) {
@@ -151,7 +165,6 @@ function updateReferenceLines(payload) {
     lineWidth: 2,
     lineStyle: LightweightCharts.LineStyle.Solid,
     axisLabelVisible: true,
-    title: "ENTRY",
   });
   currentPriceLine = setPriceLine(currentPriceLine, currentPrice == null ? null : {
     price: currentPrice,
@@ -159,7 +172,6 @@ function updateReferenceLines(payload) {
     lineWidth: 1,
     lineStyle: LightweightCharts.LineStyle.SparseDotted,
     axisLabelVisible: true,
-    title: "NOW",
   });
 }
 
@@ -172,7 +184,12 @@ function applyPriceFormat(format) {
   if (!Number.isFinite(precision) || !Number.isFinite(minMove) || precision < 0 || minMove <= 0) {
     return;
   }
-  const priceFormat = { type: "price", precision, minMove };
+  const fmt = (price) => {
+    const p = parsePrice(price);
+    return p == null ? "" : p.toFixed(precision).replace(/\.?0+$/, "");
+  };
+  const priceFormat = { type: "custom", precision, minMove, formatter: fmt };
+  chart.applyOptions({ localization: { priceFormatter: fmt } });
   candleSeries.applyOptions({ priceFormat });
   Object.values(lineSeries).forEach((series) => series.applyOptions({ priceFormat }));
 }
@@ -243,6 +260,7 @@ function applyChartPayload(payload, options = {}) {
       }))
   );
   updateReferenceLines(payload);
+  chart.resize(els.chartContainer.clientWidth, els.chartContainer.clientHeight, true);
   if (options.fitContent) {
     chart.timeScale().fitContent();
   }
@@ -330,7 +348,7 @@ function renderOptimized(items) {
         <span class="interval-badge">${item.interval}</span>
       </div>
       <div class="list-meta">Score ${item.score} · Return ${item.returnPct}% · MDD ${item.mddPct}% · Trades ${item.trades}</div>
-      <div class="list-meta">${item.currentPrice ? `현재가 ${item.currentPrice}` : "현재가 -"}</div>
+      <div class="list-meta">${item.currentPrice ? `현재가 ${formatCompactPrice(item.currentPrice)}` : "현재가 -"}</div>
       <div class="list-actions">
         <button class="ghost">차트 보기</button>
       </div>
@@ -360,7 +378,7 @@ function renderPositions(items) {
         <strong>${item.symbol}</strong>
         <span class="side-badge ${sideKey}">${sideLabel} ${item.leverage}</span>
       </div>
-      <div class="list-meta">진입 ${item.entryPrice} · ${item.amountUsdt} USDT</div>
+      <div class="list-meta">진입 ${formatCompactPrice(item.entryPrice)} · ${item.amountUsdt} USDT</div>
       <div class="list-meta">
         <span class="upnl ${upnlCls}">UPnL ${item.upnl}</span>
         · ${item.returnPct}%
