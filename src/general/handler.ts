@@ -1,4 +1,5 @@
 import {
+    Coordinate,
     ColorType,
     CrosshairMode,
     DeepPartial,
@@ -81,7 +82,6 @@ export class Handler {
         this.chart = this._createChart();
         this.series = this.createCandlestickSeries();
         this.volumeSeries = this.createVolumeSeries();
-
         this.legend = new Legend(this)
         
         document.addEventListener('keydown', (event) => {
@@ -91,6 +91,115 @@ export class Handler {
         })
         window.handlerInFocus = this.id;
         this.wrapper.addEventListener('mouseover', () => window.handlerInFocus = this.id)
+
+        const measureOverlay = document.createElement('div');
+        measureOverlay.style.position = 'absolute';
+        measureOverlay.style.left = '0';
+        measureOverlay.style.right = '0';
+        measureOverlay.style.top = '0';
+        measureOverlay.style.bottom = '0';
+        measureOverlay.style.pointerEvents = 'none';
+        measureOverlay.style.zIndex = '30';
+        measureOverlay.style.display = 'block';
+        const measureBox = document.createElement('div');
+        measureBox.style.position = 'absolute';
+        measureBox.style.left = '0';
+        measureBox.style.right = '0';
+        measureBox.style.display = 'none';
+        measureBox.style.alignItems = 'center';
+        measureBox.style.justifyContent = 'center';
+        measureBox.style.boxSizing = 'border-box';
+        measureBox.style.fontWeight = '700';
+        measureBox.style.fontSize = '13px';
+        measureBox.style.color = 'rgba(255,255,255,0.92)';
+        measureBox.style.textShadow = '0 1px 2px rgba(0,0,0,0.45)';
+        measureOverlay.appendChild(measureBox);
+        this.div.appendChild(measureOverlay);
+
+        let shiftDragActive = false;
+        let shiftDragStartPrice: number | null = null;
+        let shiftDragStartX: number | null = null;
+        const priceFromClientY = (clientY: number): number | null => {
+            const rect = this.div.getBoundingClientRect();
+            const y = (clientY - rect.top) as Coordinate;
+            return this.series.coordinateToPrice(y);
+        };
+        const xFromClientX = (clientX: number): number => {
+            const rect = this.div.getBoundingClientRect();
+            return clientX - rect.left;
+        };
+        const renderMeasureOverlay = (
+            startX: number | null,
+            endX: number | null,
+            startPrice: number | null,
+            endPrice: number | null,
+        ) => {
+            if (startX === null || endX === null || startPrice === null || endPrice === null) {
+                measureBox.style.display = 'none';
+                measureBox.textContent = '';
+                return;
+            }
+            const startY = this.series.priceToCoordinate(startPrice);
+            const endY = this.series.priceToCoordinate(endPrice);
+            if (startY === null || endY === null) {
+                measureBox.style.display = 'none';
+                measureBox.textContent = '';
+                return;
+            }
+            const left = Math.min(startX, endX);
+            const width = Math.max(1, Math.abs(endX - startX));
+            const top = Math.min(startY, endY);
+            const height = Math.max(1, Math.abs(endY - startY));
+            const pct = startPrice !== 0 ? ((endPrice - startPrice) / Math.abs(startPrice)) * 100 : 0;
+            const isUp = endPrice >= startPrice;
+            measureBox.style.display = 'flex';
+            measureBox.style.left = `${left}px`;
+            measureBox.style.width = `${width}px`;
+            measureBox.style.top = `${top}px`;
+            measureBox.style.height = `${height}px`;
+            measureBox.style.background = isUp ? 'rgba(0, 200, 100, 0.20)' : 'rgba(255, 80, 80, 0.20)';
+            measureBox.style.border = `1px solid ${isUp ? 'rgba(0, 200, 100, 0.75)' : 'rgba(255, 80, 80, 0.75)'}`;
+            measureBox.textContent = `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`;
+        };
+        const isInsideHandler = (target: EventTarget | null): boolean =>
+            target instanceof Node && this.wrapper.contains(target);
+
+        const pointerDownHandler = (event: PointerEvent) => {
+            if (!isInsideHandler(event.target)) return;
+            if (event.shiftKey) {
+                const price = priceFromClientY(event.clientY);
+                if (price !== null) {
+                    shiftDragStartPrice = price;
+                    shiftDragStartX = xFromClientX(event.clientX);
+                    shiftDragActive = true;
+                    renderMeasureOverlay(shiftDragStartX, shiftDragStartX, price, price);
+                }
+                event.preventDefault();
+                return;
+            }
+            renderMeasureOverlay(null, null, null, null);
+            shiftDragActive = false;
+            shiftDragStartPrice = null;
+            shiftDragStartX = null;
+        };
+
+        const pointerMoveHandler = (event: PointerEvent) => {
+            if (!shiftDragActive || shiftDragStartPrice === null || shiftDragStartX === null) return;
+            const price = priceFromClientY(event.clientY);
+            if (price !== null) {
+                renderMeasureOverlay(shiftDragStartX, xFromClientX(event.clientX), shiftDragStartPrice, price);
+            }
+        };
+
+        const pointerUpHandler = () => {
+            shiftDragActive = false;
+            shiftDragStartPrice = null;
+            shiftDragStartX = null;
+        };
+
+        window.addEventListener('pointerdown', pointerDownHandler, true);
+        window.addEventListener('pointermove', pointerMoveHandler, true);
+        window.addEventListener('pointerup', pointerUpHandler, true);
 
         this.reSize()
         if (!autoSize) return
