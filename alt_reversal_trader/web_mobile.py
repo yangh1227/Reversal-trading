@@ -79,9 +79,6 @@ def _price_format_from_frames(candle_df: pd.DataFrame, indicators: pd.DataFrame)
     for column in ("open", "high", "low", "close"):
         if column in candle_df.columns:
             precision = max(precision, max((_decimal_places(v) for v in candle_df[column].tail(300)), default=0))
-    for column in ("supertrend", "zone2_line", "zone3_line", "ema_fast", "ema_slow"):
-        if column in indicators.columns:
-            precision = max(precision, max((_decimal_places(v) for v in indicators[column].tail(300)), default=0))
     precision = max(precision, 2)
     return {"precision": precision, "minMove": 10 ** (-precision)}
 
