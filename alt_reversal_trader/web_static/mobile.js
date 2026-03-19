@@ -2,6 +2,8 @@ let csrfToken = null;
 let chart = null;
 let candleSeries = null;
 let lineSeries = {};
+let entryPriceLine = null;
+let currentPriceLine = null;
 let currentChartKey = "";
 let dashboardTimer = null;
 let chartTimer = null;
@@ -101,14 +103,64 @@ function initChart() {
     borderVisible: false,
     wickUpColor: "#d1d5db",
     wickDownColor: "#d1d5db",
+    priceLineVisible: false,
   });
   lineSeries = {
-    supertrend: chart.addLineSeries({ color: "#00d2ff", lineWidth: 2 }),
-    zone2: chart.addLineSeries({ color: "#d4a62a", lineWidth: 1 }),
-    zone3: chart.addLineSeries({ color: "#d36b6b", lineWidth: 1 }),
-    emaFast: chart.addLineSeries({ color: "#9ed8f2", lineWidth: 1 }),
-    emaSlow: chart.addLineSeries({ color: "#e3d995", lineWidth: 1 }),
+    supertrend: chart.addLineSeries({ color: "#00d2ff", lineWidth: 2, priceLineVisible: false, lastValueVisible: false }),
+    zone2: chart.addLineSeries({ color: "#d4a62a", lineWidth: 1, priceLineVisible: false, lastValueVisible: false }),
+    zone3: chart.addLineSeries({ color: "#d36b6b", lineWidth: 1, priceLineVisible: false, lastValueVisible: false }),
+    emaFast: chart.addLineSeries({ color: "#9ed8f2", lineWidth: 1, priceLineVisible: false, lastValueVisible: false }),
+    emaSlow: chart.addLineSeries({ color: "#e3d995", lineWidth: 1, priceLineVisible: false, lastValueVisible: false }),
   };
+}
+
+function parsePrice(value) {
+  const parsed = parseFloat(String(value ?? "").replace(/,/g, ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function setPriceLine(target, options) {
+  if (!candleSeries) {
+    return target;
+  }
+  if (!options || !Number.isFinite(options.price)) {
+    if (target) {
+      candleSeries.removePriceLine(target);
+    }
+    return null;
+  }
+  if (!target) {
+    return candleSeries.createPriceLine(options);
+  }
+  target.applyOptions(options);
+  return target;
+}
+
+function updateReferenceLines(payload) {
+  const currentSymbol = window.__dashboardState?.current?.symbol || "";
+  const positions = window.__dashboardState?.positions || [];
+  const currentPosition = positions.find((item) => item.symbol === currentSymbol) || null;
+  const entryPrice = parsePrice(currentPosition?.entryPrice);
+  const candles = payload?.candles || [];
+  const latestCandle = candles.length ? candles[candles.length - 1] : null;
+  const currentPrice = parsePrice(latestCandle?.close);
+
+  entryPriceLine = setPriceLine(entryPriceLine, entryPrice == null ? null : {
+    price: entryPrice,
+    color: "#24fc0c",
+    lineWidth: 2,
+    lineStyle: LightweightCharts.LineStyle.Solid,
+    axisLabelVisible: true,
+    title: "ENTRY",
+  });
+  currentPriceLine = setPriceLine(currentPriceLine, currentPrice == null ? null : {
+    price: currentPrice,
+    color: "#24fc0c",
+    lineWidth: 1,
+    lineStyle: LightweightCharts.LineStyle.SparseDotted,
+    axisLabelVisible: true,
+    title: "NOW",
+  });
 }
 
 function applyPriceFormat(format) {
@@ -190,6 +242,7 @@ function applyChartPayload(payload, options = {}) {
         text: marker.text || "",
       }))
   );
+  updateReferenceLines(payload);
   if (options.fitContent) {
     chart.timeScale().fitContent();
   }
