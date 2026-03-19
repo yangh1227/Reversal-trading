@@ -802,7 +802,8 @@ class ScanWorker(QThread):
             client = BinanceFuturesClient()
             candidates = client.scan_alt_candidates(
                 daily_volatility_min=self.settings.daily_volatility_min,
-                quote_volume_min=self.settings.quote_volume_min,
+                quote_volume_min=(1_000_000.0 if self.settings.filter_preset == "급등종목"
+                                  else self.settings.quote_volume_min),
                 use_rsi_filter=self.settings.use_rsi_filter,
                 rsi_length=self.settings.rsi_length,
                 rsi_lower=self.settings.rsi_lower,
@@ -2027,7 +2028,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.filter_preset_combo = QComboBox()
         self.filter_preset_combo.addItem("변동성", "변동성")
         self.filter_preset_combo.addItem("급등종목", "급등종목")
-        self.surge_info_label = QLabel("30m RSI≥65 / 거래량≥10M / 24h≥+15%")
+        self.surge_info_label = QLabel("30m RSI≥65 / 거래량≥1M / 24h≥+15%")
         self.surge_info_label.setStyleSheet("color: gray; font-size: 10px;")
         self.daily_vol_spin = QDoubleSpinBox()
         self.daily_vol_spin.setRange(0.0, 500.0)
@@ -3040,8 +3041,13 @@ class AltReversalTraderWindow(QMainWindow):
                 next_signal = (str(event.preview_entry_side or ""), int(event.preview_entry_zone or 0))
             previous_signal = self.last_engine_entry_signal_by_key.get(signal_key, ("", 0))
             self.last_engine_entry_signal_by_key[signal_key] = next_signal
+            _focus_on_signal = (
+                bool(self.auto_trade_focus_enable_check.isChecked())
+                if self.auto_trade_focus_enable_check is not None
+                else bool(self.settings.auto_trade_focus_on_signal)
+            )
             if (
-                self.settings.auto_trade_focus_on_signal
+                _focus_on_signal
                 and next_signal[0]
                 and next_signal[1] > 0
                 and next_signal != previous_signal
