@@ -1679,6 +1679,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.engine_order_pending = False
         self.engine_failed = False
         self.trade_engine_recovery_scheduled = False
+        self.mobile_web_server = None
         self.pending_open_order_interval: Optional[str] = None
         self.auto_refresh_minutes = int(self.settings.auto_refresh_minutes)
         self.auto_refresh_timer = QTimer(self)
@@ -1749,6 +1750,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_trade_timer.timeout.connect(self._run_auto_trade_cycle)
         self._init_auto_refresh()
         self._start_trade_engine()
+        self._start_mobile_web_server()
         self.statusBar().showMessage("준비됨")
         self._refresh_auto_trade_button_state()
         QTimer.singleShot(0, self.refresh_account_info)
@@ -2973,6 +2975,32 @@ class AltReversalTraderWindow(QMainWindow):
     def log(self, message: str) -> None:
         self.log_box.appendPlainText(message)
         self.statusBar().showMessage(message, 5000)
+
+    def _start_mobile_web_server(self) -> None:
+        if self.mobile_web_server is not None:
+            return
+        try:
+            from .web_mobile import MobileWebServer
+        except Exception as exc:
+            self.log(f"모바일 웹 비활성화: {exc}")
+            return
+        try:
+            self.mobile_web_server = MobileWebServer(self)
+            self.mobile_web_server.start()
+            urls = ", ".join(self.mobile_web_server.urls)
+            if urls:
+                self.log(f"모바일 웹 접속 주소: {urls}")
+        except Exception as exc:
+            self.mobile_web_server = None
+            self.log(f"모바일 웹 시작 실패: {exc}")
+
+    def _stop_mobile_web_server(self) -> None:
+        if self.mobile_web_server is None:
+            return
+        try:
+            self.mobile_web_server.stop()
+        finally:
+            self.mobile_web_server = None
 
     def _is_order_pending(self) -> bool:
         return self.engine_order_pending or (self.order_worker is not None and self.order_worker.isRunning())
@@ -7225,6 +7253,7 @@ class AltReversalTraderWindow(QMainWindow):
                 self._stop_position_price_worker(symbol)
             self._stop_all_auto_close_monitors()
             self._stop_trade_engine()
+            self._stop_mobile_web_server()
             self._drain_tracked_threads()
             self.save_settings()
         finally:

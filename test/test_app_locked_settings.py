@@ -138,6 +138,22 @@ def test_live_order_close_button_uses_total_close_label() -> None:
     assert 'setToolTip("현재 보유 중인 모든 포지션 전체 청산")' in source
 
 
+def test_app_starts_mobile_web_server_on_boot() -> None:
+    source = APP_PATH.read_text(encoding="utf-8")
+
+    assert "self.mobile_web_server = None" in source
+    assert "self._start_mobile_web_server()" in source
+
+
+def test_close_event_stops_mobile_web_server() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("closeEvent"),
+    ) or ""
+
+    assert "self._stop_mobile_web_server()" in source_segment
+
+
 def test_preview_and_fast_markers_use_unified_signal_text() -> None:
     source = APP_PATH.read_text(encoding="utf-8")
 

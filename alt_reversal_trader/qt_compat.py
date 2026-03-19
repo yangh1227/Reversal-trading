@@ -25,6 +25,7 @@ try:
     _qtcore, _qtgui, _qtwebenginewidgets, _qtwidgets = _load_pyqt5_bindings()
 
     QEvent = _qtcore.QEvent
+    QObject = _qtcore.QObject
     QPropertyAnimation = _qtcore.QPropertyAnimation
     Qt = _qtcore.Qt
     QThread = _qtcore.QThread
@@ -86,6 +87,7 @@ except ImportError:
     _qtcore, _qtgui, _qtwebenginecore, _qtwebenginewidgets, _qtwidgets = _load_pyqt6_bindings()
 
     QEvent = _qtcore.QEvent
+    QObject = _qtcore.QObject
     QPropertyAnimation = _qtcore.QPropertyAnimation
     Qt = _qtcore.Qt
     QThread = _qtcore.QThread
@@ -195,6 +197,7 @@ __all__ = [
     "QMessageBox",
     "QPlainTextEdit",
     "QProgressBar",
+    "QObject",
     "QPropertyAnimation",
     "QPushButton",
     "QRadioButton",

@@ -5,3 +5,5 @@ pandas_ta
 numpy
 requests
 websocket-client
+fastapi
+uvicorn
