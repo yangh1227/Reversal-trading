@@ -1228,14 +1228,14 @@ class _TradeEngine:
             self._evaluate_backtest_auto_close(state)
             signal_on_load = _auto_trade_signal_from_backtest(backtest)
             if trigger_bar_time is not None:
-                self.log(f"[자동매매 진단] {state.symbol}/{state.interval} 로드완료: 신선한 진입봉={trigger_bar_time}, 신호={signal_on_load and (signal_on_load['side'] + '/존' + str(signal_on_load['zone'])) or '없음'}")
+                print(f"[자동매매 진단] {state.symbol}/{state.interval} 로드완료: 신선한 진입봉={trigger_bar_time}, 신호={signal_on_load and (signal_on_load['side'] + '/존' + str(signal_on_load['zone'])) or '없음'}")
                 self._evaluate_auto_trade(
                     trigger_symbol=state.symbol,
                     trigger_interval=state.interval,
                     trigger_bar_time=trigger_bar_time,
                 )
             else:
-                self.log(f"[자동매매 진단] {state.symbol}/{state.interval} 로드완료: 신선한 진입봉 없음, 신호={signal_on_load and (signal_on_load['side'] + '/존' + str(signal_on_load['zone'])) or '없음'} → 주기점검으로만 진입가능")
+                print(f"[자동매매 진단] {state.symbol}/{state.interval} 로드완료: 신선한 진입봉 없음, 신호={signal_on_load and (signal_on_load['side'] + '/존' + str(signal_on_load['zone'])) or '없음'} → 주기점검으로만 진입가능")
                 self._evaluate_auto_trade()
         except Exception:
             self.log(traceback.format_exc())
@@ -1589,7 +1589,7 @@ class _TradeEngine:
         for item in eligible_items:
             if item.symbol in self.pending_order_symbols:
                 if _dbg_trigger and item.symbol == trigger_symbol:
-                    self.log(f"[자동매매 진단] {item.symbol}/{item.interval}: 주문 대기 중 → 스킵")
+                    print(f"[자동매매 진단] {item.symbol}/{item.interval}: 주문 대기 중 → 스킵")
                 continue
             if trigger_symbol and item.symbol != trigger_symbol:
                 continue
@@ -1598,18 +1598,18 @@ class _TradeEngine:
             open_position = open_positions_by_symbol.get(item.symbol)
             if open_positions_by_symbol and open_position is None:
                 if _dbg_trigger:
-                    self.log(f"[자동매매 진단] {item.symbol}/{item.interval}: 다른 심볼 포지션 존재({list(open_positions_by_symbol)}) → 신규진입 스킵")
+                    print(f"[자동매매 진단] {item.symbol}/{item.interval}: 다른 심볼 포지션 존재({list(open_positions_by_symbol)}) → 신규진입 스킵")
                 continue
             if open_position is not None:
                 remembered_interval = self.position_intervals.get(item.symbol)
                 if remembered_interval in APP_INTERVAL_OPTIONS and remembered_interval != item.interval:
                     if _dbg_trigger:
-                        self.log(f"[자동매매 진단] {item.symbol}/{item.interval}: 포지션 인터벌 불일치({remembered_interval}) → 스킵")
+                        print(f"[자동매매 진단] {item.symbol}/{item.interval}: 포지션 인터벌 불일치({remembered_interval}) → 스킵")
                     continue
             latest_backtest = self._latest_auto_trade_backtest(item)
             if latest_backtest is None:
                 if _dbg_trigger:
-                    self.log(f"[자동매매 진단] {item.symbol}/{item.interval}: 백테스트 없음(로딩중?) → 스킵")
+                    print(f"[자동매매 진단] {item.symbol}/{item.interval}: 백테스트 없음(로딩중?) → 스킵")
                 continue
             current_price = current_price_for(item.symbol, item.interval)
             filled_fraction = self.filled_fraction_by_symbol.get(
@@ -1643,11 +1643,11 @@ class _TradeEngine:
                 filled_info = f"채움={filled_fraction:.3f}"
                 trigger_info = f"트리거봉={normalized_trigger_time}"
                 if evaluation.candidate:
-                    self.log(f"[자동매매 진단] {item.symbol}/{item.interval}: 진입후보 생성 ✓ | {sig_info} | {pos_info} | {price_info} | {favor_mode} | {filled_info} | {trigger_info}")
+                    print(f"[자동매매 진단] {item.symbol}/{item.interval}: 진입후보 생성 ✓ | {sig_info} | {pos_info} | {price_info} | {favor_mode} | {filled_info} | {trigger_info}")
                 elif evaluation.reentry_position_side:
-                    self.log(f"[자동매매 진단] {item.symbol}/{item.interval}: 재진입 청산 트리거 | {sig_info} | {pos_info}")
+                    print(f"[자동매매 진단] {item.symbol}/{item.interval}: 재진입 청산 트리거 | {sig_info} | {pos_info}")
                 else:
-                    self.log(f"[자동매매 진단] {item.symbol}/{item.interval}: 진입 차단 | {sig_info} | {pos_info} | {price_info} | {favor_mode} | {filled_info} | {trigger_info}")
+                    print(f"[자동매매 진단] {item.symbol}/{item.interval}: 진입 차단 | {sig_info} | {pos_info} | {price_info} | {favor_mode} | {filled_info} | {trigger_info}")
             if evaluation.reentry_position_side:
                 self._trigger_reentry_auto_close(item.symbol, evaluation.reentry_position_side, latest_backtest)
                 continue
@@ -1710,7 +1710,7 @@ class _TradeEngine:
         chosen = pick_auto_trade_candidate(candidates, self.optimization_rank_mode)
         if chosen is None:
             if _dbg_trigger and not candidates:
-                self.log(f"[자동매매 진단] 트리거={trigger_symbol}/{trigger_interval} 봉시각={normalized_trigger_time}: 후보 없음 → 진입 안함")
+                print(f"[자동매매 진단] 트리거={trigger_symbol}/{trigger_interval} 봉시각={normalized_trigger_time}: 후보 없음 → 진입 안함")
             return
         # Remember the cursor entry_time on first entry so we can detect
         # close→reopen cycles on subsequent evaluations.
