@@ -567,9 +567,9 @@ class BinanceFuturesClient:
             ticker = ticker_map[symbol]
 
             if use_surge_filter:
-                # 급등종목 모드: 24h 등락률 >= +15%, 30m RSI >= 65
+                # 급등종목 모드: 24h 등락률 >= +10%, 30m RSI >= 65
                 price_change = float(ticker.get("priceChangePercent", 0.0) or 0.0)
-                if price_change < 15.0:
+                if price_change < 10.0:
                     return None
                 rsi_30m_limit = min(max(14 * 3, 60), 99)
                 rsi_30m_df = _rows_to_ohlcv_frame(self.klines(symbol, "30m", limit=rsi_30m_limit, ttl_seconds=0.0))
@@ -654,7 +654,7 @@ class BinanceFuturesClient:
         if use_surge_filter:
             active_filters = [
                 f"24h 거래량 {quote_volume_min:,.0f}+",
-                "24h 등락률 +15%+",
+                "24h 등락률 +10%+",
                 "30m RSI >= 65",
             ]
         else:

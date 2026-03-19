@@ -53,6 +53,7 @@ from .qt_compat import (
     QCheckBox,
     QColor,
     QComboBox,
+    QFontMetrics,
     QDoubleSpinBox,
     QFormLayout,
     QGraphicsOpacityEffect,
@@ -2028,7 +2029,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.filter_preset_combo = QComboBox()
         self.filter_preset_combo.addItem("변동성", "변동성")
         self.filter_preset_combo.addItem("급등종목", "급등종목")
-        self.surge_info_label = QLabel("30m RSI≥65 / 거래량≥1M / 24h≥+15%")
+        self.surge_info_label = QLabel("30m RSI≥65 / 거래량≥1M / 24h≥+10%")
         self.surge_info_label.setStyleSheet("color: gray; font-size: 10px;")
         self.daily_vol_spin = QDoubleSpinBox()
         self.daily_vol_spin.setRange(0.0, 500.0)
@@ -2232,7 +2233,15 @@ class AltReversalTraderWindow(QMainWindow):
         return group
 
     def _build_optimized_group(self) -> QGroupBox:
-        group = QGroupBox("최적화 종목")
+        self.optimized_group = QGroupBox("최적화 종목")
+        group = self.optimized_group
+        # Overlay label for favorable count — positioned in the title bar area
+        self.optimized_favorable_label = QLabel("", group)
+        self.optimized_favorable_label.setStyleSheet(
+            "color: #1a8a2a; font-weight: bold; background: transparent;"
+        )
+        self.optimized_favorable_label.hide()
+        group.installEventFilter(self)
         layout = QVBoxLayout(group)
         self.optimized_table = QTableWidget(0, 9)
         self.optimized_table.setHorizontalHeaderLabels(["Symbol", "TF", "Score", "Return%", "MDD%", "Trades", "Win%", "PF", "Grid"])
@@ -2245,6 +2254,20 @@ class AltReversalTraderWindow(QMainWindow):
         self.optimized_table.cellClicked.connect(self.on_optimized_cell_clicked)
         layout.addWidget(self.optimized_table)
         return group
+
+    def _reposition_favorable_label(self) -> None:
+        group = getattr(self, "optimized_group", None)
+        label = getattr(self, "optimized_favorable_label", None)
+        if group is None or label is None:
+            return
+        fm = QFontMetrics(group.font())
+        title_width = fm.horizontalAdvance("최적화 종목")
+        # QGroupBox title starts at ~9px left margin; add a small gap after the text
+        x = 9 + title_width + 6
+        # Vertical centre of the title bar: half the font height above midpoint
+        y = (group.fontMetrics().height() - label.sizeHint().height()) // 2
+        label.move(x, max(y, 2))
+        label.adjustSize()
 
     def _build_positions_group(self) -> QGroupBox:
         group = QGroupBox("Open Positions")
@@ -4484,7 +4507,15 @@ class AltReversalTraderWindow(QMainWindow):
         history: Optional[pd.DataFrame],
         seed_backtest: Optional[BacktestResult],
         strategy_settings: StrategySettings,
+        *,
+        fast_only: bool = False,
     ) -> Optional[BacktestResult]:
+        """Materialize a cached backtest for immediate display.
+
+        When fast_only=True (used on the main/UI thread), skip full run_backtest()
+        and return seed_backtest instead — the background worker will compute the
+        authoritative result shortly after.
+        """
         if history is None or history.empty:
             return seed_backtest
         if seed_backtest is not None and seed_backtest.settings == strategy_settings:
@@ -4498,6 +4529,9 @@ class AltReversalTraderWindow(QMainWindow):
                     fee_rate=self.settings.fee_rate,
                     backtest_start_time=pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms"),
                 )
+        if fast_only:
+            # Full run_backtest() would block the UI thread — defer to worker.
+            return seed_backtest
         return run_backtest(
             history,
             settings=strategy_settings,
@@ -4898,7 +4932,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.load_worker = None
         if worker is not None and worker.isRunning():
             worker.requestInterruption()
-            worker.wait(1500)
+            worker.wait(100)
 
     def _stop_chart_history_page_worker(self) -> None:
         worker = self.chart_history_page_worker
@@ -4907,7 +4941,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.chart_history_load_requested = False
         if worker is not None and worker.isRunning():
             worker.requestInterruption()
-            worker.wait(1500)
+            worker.wait(100)
 
     def _stop_live_backtest_worker(self) -> None:
         worker = self.live_backtest_worker
@@ -4915,7 +4949,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.live_recalc_pending = False
         if worker is not None and worker.isRunning():
             worker.requestInterruption()
-            worker.wait(1500)
+            worker.wait(100)
 
     def _stop_account_worker(self) -> None:
         worker = self.account_worker
@@ -4981,7 +5015,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.live_update_timer.stop()
         if worker is not None:
             worker.stop()
-            worker.wait(1500)
+            worker.wait(100)
         if self.chart is not None:
             self._render_lightweight_markers()
 
@@ -5610,16 +5644,26 @@ class AltReversalTraderWindow(QMainWindow):
         price_map = self._optimized_table_price_map(log_failures=False)
         favorable_row_brush = QColor(OPTIMIZED_TABLE_FAVORABLE_ROW_COLOR)
         default_row_brush = self.optimized_table.palette().base().color()
+        favorable_count = 0
         for row, result in enumerate(ordered):
             favorable_entry = self._optimized_result_has_favorable_entry(
                 result,
                 price_map.get(result.symbol),
             )
+            if favorable_entry:
+                favorable_count += 1
             brush = favorable_row_brush if favorable_entry else default_row_brush
             for col in range(self.optimized_table.columnCount()):
                 item = self.optimized_table.item(row, col)
                 if item is not None:
                     item.setBackground(brush)
+        if hasattr(self, "optimized_favorable_label"):
+            if favorable_count:
+                self.optimized_favorable_label.setText(f"(유리: {favorable_count})")
+                self.optimized_favorable_label.show()
+                self._reposition_favorable_label()
+            else:
+                self.optimized_favorable_label.hide()
 
     def update_optimized_table(self) -> None:
         self.optimized_table.setUpdatesEnabled(False)
@@ -5627,6 +5671,7 @@ class AltReversalTraderWindow(QMainWindow):
         price_map = self._optimized_table_price_map(log_failures=True)
         favorable_row_brush = QColor(OPTIMIZED_TABLE_FAVORABLE_ROW_COLOR)
         self.optimized_table.setRowCount(len(ordered))
+        favorable_count = 0
         for row, result in enumerate(ordered):
             metrics = result.best_backtest.metrics
             result_interval = result.best_interval or self.settings.kline_interval
@@ -5634,6 +5679,8 @@ class AltReversalTraderWindow(QMainWindow):
                 result,
                 price_map.get(result.symbol),
             )
+            if favorable_entry:
+                favorable_count += 1
             values = [
                 result.symbol,
                 result_interval,
@@ -5652,6 +5699,13 @@ class AltReversalTraderWindow(QMainWindow):
                     item.setBackground(favorable_row_brush)
                 self.optimized_table.setItem(row, col, item)
         self.optimized_table.setUpdatesEnabled(True)
+        if hasattr(self, "optimized_favorable_label"):
+            if favorable_count:
+                self.optimized_favorable_label.setText(f"(유리: {favorable_count})")
+                self.optimized_favorable_label.show()
+                self._reposition_favorable_label()
+            else:
+                self.optimized_favorable_label.hide()
         self._sync_trade_engine_state()
 
     def _schedule_optimized_table_refresh(self) -> None:
@@ -5948,6 +6002,11 @@ class AltReversalTraderWindow(QMainWindow):
         )
 
     def eventFilter(self, source: object, event: object) -> bool:
+        if source is getattr(self, "optimized_group", None):
+            if hasattr(event, "type"):
+                et = int(event.type())
+                if et in (14, 17):  # QEvent::Resize=14, QEvent::Show=17
+                    self._reposition_favorable_label()
         if source in (getattr(self, "candidate_table", None), getattr(self, "optimized_table", None)):
             if hasattr(event, "type") and event.type() == EVENT_KEY_PRESS:
                 key = event.key()
@@ -6059,7 +6118,7 @@ class AltReversalTraderWindow(QMainWindow):
             )
         )
         cached_backtest = (
-            self._materialize_cached_backtest(symbol, target_interval, cached_history, seed_backtest, initial_settings)
+            self._materialize_cached_backtest(symbol, target_interval, cached_history, seed_backtest, initial_settings, fast_only=True)
             if should_refresh_initial_backtest
             else seed_backtest
         )
@@ -6181,7 +6240,7 @@ class AltReversalTraderWindow(QMainWindow):
             or render_signature != self.chart_render_signature
         )
         if needs_render:
-            self.render_chart(symbol, self.current_backtest, reset_view=reset_view, chart_indicators=self.current_chart_indicators)
+            self.render_chart(symbol, self.current_backtest, reset_view=reset_view, chart_indicators=self.current_chart_indicators, _precomputed_payload=(candle_df, indicators, equity_df, markers))
         else:
             self.chart_render_signature = render_signature
             self._sync_current_chart_snapshot(symbol, self.current_interval, render_signature=render_signature)
@@ -6223,6 +6282,7 @@ class AltReversalTraderWindow(QMainWindow):
         reset_view: bool = True,
         chart_indicators: Optional[pd.DataFrame] = None,
         reveal_overlay: bool = True,
+        _precomputed_payload: Optional[tuple] = None,
     ) -> None:
         snapshot = self._sync_current_chart_snapshot(
             symbol,
@@ -6232,7 +6292,10 @@ class AltReversalTraderWindow(QMainWindow):
         )
         if snapshot is None:
             return
-        candle_df, indicators, equity_df, markers = self._build_chart_render_payload(snapshot)
+        if _precomputed_payload is not None:
+            candle_df, indicators, equity_df, markers = _precomputed_payload
+        else:
+            candle_df, indicators, equity_df, markers = self._build_chart_render_payload(snapshot)
         self.current_lightweight_preview_markers = []
         self.current_lightweight_fast_entry_markers = []
         self.current_lightweight_fast_exit_markers = []

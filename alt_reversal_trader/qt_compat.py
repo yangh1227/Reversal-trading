@@ -33,6 +33,7 @@ try:
     Signal = _qtcore.pyqtSignal
     QBrush = _qtgui.QBrush
     QColor = _qtgui.QColor
+    QFontMetrics = _qtgui.QFontMetrics
     QWebEngineSettings = _qtwebenginewidgets.QWebEngineSettings
     QWebEngineView = _qtwebenginewidgets.QWebEngineView
     QAbstractItemView = _qtwidgets.QAbstractItemView
@@ -93,6 +94,7 @@ except ImportError:
     Signal = _qtcore.pyqtSignal
     QBrush = _qtgui.QBrush
     QColor = _qtgui.QColor
+    QFontMetrics = _qtgui.QFontMetrics
     QWebEngineSettings = _qtwebenginecore.QWebEngineSettings
     QWebEngineView = _qtwebenginewidgets.QWebEngineView
     QAbstractItemView = _qtwidgets.QAbstractItemView
@@ -180,6 +182,7 @@ __all__ = [
     "QColor",
     "QComboBox",
     "QDoubleSpinBox",
+    "QFontMetrics",
     "QFormLayout",
     "QGraphicsOpacityEffect",
     "QGridLayout",
