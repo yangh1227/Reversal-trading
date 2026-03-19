@@ -99,6 +99,11 @@ class EngineCloseOrderCommand:
 
 
 @dataclass(frozen=True)
+class EngineCloseAllPositionsCommand:
+    pass
+
+
+@dataclass(frozen=True)
 class EngineStopCommand:
     pass
 
@@ -801,6 +806,9 @@ class _TradeEngine:
                 continue
             if isinstance(command, EngineOpenOrderCommand):
                 self._handle_manual_open(command)
+                continue
+            if isinstance(command, EngineCloseAllPositionsCommand):
+                self._handle_manual_close_all(command)
                 continue
             if isinstance(command, EngineCloseOrderCommand):
                 self._handle_manual_close(command)
@@ -1930,6 +1938,20 @@ class _TradeEngine:
 
     def _handle_manual_close(self, command: EngineCloseOrderCommand) -> None:
         self._enqueue_close_order(command.symbol, command.reason, auto_close=command.auto_close)
+
+    def _handle_manual_close_all(self, _command: EngineCloseAllPositionsCommand) -> None:
+        if not self.open_positions:
+            self.emit(
+                EngineOrderFailedEvent(
+                    symbol="*",
+                    message="No open positions to close",
+                    auto_close=False,
+                    auto_trade=False,
+                )
+            )
+            return
+        for symbol in sorted(self.open_positions):
+            self._enqueue_close_order(symbol, None, auto_close=False)
 
 
 def run_trade_engine_process(command_queue: mp.Queue, event_queue: mp.Queue) -> None:

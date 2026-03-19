@@ -116,7 +116,18 @@ def test_close_selected_position_requires_confirmation() -> None:
 
     assert "QMessageBox.question" in source_segment
     assert "전체청산 확인" in source_segment
-    assert "포지션을 전체청산할까요?" in source_segment
+    assert "보유 포지션" in source_segment
+    assert "개를 모두 전체청산할까요?" in source_segment
+    assert "self.close_all_positions()" in source_segment
+
+
+def test_close_all_positions_sends_engine_close_all_command() -> None:
+    method = _window_method_node("close_all_positions")
+    source_segment = ast.get_source_segment(APP_PATH.read_text(encoding="utf-8"), method) or ""
+
+    assert "EngineCloseAllPositionsCommand()" in source_segment
+    assert 'self.statusBar().showMessage("전체 포지션 청산 처리 중...", 3000)' in source_segment
+    assert 'self.show_warning("청산할 포지션이 없습니다.")' in source_segment
 
 
 def test_live_order_close_button_uses_total_close_label() -> None:
@@ -124,6 +135,7 @@ def test_live_order_close_button_uses_total_close_label() -> None:
 
     assert 'QPushButton("전체청산")' in source
     assert 'setFixedWidth(156)' in source
+    assert 'setToolTip("현재 보유 중인 모든 포지션 전체 청산")' in source
 
 
 def test_preview_and_fast_markers_use_unified_signal_text() -> None:
@@ -466,7 +478,7 @@ def test_backtest_summary_moves_to_button_dialog_and_frees_chart_space() -> None
     update_source = ast.get_source_segment(source, _window_method_node("update_summary")) or ""
     show_source = ast.get_source_segment(source, _window_method_node("show_backtest_summary")) or ""
 
-    assert 'self.backtest_summary_button = QPushButton("백테스트 서머리")' in build_ui_source
+    assert 'self.backtest_summary_button = QPushButton("백테스트 요약")' in build_ui_source
     assert "self.backtest_summary_button.clicked.connect(self.show_backtest_summary)" in build_ui_source
     assert "actions_row.addWidget(self.backtest_summary_button)" in build_ui_source
     assert 'summary_group = QGroupBox("Backtest Summary")' not in build_ui_source
@@ -523,6 +535,21 @@ def test_backtest_progress_uses_staged_status_updates() -> None:
     assert "self.optimize_worker.phase_update.connect(self._update_backtest_progress_phase)" in start_source
     assert 'self.backtest_progress_status_text = f"히스토리 로드중' in update_source
     assert 'self.backtest_progress_status_text = f"프로세스 준비중' in update_source
+
+
+def test_optimized_favorable_badge_uses_green_chip_style() -> None:
+    build_source = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_build_optimized_group"),
+    ) or ""
+    update_source = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("update_optimized_table"),
+    ) or ""
+
+    assert "background: #1f9d55" in build_source
+    assert "color: #ffffff" in build_source
+    assert 'self.optimized_favorable_label.setText("유리" if favorable_count == 1 else f"유리 {favorable_count}")' in update_source
 
 
 def test_status_strip_uses_uniform_spacing_and_label_heights() -> None:

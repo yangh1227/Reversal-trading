@@ -93,6 +93,7 @@ from .strategy import (
     signal_fraction_for_zone,
 )
 from .trade_engine import (
+    EngineCloseAllPositionsCommand,
     EngineCloseOrderCommand,
     EngineHealthEvent,
     EngineLogEvent,
@@ -1780,7 +1781,7 @@ class AltReversalTraderWindow(QMainWindow):
 
         actions_row = QHBoxLayout()
         self.save_settings_button = QPushButton("설정 저장")
-        self.backtest_summary_button = QPushButton("백테스트 서머리")
+        self.backtest_summary_button = QPushButton("백테스트 요약")
         self.scan_button = QPushButton("후보 스캔 + 최적화")
         self.auto_trade_button = QPushButton()
         self.auto_trade_button.toggled.connect(self._toggle_auto_trade_mode)
@@ -1949,7 +1950,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.close_position_button.clicked.connect(self.close_selected_position)
         self.close_position_button.setText("전체청산")
         self.close_position_button.setFixedWidth(156)
-        self.close_position_button.setToolTip("현재 선택 종목 포지션 전체 청산")
+        self.close_position_button.setToolTip("현재 보유 중인 모든 포지션 전체 청산")
         close_row = QHBoxLayout()
         close_row.addStretch(1)
         close_row.addWidget(self.close_position_button)
@@ -2303,7 +2304,7 @@ class AltReversalTraderWindow(QMainWindow):
         # Overlay label for favorable count — positioned in the title bar area
         self.optimized_favorable_label = QLabel("", group)
         self.optimized_favorable_label.setStyleSheet(
-            "color: #1a8a2a; font-weight: bold; background: transparent;"
+            "color: #ffffff; font-weight: 700; background: #1f9d55; border-radius: 8px; padding: 1px 8px;"
         )
         self.optimized_favorable_label.hide()
         group.installEventFilter(self)
@@ -2327,12 +2328,10 @@ class AltReversalTraderWindow(QMainWindow):
             return
         fm = QFontMetrics(group.font())
         title_width = fm.horizontalAdvance("최적화 종목")
-        # QGroupBox title starts at ~9px left margin; add a small gap after the text
-        x = 9 + title_width + 6
-        # Vertical centre of the title bar: half the font height above midpoint
-        y = (group.fontMetrics().height() - label.sizeHint().height()) // 2
-        label.move(x, max(y, 2))
         label.adjustSize()
+        x = 9 + title_width + 8
+        y = max(1, (group.fontMetrics().height() - label.height()) // 2)
+        label.move(x, y)
 
     def _build_positions_group(self) -> QGroupBox:
         group = QGroupBox("Open Positions")
@@ -5724,7 +5723,7 @@ class AltReversalTraderWindow(QMainWindow):
                     item.setBackground(brush)
         if hasattr(self, "optimized_favorable_label"):
             if favorable_count:
-                self.optimized_favorable_label.setText(f"(유리: {favorable_count})")
+                self.optimized_favorable_label.setText("유리" if favorable_count == 1 else f"유리 {favorable_count}")
                 self.optimized_favorable_label.show()
                 self._reposition_favorable_label()
             else:
@@ -5766,7 +5765,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.optimized_table.setUpdatesEnabled(True)
         if hasattr(self, "optimized_favorable_label"):
             if favorable_count:
-                self.optimized_favorable_label.setText(f"(유리: {favorable_count})")
+                self.optimized_favorable_label.setText("유리" if favorable_count == 1 else f"유리 {favorable_count}")
                 self.optimized_favorable_label.show()
                 self._reposition_favorable_label()
             else:
@@ -7045,16 +7044,48 @@ class AltReversalTraderWindow(QMainWindow):
             standard_button = getattr(QMessageBox, "StandardButton", None)
             yes_button = standard_button.Yes
             no_button = standard_button.No
+        open_symbols = sorted(position.symbol for position in self.open_positions)
+        if not open_symbols:
+            self.show_warning("청산할 포지션이 없습니다.")
+            return
         answer = QMessageBox.question(
             self,
             "전체청산 확인",
-            f"{self.current_symbol} 포지션을 전체청산할까요?",
+            f"보유 포지션 {len(open_symbols)}개를 모두 전체청산할까요?\n" + ", ".join(open_symbols),
             yes_button | no_button,
             no_button,
         )
         if answer != yes_button:
             return
-        self.close_position_for_symbol(self.current_symbol)
+        self.close_all_positions()
+
+    def close_all_positions(self) -> None:
+        self._sync_settings()
+        if not self.settings.api_key or not self.settings.api_secret:
+            self.show_warning("API Key / Secret을 입력해야 실제 주문이 가능합니다.")
+            return
+        if self._is_order_pending():
+            self.show_warning("이미 주문 처리 중입니다.")
+            return
+        if not self.open_positions:
+            self.show_warning("청산할 포지션이 없습니다.")
+            return
+        if not self._ensure_trade_engine_available():
+            self.show_error("Trade engine is not available.")
+            return
+        self.order_worker_symbol = "*"
+        self.order_worker_is_auto_close = False
+        self.order_worker_is_auto_trade = False
+        self.engine_order_pending = True
+        self.pending_open_order_interval = None
+        self._set_order_buttons_enabled(False)
+        self.statusBar().showMessage("전체 포지션 청산 처리 중...", 3000)
+        try:
+            self.trade_engine.send(EngineCloseAllPositionsCommand())
+        except Exception as exc:
+            self.engine_order_pending = False
+            self._set_order_buttons_enabled(True)
+            self._on_order_failed(f"Trade engine close-all failed: {exc}")
 
     def _submit_close_position(self, symbol: str, auto_close_reason: Optional[str] = None) -> bool:
         self._sync_settings()

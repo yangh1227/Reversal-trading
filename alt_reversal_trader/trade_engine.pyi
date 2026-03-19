@@ -53,6 +53,11 @@ class EngineCloseOrderCommand:
 
 
 @dataclass(frozen=True)
+class EngineCloseAllPositionsCommand:
+    pass
+
+
+@dataclass(frozen=True)
 class EngineStopCommand:
     pass
 
