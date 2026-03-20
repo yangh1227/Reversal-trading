@@ -161,6 +161,15 @@ class _UiInvoker(QObject):
             raise payload["error"]  # type: ignore[misc]
         return payload["result"]
 
+    def post(self, fn: Callable[[], Any]) -> None:
+        payload: dict[str, object] = {
+            "fn": fn,
+            "done": threading.Event(),
+            "result": None,
+            "error": None,
+        }
+        self.dispatch.emit(payload)
+
 
 @dataclass
 class _SessionState:
@@ -350,7 +359,8 @@ class MobileWebServer:
             fraction = float(payload.get("fraction", 0.0) or 0.0)
             if side not in {"BUY", "SELL"}:
                 raise HTTPException(status_code=400, detail="BUY 또는 SELL만 가능합니다.")
-            return JSONResponse(self.invoker.call(lambda: self._submit_fractional_order(symbol, interval, side, fraction)))
+            self.invoker.post(lambda: self._submit_fractional_order(symbol, interval, side, fraction))
+            return JSONResponse({"ok": True, "queued": True})
 
         @app.post("/api/order/simple")
         async def api_order_simple(request: Request) -> JSONResponse:
@@ -362,7 +372,8 @@ class MobileWebServer:
             amount = float(payload.get("amount", 0.0) or 0.0)
             if side not in {"BUY", "SELL"}:
                 raise HTTPException(status_code=400, detail="BUY 또는 SELL만 가능합니다.")
-            return JSONResponse(self.invoker.call(lambda: self._submit_simple_order(symbol, interval, side, amount)))
+            self.invoker.post(lambda: self._submit_simple_order(symbol, interval, side, amount))
+            return JSONResponse({"ok": True, "queued": True})
 
         @app.post("/api/positions/close-all")
         async def api_close_all(request: Request) -> JSONResponse:

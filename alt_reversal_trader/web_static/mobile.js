@@ -172,7 +172,7 @@ function updateReferenceLines(payload) {
     price: currentPrice,
     color: "#24fc0c",
     lineWidth: 1,
-    lineStyle: LightweightCharts.LineStyle.SparseDotted,
+    lineStyle: LightweightCharts.LineStyle.Dotted,
     axisLabelVisible: true,
   });
 }

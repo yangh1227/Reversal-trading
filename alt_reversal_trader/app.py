@@ -5318,15 +5318,17 @@ class AltReversalTraderWindow(QMainWindow):
         self.chart_indicator_cache[cache_key] = self.current_chart_indicators
         self._prune_caches()
         apply_started_at = time.perf_counter()
-        applied_incrementally = self._apply_incremental_lightweight_backtest(
-            symbol,
-            previous_backtest,
-            previous_chart_indicators,
-            self.current_backtest,
-            self.current_chart_indicators,
-            chart_history,
-            skip_candle_update=has_newer_live_bar,
-        )
+        applied_incrementally = False
+        if not has_newer_live_bar:
+            applied_incrementally = self._apply_incremental_lightweight_backtest(
+                symbol,
+                previous_backtest,
+                previous_chart_indicators,
+                self.current_backtest,
+                self.current_chart_indicators,
+                chart_history,
+                skip_candle_update=False,
+            )
         if not applied_incrementally:
             self.render_chart(symbol, self.current_backtest, reset_view=False, chart_indicators=self.current_chart_indicators)
         if has_newer_live_bar:
