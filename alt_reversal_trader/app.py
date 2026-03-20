@@ -92,6 +92,7 @@ from .strategy import (
     run_backtest,
     signal_fraction_for_zone,
 )
+from .telegram_notifier import TelegramNotifier
 from .trade_engine import (
     EngineCloseAllPositionsCommand,
     EngineCloseOrderCommand,
@@ -1687,6 +1688,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.optimized_table_timer = QTimer(self)
         self.optimized_table_highlight_timer = QTimer(self)
         self.trade_engine_poll_timer = QTimer(self)
+        self.telegram_notifier = TelegramNotifier(log=self._log_telegram_failure)
+        self.telegram_favorable_symbols: set[str] = set()
         self.backtest_summary_text = ""
         self.backtest_summary_window: Optional[QWidget] = None
         self.backtest_summary_box: Optional[QPlainTextEdit] = None
@@ -3191,6 +3194,9 @@ class AltReversalTraderWindow(QMainWindow):
                         event.interval,
                         prefer_locked_position_settings=True,
                     )
+                self._notify_telegram_auto_trade_entry(event)
+            elif event.auto_close:
+                self._notify_telegram_auto_trade_close(event)
             self._on_order_completed({"symbol": event.symbol, "message": event.message})
             return
         if isinstance(event, EngineOrderFailedEvent):
@@ -5728,6 +5734,73 @@ class AltReversalTraderWindow(QMainWindow):
             filled_fraction,
         ) > 1e-9
 
+    def _log_telegram_failure(self, message: str) -> None:
+        if hasattr(self, "log_box"):
+            self.log(message)
+
+    def _notify_telegram(self, text: str, *, key: str, cooldown_seconds: float = 5.0) -> None:
+        if not text.strip():
+            return
+        self.telegram_notifier.send(text.strip(), key=key, cooldown_seconds=cooldown_seconds)
+
+    def _notify_telegram_auto_trade_entry(self, event: EngineOrderCompletedEvent) -> None:
+        interval = str(event.interval or self.settings.kline_interval)
+        fraction_pct = float(event.fraction or 0.0) * 100.0
+        lines = [
+            "[자동매매 진입]",
+            f"종목: {event.symbol}",
+            f"차트TF: {interval}",
+        ]
+        if fraction_pct > 0:
+            lines.append(f"비중: {fraction_pct:.1f}%")
+        lines.append(str(event.message))
+        self._notify_telegram(
+            "\n".join(lines),
+            key=f"auto-trade-entry:{event.symbol}:{interval}:{fraction_pct:.1f}:{event.message}",
+            cooldown_seconds=3.0,
+        )
+
+    def _notify_telegram_auto_trade_close(self, event: EngineOrderCompletedEvent) -> None:
+        interval = str(event.interval or self.settings.kline_interval)
+        self._notify_telegram(
+            "\n".join(
+                [
+                    "[자동매매 청산]",
+                    f"종목: {event.symbol}",
+                    f"차트TF: {interval}",
+                    str(event.message),
+                ]
+            ),
+            key=f"auto-trade-close:{event.symbol}:{interval}:{event.message}",
+            cooldown_seconds=3.0,
+        )
+
+    def _update_favorable_telegram_alerts(
+        self,
+        favorable_rows: List[Tuple[str, str, Optional[float]]],
+    ) -> None:
+        current_symbols = {symbol for symbol, _interval, _price in favorable_rows}
+        new_symbols = current_symbols - self.telegram_favorable_symbols
+        self.telegram_favorable_symbols = current_symbols
+        if not new_symbols:
+            return
+        favorable_map = {symbol: (interval, price) for symbol, interval, price in favorable_rows}
+        for symbol in sorted(new_symbols):
+            interval, price = favorable_map[symbol]
+            price_text = f"{float(price):.12f}".rstrip("0").rstrip(".") if price else "-"
+            self._notify_telegram(
+                "\n".join(
+                    [
+                        "[유리한 가격 새 발생]",
+                        f"종목: {symbol}",
+                        f"차트TF: {interval}",
+                        f"현재가: {price_text}",
+                    ]
+                ),
+                key=f"favorable:{symbol}:{interval}",
+                cooldown_seconds=30.0,
+            )
+
     def _refresh_optimized_table_highlights(self) -> None:
         if not hasattr(self, "optimized_table"):
             return
@@ -5739,18 +5812,22 @@ class AltReversalTraderWindow(QMainWindow):
         favorable_row_brush = QColor(OPTIMIZED_TABLE_FAVORABLE_ROW_COLOR)
         default_row_brush = self.optimized_table.palette().base().color()
         favorable_count = 0
+        favorable_rows: List[Tuple[str, str, Optional[float]]] = []
         for row, result in enumerate(ordered):
+            result_interval = result.best_interval or self.settings.kline_interval
             favorable_entry = self._optimized_result_has_favorable_entry(
                 result,
                 price_map.get(result.symbol),
             )
             if favorable_entry:
                 favorable_count += 1
+                favorable_rows.append((result.symbol, result_interval, price_map.get(result.symbol)))
             brush = favorable_row_brush if favorable_entry else default_row_brush
             for col in range(self.optimized_table.columnCount()):
                 item = self.optimized_table.item(row, col)
                 if item is not None:
                     item.setBackground(brush)
+        self._update_favorable_telegram_alerts(favorable_rows)
         if hasattr(self, "optimized_favorable_label"):
             if favorable_count:
                 self.optimized_favorable_label.setText("유리" if favorable_count == 1 else f"유리 {favorable_count}")
@@ -5766,6 +5843,7 @@ class AltReversalTraderWindow(QMainWindow):
         favorable_row_brush = QColor(OPTIMIZED_TABLE_FAVORABLE_ROW_COLOR)
         self.optimized_table.setRowCount(len(ordered))
         favorable_count = 0
+        favorable_rows: List[Tuple[str, str, Optional[float]]] = []
         for row, result in enumerate(ordered):
             metrics = result.best_backtest.metrics
             result_interval = result.best_interval or self.settings.kline_interval
@@ -5775,6 +5853,7 @@ class AltReversalTraderWindow(QMainWindow):
             )
             if favorable_entry:
                 favorable_count += 1
+                favorable_rows.append((result.symbol, result_interval, price_map.get(result.symbol)))
             values = [
                 result.symbol,
                 result_interval,
@@ -5793,6 +5872,7 @@ class AltReversalTraderWindow(QMainWindow):
                     item.setBackground(favorable_row_brush)
                 self.optimized_table.setItem(row, col, item)
         self.optimized_table.setUpdatesEnabled(True)
+        self._update_favorable_telegram_alerts(favorable_rows)
         if hasattr(self, "optimized_favorable_label"):
             if favorable_count:
                 self.optimized_favorable_label.setText("유리" if favorable_count == 1 else f"유리 {favorable_count}")
