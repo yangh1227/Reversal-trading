@@ -12,6 +12,7 @@ let liveSocketRetryTimer = null;
 let countdownTimer = null;
 let countdownDeadlineMs = null;
 let foregroundSyncTimer = null;
+let recoverUiTimer = null;
 
 const els = {
   loginView: document.getElementById("login-view"),
@@ -177,6 +178,21 @@ function updateReferenceLines(payload) {
     lineStyle: LightweightCharts.LineStyle.Dotted,
     axisLabelVisible: true,
   });
+}
+
+function queueUiRecovery(delayMs = 1500) {
+  if (recoverUiTimer) {
+    clearTimeout(recoverUiTimer);
+    recoverUiTimer = null;
+  }
+  recoverUiTimer = setTimeout(() => {
+    recoverUiTimer = null;
+    if (els.appView.classList.contains("hidden")) {
+      return;
+    }
+    showToast("연결 복구 중...", "info", 2000);
+    queueForegroundSync(0);
+  }, Math.max(0, Number(delayMs) || 0));
 }
 
 function applyPriceFormat(format) {
@@ -453,7 +469,13 @@ function connectLiveSocket() {
   liveSocket = new WebSocket(`${scheme}://${window.location.host}/ws/live`);
 
   liveSocket.onmessage = (event) => {
-    const payload = JSON.parse(event.data || "{}");
+    let payload = {};
+    try {
+      payload = JSON.parse(event.data || "{}");
+    } catch (_error) {
+      queueUiRecovery(250);
+      return;
+    }
     if (payload.type === "dashboard" && payload.data) {
       applyDashboardState(payload.data);
       return;
@@ -467,6 +489,7 @@ function connectLiveSocket() {
 
   liveSocket.onclose = () => {
     liveSocket = null;
+    queueUiRecovery(250);
     liveSocketRetryTimer = setTimeout(() => {
       if (!els.appView.classList.contains("hidden")) {
         connectLiveSocket();
@@ -549,6 +572,7 @@ function stopPolling() {
   if (countdownTimer) clearInterval(countdownTimer);
   if (liveSocketRetryTimer) clearTimeout(liveSocketRetryTimer);
   if (foregroundSyncTimer) clearTimeout(foregroundSyncTimer);
+  if (recoverUiTimer) clearTimeout(recoverUiTimer);
   if (liveSocket) {
     liveSocket.onclose = null;
     liveSocket.close();
@@ -558,6 +582,7 @@ function stopPolling() {
   countdownTimer = null;
   liveSocketRetryTimer = null;
   foregroundSyncTimer = null;
+  recoverUiTimer = null;
   liveSocket = null;
 }
 
@@ -689,6 +714,14 @@ els.loginSubmit.addEventListener("click", () => login());
 bootstrap().catch((error) => {
   els.loginError.textContent = error.message;
   showLogin(true);
+});
+
+window.addEventListener("error", () => {
+  queueUiRecovery(250);
+});
+
+window.addEventListener("unhandledrejection", () => {
+  queueUiRecovery(250);
 });
 
 document.addEventListener("visibilitychange", () => {

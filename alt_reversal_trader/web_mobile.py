@@ -221,6 +221,14 @@ class MobileWebServer:
         app = FastAPI(title="Alt Reversal Trader Mobile", docs_url=None, redoc_url=None, openapi_url=None)
         app.mount("/mobile-static", StaticFiles(directory=str(WEB_STATIC_DIR)), name="mobile-static")
 
+        @app.exception_handler(Exception)
+        async def handle_uncaught_exception(_request: Request, exc: Exception) -> JSONResponse:
+            try:
+                self.window.log(f"Mobile web error: {exc}")
+            except Exception:
+                pass
+            return JSONResponse({"detail": "모바일 웹 요청 처리 중 오류가 발생했습니다."}, status_code=500)
+
         @app.middleware("http")
         async def harden_http(request: Request, call_next):
             content_length = str(request.headers.get("content-length", "")).strip()
@@ -378,12 +386,14 @@ class MobileWebServer:
         @app.post("/api/positions/close-all")
         async def api_close_all(request: Request) -> JSONResponse:
             self._require_session(request, require_csrf=True)
-            return JSONResponse(self.invoker.call(self._close_all_positions))
+            self.invoker.post(self._close_all_positions)
+            return JSONResponse({"ok": True, "queued": True})
 
         @app.post("/api/positions/{symbol}/close")
         async def api_close_symbol(symbol: str, request: Request) -> JSONResponse:
             self._require_session(request, require_csrf=True)
-            return JSONResponse(self.invoker.call(lambda: self._close_position(str(symbol or "").strip().upper())))
+            self.invoker.post(lambda: self._close_position(str(symbol or "").strip().upper()))
+            return JSONResponse({"ok": True, "queued": True})
 
         @app.post("/api/positions/{symbol}/auto-close")
         async def api_toggle_auto_close(symbol: str, request: Request) -> JSONResponse:
