@@ -76,9 +76,13 @@ body {
 }
 
 .app-title {
-  font-size: 15px;
-  font-weight: 700;
-  letter-spacing: -.01em;
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: -.02em;
+  background: linear-gradient(135deg, #58a6ff 0%, #3fb950 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
 }
 
 .server-urls {

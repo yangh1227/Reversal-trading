@@ -22,7 +22,6 @@ const els = {
   loginPassword: document.getElementById("login-password"),
   loginSubmit: document.getElementById("login-submit"),
   loginError: document.getElementById("login-error"),
-  serverUrls: document.getElementById("server-urls"),
   equityValue: document.getElementById("equity-value"),
   availableValue: document.getElementById("available-value"),
   currentSymbol: document.getElementById("current-symbol"),
@@ -446,7 +445,6 @@ function renderPositions(items) {
 
 function applyDashboardState(state) {
   window.__dashboardState = state;
-  els.serverUrls.textContent = (state.serverUrls || []).join("  |  ");
   els.equityValue.textContent = state.balance.equity == null ? "-" : `${state.balance.equity.toFixed(2)} USDT`;
   els.availableValue.textContent = state.balance.available == null ? "-" : `${state.balance.available.toFixed(2)} USDT`;
   els.currentSymbol.textContent = state.current.symbol || "차트 로드 중";
