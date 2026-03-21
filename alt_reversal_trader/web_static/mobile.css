@@ -286,12 +286,37 @@ button.danger:hover { background: rgba(248,81,73,0.22); }
 #bar-countdown                  { color: var(--yellow); }
 
 /* ─── Chart ──────────────────────────────────── */
-.chart-header { margin-bottom: 10px; }
+.chart-header { margin-bottom: 6px; }
 
 #current-symbol {
   margin-top: 2px;
   font-size: 22px;
   font-weight: 800;
+}
+
+/* TF + 봉마감 행 (차트 위) */
+.chart-tf-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.chart-tf-badge {
+  font-size: 12px;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--blue-dim);
+  border: 1px solid rgba(88,166,255,0.25);
+  color: var(--blue);
+}
+
+.chart-countdown {
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--yellow);
 }
 
 #chart-container {
@@ -326,13 +351,50 @@ button.danger:hover { background: rgba(248,81,73,0.22); }
   animation: spin .7s linear infinite;
 }
 
-/* Signal text */
-.signal-text {
-  font-size: 13px;
-  font-weight: 600;
-  min-height: 20px;
+/* ─── Position PnL row ───────────────────────── */
+.pos-pnl-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-top: 5px;
+}
+
+.return-pct {
+  font-size: 20px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.02em;
+}
+
+.return-pct.positive { color: var(--green); }
+.return-pct.negative { color: var(--red); }
+
+.upnl-secondary {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
   color: var(--muted);
-  margin-bottom: 2px;
+}
+
+/* Position interval badge */
+.pos-interval {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.07);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  margin-left: 4px;
+}
+
+/* Chart view button (full width) */
+.chart-view-btn { width: 100%; }
+
+/* Signal chip (진입신호 종목) */
+.chip.signal-chip {
+  background: rgba(227,179,65,0.13);
+  border: 1px solid rgba(227,179,65,0.35);
+  color: var(--yellow);
 }
 
 .signal-text.sig-long  { color: var(--green); }

@@ -43,14 +43,6 @@
         <span>가용</span>
         <strong id="available-value">-</strong>
       </div>
-      <div class="stat">
-        <span>차트 TF</span>
-        <strong id="current-interval">-</strong>
-      </div>
-      <div class="stat">
-        <span>봉마감</span>
-        <strong id="bar-countdown">-</strong>
-      </div>
     </section>
 
     <section class="card">
@@ -67,7 +59,10 @@
           </span>
         </label>
       </div>
-      <div id="signal-text" class="signal-text"></div>
+      <div class="chart-tf-row">
+        <span class="chart-tf-badge" id="current-interval">-</span>
+        <span class="chart-countdown" id="bar-countdown">-</span>
+      </div>
       <div id="chart-container">
         <div class="chart-loading" id="chart-loading">
           <div class="spinner"></div>
@@ -77,7 +72,7 @@
 
     <section class="card">
       <div class="row between center">
-        <h3 class="section-title">유리한 가격</h3>
+        <h3 class="section-title">유리한 가격 / 진입신호</h3>
         <span id="favorable-count" class="chip">0</span>
       </div>
       <div id="favorable-list" class="chip-list"></div>

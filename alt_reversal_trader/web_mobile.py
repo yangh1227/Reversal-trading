@@ -559,6 +559,7 @@ class MobileWebServer:
             positions.append(
                 {
                     "symbol": position.symbol,
+                    "interval": self.window._position_interval_for_symbol(position.symbol),
                     "side": values[1],
                     "leverage": values[2],
                     "amountUsdt": values[3],
@@ -568,6 +569,11 @@ class MobileWebServer:
                     "autoCloseEnabled": position.symbol in self.window.auto_close_enabled_symbols or self.window.auto_trade_enabled,
                 }
             )
+        # 예상 진입신호가 나온 종목 수집
+        signal_symbols: list[str] = []
+        for (sym, _ivl, _mode), (side, zone) in self.window.last_engine_entry_signal_by_key.items():
+            if side and int(zone) > 0 and sym not in signal_symbols:
+                signal_symbols.append(sym)
         snapshot = self.window.account_balance_snapshot
         equity = available = None
         if snapshot is not None:
@@ -582,7 +588,6 @@ class MobileWebServer:
                 "interval": self.window.current_interval,
                 "countdown": self._current_countdown(),
                 "barCloseDeadlineMs": self._current_bar_close_deadline_ms(),
-                "signalText": self.window.signal_label.text() if hasattr(self.window, "signal_label") else "",
                 "chartVersion": repr(self.window.chart_render_signature),
             },
             "balance": {"equity": equity, "available": available},
@@ -590,6 +595,7 @@ class MobileWebServer:
             "simpleOrderAmount": float(self.window.simple_order_amount_spin.value()),
             "optimized": optimized_rows,
             "favorableSymbols": favorable_symbols,
+            "signalSymbols": signal_symbols,
             "positions": positions,
         }
 

@@ -28,7 +28,6 @@ const els = {
   currentSymbol: document.getElementById("current-symbol"),
   currentInterval: document.getElementById("current-interval"),
   barCountdown: document.getElementById("bar-countdown"),
-  signalText: document.getElementById("signal-text"),
   favorableCount: document.getElementById("favorable-count"),
   favorableList: document.getElementById("favorable-list"),
   optimizedList: document.getElementById("optimized-list"),
@@ -340,17 +339,26 @@ function startCountdown(deadlineMs) {
   countdownTimer = setInterval(() => renderCountdown(countdownDeadlineMs), 1000);
 }
 
-function renderFavorable(symbols) {
+function renderFavorable(favorableSymbols, signalSymbols) {
   els.favorableList.innerHTML = "";
-  els.favorableCount.textContent = String(symbols.length);
-  if (!symbols.length) {
+  const total = favorableSymbols.length + signalSymbols.length;
+  els.favorableCount.textContent = String(total);
+  if (!total) {
     els.favorableList.innerHTML = '<span class="muted">현재 없음</span>';
     return;
   }
-  symbols.forEach((symbol) => {
+  favorableSymbols.forEach((symbol) => {
     const chip = document.createElement("span");
     chip.className = "chip symbol";
     chip.textContent = symbol;
+    chip.onclick = () => selectSymbol(symbol);
+    els.favorableList.appendChild(chip);
+  });
+  signalSymbols.forEach((symbol) => {
+    if (favorableSymbols.includes(symbol)) return;
+    const chip = document.createElement("span");
+    chip.className = "chip symbol signal-chip";
+    chip.textContent = `⚡ ${symbol}`;
     chip.onclick = () => selectSymbol(symbol);
     els.favorableList.appendChild(chip);
   });
@@ -374,10 +382,13 @@ function renderOptimized(items) {
       <div class="list-meta">Score ${item.score} · Return ${item.returnPct}% · MDD ${item.mddPct}% · Trades ${item.trades}</div>
       <div class="list-meta">${item.currentPrice ? `현재가 ${formatCompactPrice(item.currentPrice)}` : "현재가 -"}</div>
       <div class="list-actions">
-        <button class="ghost">차트 보기</button>
+        <button class="ghost chart-view-btn">차트 보기</button>
       </div>
     `;
-    row.querySelector("button").onclick = () => selectSymbol(item.symbol, item.interval);
+    row.querySelector("button").onclick = () => {
+      selectSymbol(item.symbol, item.interval);
+      setTimeout(() => els.chartContainer.closest(".card")?.scrollIntoView({ behavior: "smooth", block: "start" }), 300);
+    };
     els.optimizedList.appendChild(row);
   });
 }
@@ -402,11 +413,12 @@ function renderPositions(items) {
       <div class="list-title">
         <strong>${item.symbol}</strong>
         <span class="side-badge ${sideKey}">${sideLabel} ${item.leverage}</span>
+        ${item.interval ? `<span class="pos-interval">${item.interval}</span>` : ""}
       </div>
       <div class="list-meta">진입 ${formatCompactPrice(item.entryPrice)} · ${item.amountUsdt} USDT</div>
-      <div class="list-meta">
-        <span class="upnl ${upnlCls}">UPnL ${item.upnl}</span>
-        · ${item.returnPct}%
+      <div class="pos-pnl-row">
+        <span class="return-pct ${upnlCls}">${item.returnPct >= 0 ? "+" : ""}${item.returnPct}%</span>
+        <span class="upnl-secondary">${item.upnl >= 0 ? "+" : ""}${item.upnl} USDT</span>
       </div>
       <div class="list-actions">
         <button class="danger">청산</button>
@@ -441,16 +453,10 @@ function applyDashboardState(state) {
   els.currentInterval.textContent = state.current.interval || "-";
   startCountdown(state.current.barCloseDeadlineMs);
 
-  const signal = state.current.signalText || "";
-  els.signalText.textContent = signal;
-  els.signalText.className = "signal-text" +
-    (/LONG|롱|매수/i.test(signal) ? " sig-long" :
-      /SHORT|숏|매도/i.test(signal) ? " sig-short" : "");
-
   els.autoTradeToggle.checked = !!state.autoTradeEnabled;
   els.simpleAmount.value = state.simpleOrderAmount ?? 50;
 
-  renderFavorable(state.favorableSymbols || []);
+  renderFavorable(state.favorableSymbols || [], state.signalSymbols || []);
   renderOptimized(state.optimized || []);
   renderPositions(state.positions || []);
 }
