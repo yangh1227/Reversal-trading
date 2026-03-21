@@ -48,6 +48,7 @@ STREAM_PRICE_EVAL_MIN_INTERVAL_SECONDS = 0.2
 STREAM_STALE_SECONDS = 3.0
 STREAM_FORCE_RELOAD_SECONDS = 10.0
 STALE_SYMBOL_EVAL_INTERVAL_SECONDS = 1.0
+AUTO_TRADE_REENTRY_COOLDOWN_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -746,6 +747,7 @@ class _TradeEngine:
         self.position_strategy_by_symbol: Dict[str, StrategySettings] = {}
         self.applied_leverage_by_symbol: Dict[str, int] = {}
         self.pending_order_symbols: Dict[str, float] = {}
+        self.auto_trade_reentry_cooldown_until: Dict[Tuple[str, str], float] = {}
         self.auto_close_last_trigger_time: Dict[str, pd.Timestamp] = {}
         self.auto_close_last_attempt_at: Dict[str, float] = {}
         self.latest_stream_price_by_symbol: Dict[str, float] = {}
@@ -838,11 +840,15 @@ class _TradeEngine:
             if not isinstance(result, _OrderExecutionResult):
                 continue
             self.pending_order_symbols.pop(result.symbol, None)
+            cooldown_interval = str(result.interval or self.position_intervals.get(result.symbol) or self.default_interval)
             if result.close_order and result.success:
                 self.open_positions.pop(result.symbol, None)
                 self.filled_fraction_by_symbol.pop(result.symbol, None)
                 self.auto_trade_cursor_entry_time.pop(result.symbol, None)
                 self.applied_leverage_by_symbol.pop(result.symbol, None)
+                self.auto_trade_reentry_cooldown_until[(result.symbol, cooldown_interval)] = (
+                    time.time() + AUTO_TRADE_REENTRY_COOLDOWN_SECONDS
+                )
             if result.no_open_position:
                 self.open_positions.pop(result.symbol, None)
                 self.filled_fraction_by_symbol.pop(result.symbol, None)
@@ -895,6 +901,9 @@ class _TradeEngine:
             if now - self.pending_order_symbols[symbol] > PENDING_ORDER_TIMEOUT_SECONDS:
                 self.pending_order_symbols.pop(symbol, None)
                 self.log(f"{symbol} pending order timed out after {PENDING_ORDER_TIMEOUT_SECONDS}s")
+        for key, cooldown_until in list(self.auto_trade_reentry_cooldown_until.items()):
+            if now >= cooldown_until:
+                self.auto_trade_reentry_cooldown_until.pop(key, None)
 
     def _apply_sync(self, command: EngineSyncCommand) -> None:
         creds_changed = (command.api_key != self.api_key) or (command.api_secret != self.api_secret)
@@ -1620,6 +1629,9 @@ class _TradeEngine:
         candidates: List[Dict[str, object]] = []
         _dbg_trigger = bool(trigger_symbol) and normalized_trigger_time is not None
         for item in eligible_items:
+            cooldown_until = self.auto_trade_reentry_cooldown_until.get((item.symbol, item.interval), 0.0)
+            if cooldown_until > time.time():
+                continue
             if item.symbol in self.pending_order_symbols:
                 if _dbg_trigger and item.symbol == trigger_symbol:
                     print(f"[자동매매 진단] {item.symbol}/{item.interval}: 주문 대기 중 → 스킵")

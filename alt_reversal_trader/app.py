@@ -1673,6 +1673,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_trade_cursor_entry_time_by_symbol: Dict[str, pd.Timestamp] = dict(
             self.settings.position_cursor_entry_times
         )
+        self.auto_trade_reentry_cooldown_until: Dict[Tuple[str, str], float] = {}
         self.last_engine_entry_signal_by_key: Dict[Tuple[str, str, str], Tuple[str, int]] = {}
         self.order_worker_symbol: Optional[str] = None
         self.order_worker_is_auto_close = False
@@ -3404,6 +3405,10 @@ class AltReversalTraderWindow(QMainWindow):
                 self.auto_trade_cursor_entry_time_by_symbol = {}
             else:
                 return
+        now = time.time()
+        for key, cooldown_until in list(self.auto_trade_reentry_cooldown_until.items()):
+            if now >= cooldown_until:
+                self.auto_trade_reentry_cooldown_until.pop(key, None)
         self._refresh_auto_close_monitors()
         trigger_symbol = str(trigger_symbol or "").upper()
         trigger_interval = str(trigger_interval or self.current_interval or self.settings.kline_interval)
@@ -3423,6 +3428,8 @@ class AltReversalTraderWindow(QMainWindow):
         for item in eligible_items:
             symbol = str(item["symbol"])
             interval = str(item["interval"])
+            if self.auto_trade_reentry_cooldown_until.get((symbol, interval), 0.0) > now:
+                continue
             open_position = open_positions_by_symbol.get(symbol)
             if open_positions_by_symbol and open_position is None:
                 continue
@@ -7290,10 +7297,18 @@ class AltReversalTraderWindow(QMainWindow):
         self.engine_order_pending = False
         self._set_order_buttons_enabled(True)
         result = dict(payload)
+        message_text = str(result.get("message", ""))
         order_symbol = self.order_worker_symbol or str(result.get("symbol", ""))
+        close_interval = self._position_interval_for_symbol(order_symbol) if order_symbol else ""
         if self.order_worker_is_auto_close and order_symbol:
             self.auto_close_order_pending.discard(order_symbol)
             self.auto_close_last_attempt_at[order_symbol] = time.time()
+        if (
+            order_symbol
+            and close_interval in APP_INTERVAL_OPTIONS
+            and (self.order_worker_is_auto_close or "close completed" in message_text.lower())
+        ):
+            self.auto_trade_reentry_cooldown_until[(order_symbol, close_interval)] = time.time() + 60.0
         if not self.order_worker_is_auto_close and order_symbol:
             self._remember_position_interval(order_symbol, self.pending_open_order_interval)
         was_auto_trade = self.order_worker_is_auto_trade

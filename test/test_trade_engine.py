@@ -1,6 +1,7 @@
 import multiprocessing as mp
 import alt_reversal_trader.trade_engine as trade_engine_module
 from dataclasses import replace
+from queue import Queue
 import threading
 import time
 
@@ -804,7 +805,7 @@ def test_trade_engine_uses_persisted_filled_fraction_after_restart_for_additiona
 
 
 def test_trade_engine_drops_symbol_after_successful_close_before_refresh() -> None:
-    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine = _TradeEngine(Queue(), Queue())
     engine.open_positions["TESTUSDT"] = make_position()
     engine.filled_fraction_by_symbol["TESTUSDT"] = 0.5
     engine.auto_trade_cursor_entry_time["TESTUSDT"] = pd.Timestamp("2026-01-01 00:00:00")
@@ -829,6 +830,54 @@ def test_trade_engine_drops_symbol_after_successful_close_before_refresh() -> No
     assert "TESTUSDT" not in engine.open_positions
     assert "TESTUSDT" not in engine.filled_fraction_by_symbol
     assert "TESTUSDT" not in engine.auto_trade_cursor_entry_time
+
+
+def test_trade_engine_skips_reentry_for_one_minute_after_close_on_same_symbol_interval() -> None:
+    engine = _TradeEngine(Queue(), Queue())
+    engine.auto_trade_enabled = True
+    engine.client = FakeTickerClient({"TESTUSDT": 120.0})
+    backtest = make_signal_backtest(zone=2, signal_time="2026-01-01 00:15:00")
+    key = ("TESTUSDT", "1m")
+    engine.watchlist[key] = EngineWatchlistItem(
+        symbol="TESTUSDT",
+        interval="1m",
+        score=7.0,
+        return_pct=12.0,
+        strategy_settings=StrategySettings(),
+    )
+    engine.symbol_states[key] = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="1m",
+        strategy_settings=StrategySettings(),
+        backtest=backtest,
+    )
+    engine.position_intervals["TESTUSDT"] = "1m"
+    engine.order_result_queue.put(
+        _OrderExecutionResult(
+            symbol="TESTUSDT",
+            success=True,
+            message="TESTUSDT close completed: orderId=1",
+            auto_close=False,
+            auto_trade=False,
+            close_order=True,
+            interval="1m",
+            fraction=0.0,
+            strategy_settings=None,
+            no_open_position=False,
+        )
+    )
+    engine._refresh_positions = lambda force=False: None
+    engine._drain_order_results()
+    submitted: list[dict[str, object]] = []
+    engine._enqueue_open_order = lambda **kwargs: submitted.append(kwargs)
+
+    engine._evaluate_auto_trade(
+        trigger_symbol="TESTUSDT",
+        trigger_interval="1m",
+        trigger_bar_time=pd.Timestamp("2026-01-01 00:15:00"),
+    )
+
+    assert submitted == []
 
 
 def test_trade_engine_enters_fresh_confirmed_new_signal_on_trigger_bar() -> None:

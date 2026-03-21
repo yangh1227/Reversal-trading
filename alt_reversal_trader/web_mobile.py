@@ -477,6 +477,20 @@ class MobileWebServer:
         self._price_cache_at = now
         return dict(self._price_cache)
 
+    def _uncached_price_map(self) -> dict[str, float]:
+        symbols = [result.symbol for result in self.window._ordered_optimized_results()]
+        if not symbols:
+            return {}
+        try:
+            prices = self.window._optimized_table_price_map(log_failures=False)
+        except Exception:
+            prices = {}
+        if prices:
+            self._price_cache = dict(prices)
+            self._price_cache_at = time.time()
+            return dict(prices)
+        return {}
+
     def _current_bar_close_deadline_ms(self) -> Optional[int]:
         interval = str(self.window.current_interval or self.window.settings.kline_interval or "").strip()
         if not interval:
@@ -515,8 +529,10 @@ class MobileWebServer:
             first = next(iter(self.window._ordered_optimized_results()), None)
             if first is not None:
                 self.window._request_symbol_load(first.symbol, first.best_interval or self.window.settings.kline_interval)
-        price_map = self._cached_price_map()
         ordered_results = self.window._ordered_optimized_results()
+        price_map = self._uncached_price_map()
+        if not price_map and ordered_results:
+            price_map = self._cached_price_map()
         favorable_symbols: list[str] = []
         optimized_rows: list[dict[str, object]] = []
         for result in ordered_results:
@@ -638,8 +654,8 @@ class MobileWebServer:
     def _select_symbol(self, symbol: str, interval: str) -> dict[str, object]:
         optimization = self.window._optimization_result(symbol)
         chosen_interval = interval or (
-            (optimization.best_interval if optimization else None)
-            or self.window._position_interval_for_symbol(symbol)
+            self.window._position_interval_for_symbol(symbol)
+            or (optimization.best_interval if optimization else None)
             or self.window.settings.kline_interval
         )
         self.window._request_symbol_load(symbol, chosen_interval, prefer_locked_position_settings=True)

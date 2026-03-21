@@ -13,6 +13,7 @@ let countdownTimer = null;
 let countdownDeadlineMs = null;
 let foregroundSyncTimer = null;
 let recoverUiTimer = null;
+let recoveryToastCooldownUntil = 0;
 
 const els = {
   loginView: document.getElementById("login-view"),
@@ -190,7 +191,10 @@ function queueUiRecovery(delayMs = 1500) {
     if (els.appView.classList.contains("hidden")) {
       return;
     }
-    showToast("연결 복구 중...", "info", 2000);
+    if (Date.now() >= recoveryToastCooldownUntil) {
+      recoveryToastCooldownUntil = Date.now() + 4000;
+      showToast("연결 복구 중...", "info", 2000);
+    }
     queueForegroundSync(0);
   }, Math.max(0, Number(delayMs) || 0));
 }
