@@ -3759,10 +3759,21 @@ class AltReversalTraderWindow(QMainWindow):
     def _find_open_position(self, symbol: str) -> Optional[PositionSnapshot]:
         return next((position for position in self.open_positions if position.symbol == symbol), None)
 
-    def _set_auto_close_button_state(self, button: QPushButton, enabled: bool) -> None:
+    def _set_auto_close_button_state(
+        self,
+        button: QPushButton,
+        enabled: bool,
+        *,
+        forced_by_auto_trade: bool = False,
+    ) -> None:
         button.setCheckable(True)
         button.setChecked(enabled)
-        button.setText("자동청산 ON" if enabled else "자동청산 OFF")
+        if forced_by_auto_trade and enabled:
+            button.setText("자동청산 ON")
+            button.setToolTip("자동매매 사용 중에는 자동청산이 함께 적용됩니다.")
+        else:
+            button.setText("자동청산 ON" if enabled else "자동청산 OFF")
+            button.setToolTip("포지션별 자동청산 사용 여부")
         button.setStyleSheet(
             """
             QPushButton {
@@ -5623,9 +5634,11 @@ class AltReversalTraderWindow(QMainWindow):
                 auto_button = QPushButton()
                 auto_button.setFixedWidth(124)
                 auto_button.setMinimumHeight(24)
+                auto_close_active = position.symbol in self.auto_close_enabled_symbols or self.auto_trade_enabled
                 self._set_auto_close_button_state(
                     auto_button,
-                    position.symbol in self.auto_close_enabled_symbols or self.auto_trade_enabled,
+                    auto_close_active,
+                    forced_by_auto_trade=bool(self.auto_trade_enabled),
                 )
                 auto_button.setEnabled(not self.auto_trade_enabled)
                 auto_button.toggled.connect(
