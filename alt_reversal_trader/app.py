@@ -3271,16 +3271,39 @@ class AltReversalTraderWindow(QMainWindow):
     def _latest_auto_trade_backtest(self, result: OptimizationResult) -> BacktestResult:
         interval = result.best_interval or self.settings.kline_interval
         target_settings = result.best_backtest.settings
+        history = self._get_history_frame(result.symbol, interval)
         if (
             self.current_symbol == result.symbol
             and self.current_interval == interval
             and self.current_backtest is not None
             and self.current_backtest.settings == target_settings
+            and _backtest_matches_history(self.current_backtest, history)
         ):
             return self.current_backtest
         cached_backtest = self.backtest_cache.get(self._symbol_interval_key(result.symbol, interval))
-        if cached_backtest is not None and cached_backtest.settings == target_settings:
+        if (
+            cached_backtest is not None
+            and cached_backtest.settings == target_settings
+            and _backtest_matches_history(cached_backtest, history)
+        ):
             return cached_backtest
+        materialized = self._materialize_cached_backtest(
+            result.symbol,
+            interval,
+            history,
+            self.current_backtest
+            if (
+                self.current_symbol == result.symbol
+                and self.current_interval == interval
+                and self.current_backtest is not None
+                and self.current_backtest.settings == target_settings
+            )
+            else cached_backtest,
+            target_settings,
+        )
+        if materialized is not None:
+            self.backtest_cache[self._symbol_interval_key(result.symbol, interval)] = materialized
+            return materialized
         return result.best_backtest
 
     def _fallback_auto_trade_items(self) -> List[Dict[str, object]]:
@@ -5722,17 +5745,23 @@ class AltReversalTraderWindow(QMainWindow):
         symbol = str(result.symbol)
         interval = str(result.best_interval or self.settings.kline_interval)
         open_position = self._find_open_position(symbol)
+        history = self._get_history_frame(symbol, interval)
         latest_backtest: Optional[BacktestResult] = None
         if (
             self.current_symbol == symbol
             and self.current_interval == interval
             and self.current_backtest is not None
             and self.current_backtest.settings == result.best_backtest.settings
+            and _backtest_matches_history(self.current_backtest, history)
         ):
             latest_backtest = self.current_backtest
         else:
             cached_backtest = self.backtest_cache.get(self._symbol_interval_key(symbol, interval))
-            if cached_backtest is not None and cached_backtest.settings == result.best_backtest.settings:
+            if (
+                cached_backtest is not None
+                and cached_backtest.settings == result.best_backtest.settings
+                and _backtest_matches_history(cached_backtest, history)
+            ):
                 latest_backtest = cached_backtest
         if latest_backtest is None:
             return False

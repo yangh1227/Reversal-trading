@@ -277,6 +277,38 @@ def make_flat_signal_backtest_with_latest_state_exit() -> BacktestResult:
     )
 
 
+def make_flat_signal_backtest_with_historical_indicator_exit() -> BacktestResult:
+    backtest = make_flat_signal_backtest(with_open_event=True)
+    indicators = pd.DataFrame(
+        {
+            "time": [
+                pd.Timestamp("2026-01-01 00:20:00"),
+                pd.Timestamp("2026-01-01 00:25:00"),
+                pd.Timestamp("2026-01-01 00:30:00"),
+            ],
+            "open": [120.0, 121.0, 122.0],
+            "high": [121.0, 122.0, 123.0],
+            "low": [119.0, 120.0, 121.0],
+            "close": [120.0, 121.0, 122.0],
+            "volume": [1000.0, 1000.0, 1000.0],
+            "trend_to_long": [False, True, False],
+            "trend_to_short": [False, False, False],
+            "final_bull": [False, False, False],
+            "final_bear": [False, False, False],
+        }
+    )
+    return BacktestResult(
+        settings=backtest.settings,
+        metrics=backtest.metrics,
+        trades=[],
+        open_entry_events=backtest.open_entry_events,
+        indicators=indicators,
+        latest_state={},
+        equity_curve=pd.Series([1000.0], index=[pd.Timestamp("2026-01-01 00:30:00")]),
+        cursor=backtest.cursor,
+    )
+
+
 def test_backtest_smoke() -> None:
     df = make_sample_ohlcv()
     result = run_backtest(df, settings=StrategySettings())
@@ -412,6 +444,14 @@ def test_active_auto_trade_signal_clears_stale_entry_after_exit_signal() -> None
 
 def test_active_auto_trade_signal_clears_stale_entry_after_latest_state_exit() -> None:
     backtest = make_flat_signal_backtest_with_latest_state_exit()
+
+    signal = active_auto_trade_signal(backtest)
+
+    assert signal is None
+
+
+def test_active_auto_trade_signal_clears_stale_entry_after_historical_indicator_exit() -> None:
+    backtest = make_flat_signal_backtest_with_historical_indicator_exit()
 
     signal = active_auto_trade_signal(backtest)
 

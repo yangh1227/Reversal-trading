@@ -246,6 +246,27 @@ def _latest_state_exit_time_for_side(
     normalized_side = str(side or "").lower()
     if normalized_side not in {"long", "short"}:
         return None
+    indicators = backtest.indicators
+    if normalized_side == "long":
+        exit_columns = [column for column in ("trend_to_short", "final_bear") if column in indicators.columns]
+    else:
+        exit_columns = [column for column in ("trend_to_long", "final_bull") if column in indicators.columns]
+    if not exit_columns:
+        latest_state = dict(backtest.latest_state or {})
+        has_exit = (
+            bool(latest_state.get("trend_to_short")) or bool(latest_state.get("final_bear"))
+            if normalized_side == "long"
+            else bool(latest_state.get("trend_to_long")) or bool(latest_state.get("final_bull"))
+        )
+        if not has_exit:
+            return None
+        return _normalize_event_timestamp(indicators["time"].iloc[-1])
+    exit_mask = pd.Series(False, index=indicators.index, dtype=bool)
+    for column in exit_columns:
+        exit_mask = exit_mask | indicators[column].fillna(False).astype(bool)
+    if bool(exit_mask.any()):
+        latest_index = indicators.index[exit_mask][-1]
+        return _normalize_event_timestamp(indicators.loc[latest_index, "time"])
     latest_state = dict(backtest.latest_state or {})
     has_exit = (
         bool(latest_state.get("trend_to_short")) or bool(latest_state.get("final_bear"))
@@ -254,7 +275,7 @@ def _latest_state_exit_time_for_side(
     )
     if not has_exit:
         return None
-    return _normalize_event_timestamp(backtest.indicators["time"].iloc[-1])
+    return _normalize_event_timestamp(indicators["time"].iloc[-1])
 
 
 def active_entry_price_by_zone(backtest: Optional["BacktestResult"]) -> Dict[int, float]:
