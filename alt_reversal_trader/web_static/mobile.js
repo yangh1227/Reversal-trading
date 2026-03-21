@@ -11,6 +11,7 @@ let liveSocket = null;
 let liveSocketRetryTimer = null;
 let countdownTimer = null;
 let countdownDeadlineMs = null;
+let foregroundSyncTimer = null;
 
 const els = {
   loginView: document.getElementById("login-view"),
@@ -112,6 +113,7 @@ function initChart() {
     wickUpColor: "#a3acb7",
     wickDownColor: "#a3acb7",
     priceLineVisible: false,
+    lastValueVisible: false,
   });
   lineSeries = {
     supertrend: chart.addLineSeries({ color: "#00d2ff", lineWidth: 2, priceLineVisible: false, lastValueVisible: false }),
@@ -479,6 +481,22 @@ function connectLiveSocket() {
   };
 }
 
+function queueForegroundSync(delayMs = 0) {
+  if (foregroundSyncTimer) {
+    clearTimeout(foregroundSyncTimer);
+    foregroundSyncTimer = null;
+  }
+  foregroundSyncTimer = setTimeout(() => {
+    foregroundSyncTimer = null;
+    if (els.appView.classList.contains("hidden")) {
+      return;
+    }
+    currentChartKey = "";
+    connectLiveSocket();
+    refreshDashboard(true).catch(console.error);
+  }, Math.max(0, Number(delayMs) || 0));
+}
+
 function showLogin(show) {
   els.loginView.classList.toggle("hidden", !show);
   els.appView.classList.toggle("hidden", show);
@@ -530,6 +548,7 @@ function stopPolling() {
   if (chartTimer) clearInterval(chartTimer);
   if (countdownTimer) clearInterval(countdownTimer);
   if (liveSocketRetryTimer) clearTimeout(liveSocketRetryTimer);
+  if (foregroundSyncTimer) clearTimeout(foregroundSyncTimer);
   if (liveSocket) {
     liveSocket.onclose = null;
     liveSocket.close();
@@ -538,6 +557,7 @@ function stopPolling() {
   chartTimer = null;
   countdownTimer = null;
   liveSocketRetryTimer = null;
+  foregroundSyncTimer = null;
   liveSocket = null;
 }
 
@@ -669,4 +689,18 @@ els.loginSubmit.addEventListener("click", () => login());
 bootstrap().catch((error) => {
   els.loginError.textContent = error.message;
   showLogin(true);
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    queueForegroundSync(0);
+  }
+});
+
+window.addEventListener("pageshow", () => {
+  queueForegroundSync(0);
+});
+
+window.addEventListener("focus", () => {
+  queueForegroundSync(100);
 });
