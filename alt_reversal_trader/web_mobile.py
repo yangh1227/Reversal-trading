@@ -623,6 +623,15 @@ class MobileWebServer:
                 .drop_duplicates(subset=["time"])
                 .reset_index(drop=True)
             )
+        visible_marker_times: Optional[tuple[pd.Timestamp, pd.Timestamp]] = None
+        if not candle_df.empty and "time" in candle_df.columns:
+            try:
+                visible_marker_times = (
+                    pd.Timestamp(candle_df["time"].iloc[0]).tz_localize(None),
+                    pd.Timestamp(candle_df["time"].iloc[-1]).tz_localize(None),
+                )
+            except Exception:
+                visible_marker_times = None
         return {
             "ready": True,
             "symbol": symbol,
@@ -654,6 +663,15 @@ class MobileWebServer:
                     "text": marker.get("text"),
                 }
                 for marker in self.window._compose_lightweight_markers(markers)
+                if (
+                    visible_marker_times is None
+                    or marker.get("time") is None
+                    or (
+                        visible_marker_times[0]
+                        <= pd.Timestamp(marker.get("time")).tz_localize(None)
+                        <= visible_marker_times[1]
+                    )
+                )
             ],
         }
 

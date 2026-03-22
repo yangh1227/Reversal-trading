@@ -280,6 +280,7 @@ function applyChartPayload(payload, options = {}) {
         color: marker.color,
         text: marker.text || "",
       }))
+      .sort((a, b) => a.time - b.time)
   );
   updateReferenceLines(payload);
   chart.resize(els.chartContainer.clientWidth, els.chartContainer.clientHeight, true);
