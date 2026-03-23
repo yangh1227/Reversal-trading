@@ -1868,6 +1868,14 @@ class AltReversalTraderWindow(QMainWindow):
         self._set_balance_label_status("API 미입력")
         chart_header_row = QHBoxLayout()
         chart_header_row.setContentsMargins(0, 0, 0, 0)
+        chart_header_row.setSpacing(10)
+        self.chart_header_symbol_label = QLabel("-")
+        self.chart_header_symbol_label.setStyleSheet("color: #111827; font-weight: 800; font-size: 14px;")
+        chart_header_row.addWidget(self.chart_header_symbol_label)
+        self.chart_header_tf_label = QLabel("TF -")
+        self.chart_header_tf_label.setStyleSheet("color: #4b5563; font-weight: 700; font-size: 12px;")
+        chart_header_row.addWidget(self.chart_header_tf_label)
+        chart_header_row.addStretch(1)
         chart_header_row.addWidget(QLabel("차트 전환"))
         self.auto_trade_focus_enable_check = QCheckBox("사용")
         chart_header_row.addWidget(self.auto_trade_focus_enable_check)
@@ -1881,7 +1889,6 @@ class AltReversalTraderWindow(QMainWindow):
         self.chart_display_days_popup_spin.setRange(1, 720)
         self.chart_display_days_popup_spin.setSuffix(" 시간")
         chart_header_row.addWidget(self.chart_display_days_popup_spin)
-        chart_header_row.addStretch(1)
         self.chart_host = QWidget()
         self.chart_host_layout = QVBoxLayout(self.chart_host)
         self.chart_host_layout.setContentsMargins(0, 0, 0, 0)
@@ -5449,6 +5456,8 @@ class AltReversalTraderWindow(QMainWindow):
         if not hasattr(self, "chart_interval_label"):
             return
         self.chart_interval_label.setText(f"차트TF: {interval}" if interval else "차트TF: -")
+        if hasattr(self, "chart_header_tf_label"):
+            self.chart_header_tf_label.setText(f"TF {interval}" if interval else "TF -")
 
     def _update_entry_price_overlay(self) -> None:
         position = self.current_position_snapshot
@@ -6386,6 +6395,8 @@ class AltReversalTraderWindow(QMainWindow):
         self._stop_chart_history_page_worker()
         self._clear_current_chart_snapshot()
         self.current_symbol = symbol
+        if hasattr(self, "chart_header_symbol_label"):
+            self.chart_header_symbol_label.setText(symbol)
         self._remember_recent_symbol(symbol)
         self.current_position_snapshot = self._find_open_position(symbol)
         self._refresh_position_status_label()
@@ -6622,6 +6633,10 @@ class AltReversalTraderWindow(QMainWindow):
                 else ""
             )
         )
+        if hasattr(self, "chart_header_symbol_label"):
+            self.chart_header_symbol_label.setText(symbol)
+        if hasattr(self, "chart_header_tf_label"):
+            self.chart_header_tf_label.setText(f"TF {self.current_interval}" if self.current_interval else "TF -")
         self.signal_label.setText(
             f"신호: Trend {latest['trend']} | Zone {latest['zone']} | "
             f"Bull {latest['final_bull']} | Bear {latest['final_bear']} | RSI {latest['rsi']:.2f}"
