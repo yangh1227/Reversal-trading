@@ -533,13 +533,20 @@ class MobileWebServer:
         price_map = self._uncached_price_map()
         if not price_map and ordered_results:
             price_map = self._cached_price_map()
-        favorable_symbols: list[str] = []
+        favorable_entries: list[dict[str, object]] = []
         optimized_rows: list[dict[str, object]] = []
         for result in ordered_results:
             metrics = result.best_backtest.metrics
-            favorable = self.window._optimized_result_has_favorable_entry(result, price_map.get(result.symbol))
+            favorable_zone = self.window._optimized_result_favorable_zone(result, price_map.get(result.symbol))
+            favorable = favorable_zone is not None
             if favorable:
-                favorable_symbols.append(result.symbol)
+                favorable_entries.append(
+                    {
+                        "symbol": result.symbol,
+                        "interval": result.best_interval or self.window.settings.kline_interval,
+                        "zone": int(favorable_zone or 0),
+                    }
+                )
             optimized_rows.append(
                 {
                     "symbol": result.symbol,
@@ -594,7 +601,8 @@ class MobileWebServer:
             "autoTradeEnabled": bool(self.window.auto_trade_enabled or self.window.auto_trade_requested),
             "simpleOrderAmount": float(self.window.simple_order_amount_spin.value()),
             "optimized": optimized_rows,
-            "favorableSymbols": favorable_symbols,
+            "favorableSymbols": [entry["symbol"] for entry in favorable_entries],
+            "favorableEntries": favorable_entries,
             "signalSymbols": signal_symbols,
             "positions": positions,
         }

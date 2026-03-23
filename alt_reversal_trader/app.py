@@ -14,11 +14,13 @@ from lightweight_charts.widgets import QtChart
 import websocket
 
 from .auto_trade_runtime import (
+    auto_trade_signal_from_backtest,
     evaluate_auto_trade_candidate,
     favorable_auto_trade_fraction,
     history_can_resume_backtest as _history_can_resume_backtest,
     inferred_auto_trade_fraction as _inferred_auto_trade_fraction,
     pick_auto_trade_candidate,
+    zone_favorable_fraction,
 )
 from .binance_futures import (
     BalanceSnapshot,
@@ -5746,42 +5748,67 @@ class AltReversalTraderWindow(QMainWindow):
                 prices[symbol] = current_price
         return prices
 
-    def _optimized_result_has_favorable_entry(self, result: OptimizationResult, current_price: Optional[float]) -> bool:
+    def _optimized_result_favorable_zone(self, result: OptimizationResult, current_price: Optional[float]) -> Optional[int]:
         if current_price is None or current_price <= 0:
-            return False
+            return None
         symbol = str(result.symbol)
         interval = str(result.best_interval or self.settings.kline_interval)
         open_position = self._find_open_position(symbol)
-        history = self._get_history_frame(symbol, interval)
         latest_backtest: Optional[BacktestResult] = None
         if (
             self.current_symbol == symbol
             and self.current_interval == interval
             and self.current_backtest is not None
             and self.current_backtest.settings == result.best_backtest.settings
-            and _backtest_matches_history(self.current_backtest, history)
         ):
             latest_backtest = self.current_backtest
         else:
             cached_backtest = self.backtest_cache.get(self._symbol_interval_key(symbol, interval))
-            if (
-                cached_backtest is not None
-                and cached_backtest.settings == result.best_backtest.settings
-                and _backtest_matches_history(cached_backtest, history)
-            ):
+            if cached_backtest is not None and cached_backtest.settings == result.best_backtest.settings:
                 latest_backtest = cached_backtest
         if latest_backtest is None:
-            return False
+            return None
         filled_fraction = self.auto_trade_filled_fraction_by_symbol.get(
             symbol,
             _inferred_auto_trade_fraction(latest_backtest, open_position) if open_position is not None else 0.0,
         )
-        return favorable_auto_trade_fraction(
+        signal = auto_trade_signal_from_backtest(latest_backtest)
+        if signal is None:
+            return None
+        side = str(signal.get("side") or "")
+        if open_position is not None:
+            position_side = "long" if float(open_position.amount) > 0 else "short"
+            if side != position_side:
+                return None
+        favorable_fraction = favorable_auto_trade_fraction(
             latest_backtest,
             float(current_price),
             open_position,
             filled_fraction,
-        ) > 1e-9
+        )
+        if favorable_fraction <= 1e-9:
+            return None
+        zone_prices = dict(signal.get("zone_prices") or {})
+        current_price_value = float(current_price)
+        for zone in (3, 2):
+            zone_price = float(zone_prices.get(zone, 0.0) or 0.0)
+            if zone_price <= 0:
+                continue
+            favorable = current_price_value < zone_price if side == "long" else current_price_value > zone_price
+            if favorable:
+                return zone
+        if zone_favorable_fraction(
+            side,
+            current_price_value,
+            float(signal.get("price") or 0.0),
+            zone_prices,
+            float(filled_fraction),
+        ) > 1e-9:
+            return 1
+        return None
+
+    def _optimized_result_has_favorable_entry(self, result: OptimizationResult, current_price: Optional[float]) -> bool:
+        return self._optimized_result_favorable_zone(result, current_price) is not None
 
     def _log_telegram_failure(self, message: str) -> None:
         if hasattr(self, "log_box"):
@@ -5826,17 +5853,18 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _update_favorable_telegram_alerts(
         self,
-        favorable_rows: List[Tuple[str, str, Optional[float]]],
+        favorable_rows: List[Tuple[str, str, Optional[float], Optional[int]]],
     ) -> None:
-        current_symbols = {symbol for symbol, _interval, _price in favorable_rows}
+        current_symbols = {symbol for symbol, _interval, _price, _zone in favorable_rows}
         new_symbols = current_symbols - self.telegram_favorable_symbols
         self.telegram_favorable_symbols = current_symbols
         if not new_symbols:
             return
-        favorable_map = {symbol: (interval, price) for symbol, interval, price in favorable_rows}
+        favorable_map = {symbol: (interval, price, zone) for symbol, interval, price, zone in favorable_rows}
         for symbol in sorted(new_symbols):
-            interval, price = favorable_map[symbol]
+            interval, price, zone = favorable_map[symbol]
             price_text = f"{float(price):.12f}".rstrip("0").rstrip(".") if price else "-"
+            zone_text = f"L{zone}" if zone in {1, 2, 3} else "-"
             self._notify_telegram(
                 "\n".join(
                     [
@@ -5846,7 +5874,7 @@ class AltReversalTraderWindow(QMainWindow):
                         f"현재가: {price_text}",
                     ]
                 ),
-                key=f"favorable:{symbol}:{interval}",
+                key=f"favorable:{symbol}:{interval}:{zone_text}",
                 cooldown_seconds=30.0,
             )
 
@@ -5861,16 +5889,14 @@ class AltReversalTraderWindow(QMainWindow):
         favorable_row_brush = QColor(OPTIMIZED_TABLE_FAVORABLE_ROW_COLOR)
         default_row_brush = self.optimized_table.palette().base().color()
         favorable_count = 0
-        favorable_rows: List[Tuple[str, str, Optional[float]]] = []
+        favorable_rows: List[Tuple[str, str, Optional[float], Optional[int]]] = []
         for row, result in enumerate(ordered):
             result_interval = result.best_interval or self.settings.kline_interval
-            favorable_entry = self._optimized_result_has_favorable_entry(
-                result,
-                price_map.get(result.symbol),
-            )
+            favorable_zone = self._optimized_result_favorable_zone(result, price_map.get(result.symbol))
+            favorable_entry = favorable_zone is not None
             if favorable_entry:
                 favorable_count += 1
-                favorable_rows.append((result.symbol, result_interval, price_map.get(result.symbol)))
+                favorable_rows.append((result.symbol, result_interval, price_map.get(result.symbol), favorable_zone))
             brush = favorable_row_brush if favorable_entry else default_row_brush
             for col in range(self.optimized_table.columnCount()):
                 item = self.optimized_table.item(row, col)
@@ -5892,17 +5918,15 @@ class AltReversalTraderWindow(QMainWindow):
         favorable_row_brush = QColor(OPTIMIZED_TABLE_FAVORABLE_ROW_COLOR)
         self.optimized_table.setRowCount(len(ordered))
         favorable_count = 0
-        favorable_rows: List[Tuple[str, str, Optional[float]]] = []
+        favorable_rows: List[Tuple[str, str, Optional[float], Optional[int]]] = []
         for row, result in enumerate(ordered):
             metrics = result.best_backtest.metrics
             result_interval = result.best_interval or self.settings.kline_interval
-            favorable_entry = self._optimized_result_has_favorable_entry(
-                result,
-                price_map.get(result.symbol),
-            )
+            favorable_zone = self._optimized_result_favorable_zone(result, price_map.get(result.symbol))
+            favorable_entry = favorable_zone is not None
             if favorable_entry:
                 favorable_count += 1
-                favorable_rows.append((result.symbol, result_interval, price_map.get(result.symbol)))
+                favorable_rows.append((result.symbol, result_interval, price_map.get(result.symbol), favorable_zone))
             values = [
                 result.symbol,
                 result_interval,

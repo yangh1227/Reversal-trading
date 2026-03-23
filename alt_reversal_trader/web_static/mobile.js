@@ -355,19 +355,21 @@ function startCountdown(deadlineMs) {
   countdownTimer = setInterval(() => renderCountdown(countdownDeadlineMs), 1000);
 }
 
-function renderFavorable(favorableSymbols, signalSymbols) {
+function renderFavorable(favorableEntries, signalSymbols) {
   els.favorableList.innerHTML = "";
-  const total = favorableSymbols.length + signalSymbols.length;
+  const favorableSymbols = favorableEntries.map((entry) => entry.symbol);
+  const total = favorableEntries.length + signalSymbols.length;
   els.favorableCount.textContent = String(total);
   if (!total) {
     els.favorableList.innerHTML = '<span class="muted">현재 없음</span>';
     return;
   }
-  favorableSymbols.forEach((symbol) => {
+  favorableEntries.forEach((entry) => {
     const chip = document.createElement("span");
     chip.className = "chip symbol";
-    chip.textContent = symbol;
-    chip.onclick = () => selectSymbol(symbol);
+    const zoneText = entry.zone ? ` L${entry.zone}` : "";
+    chip.textContent = `${entry.symbol}${zoneText}`;
+    chip.onclick = () => selectSymbol(entry.symbol, entry.interval || "");
     els.favorableList.appendChild(chip);
   });
   signalSymbols.forEach((symbol) => {
@@ -485,7 +487,7 @@ function applyDashboardState(state) {
   els.autoTradeToggle.disabled = autoTradeTogglePending;
   els.simpleAmount.value = state.simpleOrderAmount ?? 50;
 
-  renderFavorable(state.favorableSymbols || [], state.signalSymbols || []);
+  renderFavorable(state.favorableEntries || [], state.signalSymbols || []);
   renderOptimized(state.optimized || []);
   renderPositions(state.positions || []);
 }
