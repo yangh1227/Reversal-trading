@@ -602,7 +602,7 @@ class MobileWebServer:
                     "trades": int(metrics.trade_count),
                     "favorable": favorable,
                     "currentPrice": _format_compact_number(price_map.get(result.symbol)),
-                    "isCurrent": result.symbol == self.window.current_symbol,
+                    "isCurrent": result.symbol == self.window.current_symbol and (result.best_interval or self.window.settings.kline_interval) == (self.window.current_interval or self.window.settings.kline_interval),
                 }
             )
         exchange_balance, exchange_positions = self._mobile_exchange_account_snapshot()
