@@ -88,6 +88,7 @@ from .strategy import (
     compact_indicator_frame,
     evaluate_latest_state,
     estimate_warmup_bars,
+    fresh_entry_trigger_time,
     latest_confirmed_entry_event,
     prepare_ohlcv,
     resume_backtest,
@@ -5399,12 +5400,13 @@ class AltReversalTraderWindow(QMainWindow):
                 else None
             )
             if confirmed_bar_time is not None:
+                trigger_time = fresh_entry_trigger_time(self.current_backtest, confirmed_bar_time, self.current_interval)
                 QTimer.singleShot(
                     0,
                     lambda: self._run_auto_trade_cycle(
                         trigger_symbol=symbol,
                         trigger_interval=self.current_interval,
-                        trigger_bar_time=confirmed_bar_time,
+                        trigger_bar_time=trigger_time if trigger_time is not None else confirmed_bar_time,
                     ),
                 )
         if self.live_recalc_pending:

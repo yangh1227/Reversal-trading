@@ -21,6 +21,7 @@ from alt_reversal_trader.strategy import (
     active_entry_price_by_zone,
     BacktestCursor,
     BacktestResult,
+    fresh_entry_trigger_time,
     latest_confirmed_entry_event,
     incremental_signal_fraction_for_entry,
     resume_backtest,
@@ -400,6 +401,62 @@ def test_latest_confirmed_entry_event_falls_back_to_cursor_signal() -> None:
         "zone": 2,
         "bar_time": pd.Timestamp("2026-01-01 00:10:00"),
     }
+
+
+def test_fresh_entry_trigger_time_accepts_previous_bar_signal_on_close_confirmation() -> None:
+    indicators = pd.DataFrame(
+        {
+            "time": [pd.Timestamp("2026-01-01 00:08:00"), pd.Timestamp("2026-01-01 00:10:00")],
+            "open": [100.0, 101.0],
+            "high": [101.0, 102.0],
+            "low": [99.0, 100.0],
+            "close": [100.0, 101.0],
+            "volume": [1000.0, 1100.0],
+        }
+    )
+    cursor = BacktestCursor(
+        processed_bars=2,
+        last_time=pd.Timestamp("2026-01-01 00:10:00"),
+        equity=1000.0,
+        position_qty=-1.0,
+        avg_entry_price=100.0,
+        entry_side="short",
+        entry_time=pd.Timestamp("2026-01-01 00:08:00"),
+        entry_price=100.0,
+        zone_events=("S3",),
+        zone_event_times=((pd.Timestamp("2026-01-01 00:08:00"), "S3"),),
+        gross_profit=0.0,
+        gross_loss=0.0,
+        trade_count=0,
+        win_count=0,
+        long_zone_used=(False, False, False),
+        short_zone_used=(False, False, True),
+        last_long_zone=0,
+        last_short_zone=3,
+        last_entry_signal_time=pd.Timestamp("2026-01-01 00:08:00"),
+        last_entry_signal_price=100.0,
+        last_entry_signal_side="short",
+        last_entry_signal_zone=3,
+        last_equity_value=1000.0,
+    )
+    backtest = BacktestResult(
+        settings=StrategySettings(),
+        metrics=StrategyMetrics(0.0, 0.0, 0.0, 0, 0.0, 0.0),
+        trades=[],
+        open_entry_events=((pd.Timestamp("2026-01-01 00:08:00"), "S3"),),
+        indicators=indicators,
+        latest_state={},
+        equity_curve=pd.Series([1000.0, 1000.0], index=indicators["time"]),
+        cursor=cursor,
+    )
+
+    trigger_time = fresh_entry_trigger_time(
+        backtest,
+        pd.Timestamp("2026-01-01 00:10:00"),
+        "2m",
+    )
+
+    assert trigger_time == pd.Timestamp("2026-01-01 00:08:00")
 
 
 def test_active_entry_price_by_zone_uses_confirmed_entry_bar_prices() -> None:

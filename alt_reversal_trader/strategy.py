@@ -221,6 +221,45 @@ def latest_confirmed_entry_event(
     }
 
 
+def fresh_entry_trigger_time(
+    backtest: Optional["BacktestResult"],
+    closed_bar_time: Optional[pd.Timestamp | str],
+    interval: str,
+) -> Optional[pd.Timestamp]:
+    normalized_closed_time = _normalize_event_timestamp(closed_bar_time)
+    if backtest is None or normalized_closed_time is None:
+        return None
+    direct_event = latest_confirmed_entry_event(backtest, normalized_closed_time)
+    if direct_event is not None:
+        return pd.Timestamp(direct_event["bar_time"])
+    signal = active_auto_trade_signal(backtest)
+    if signal is None:
+        return None
+    signal_time = _normalize_event_timestamp(signal.get("time"))
+    if signal_time is None or signal_time > normalized_closed_time:
+        return None
+    interval_text = str(interval or "").strip()
+    if len(interval_text) < 2:
+        return None
+    try:
+        interval_value = int(interval_text[:-1])
+    except Exception:
+        return None
+    interval_unit = interval_text[-1]
+    if interval_unit == "m":
+        window = pd.Timedelta(minutes=interval_value)
+    elif interval_unit == "h":
+        window = pd.Timedelta(hours=interval_value)
+    elif interval_unit == "d":
+        window = pd.Timedelta(days=interval_value)
+    else:
+        return None
+    window += pd.Timedelta(milliseconds=1)
+    if normalized_closed_time - signal_time > window:
+        return None
+    return pd.Timestamp(signal_time)
+
+
 def _latest_effective_exit_time(backtest: Optional["BacktestResult"]) -> Optional[pd.Timestamp]:
     if backtest is None or not backtest.trades:
         return None

@@ -29,6 +29,7 @@ from .strategy import (
     BacktestResult,
     evaluate_latest_state,
     estimate_warmup_bars,
+    fresh_entry_trigger_time,
     latest_confirmed_entry_event,
     prepare_ohlcv,
     resume_backtest,
@@ -37,14 +38,14 @@ from .strategy import (
 )
 
 
-AUTO_TRADE_RECHECK_INTERVAL_SECONDS = 1.0
+AUTO_TRADE_RECHECK_INTERVAL_SECONDS = 0.25
 AUTO_CLOSE_RETRY_INTERVAL_SECONDS = 10.0
 POSITION_REFRESH_INTERVAL_SECONDS = 1.0
 COMMAND_POLL_TIMEOUT_SECONDS = 0.25
 STREAM_RECONNECT_DELAY_SECONDS = 2.0
 BACKTEST_WARMUP_BAR_FLOOR = 1_500
 PENDING_ORDER_TIMEOUT_SECONDS = 30.0
-STREAM_PRICE_EVAL_MIN_INTERVAL_SECONDS = 0.2
+STREAM_PRICE_EVAL_MIN_INTERVAL_SECONDS = 0.05
 STREAM_STALE_SECONDS = 3.0
 STREAM_FORCE_RELOAD_SECONDS = 10.0
 STALE_SYMBOL_EVAL_INTERVAL_SECONDS = 1.0
@@ -246,17 +247,18 @@ def _fresh_initial_trigger_bar_time(
     if backtest is None or backtest.indicators.empty or "time" not in backtest.indicators.columns:
         return None
     latest_bar_time = pd.Timestamp(backtest.indicators["time"].iloc[-1]).tz_localize(None)
-    if latest_confirmed_entry_event(backtest, latest_bar_time) is None:
+    trigger_time = fresh_entry_trigger_time(backtest, latest_bar_time, interval)
+    if trigger_time is None:
         return None
     reference_time = now_time
     if reference_time is None:
         reference_time = pd.Timestamp.now(tz="UTC").tz_localize(None)
-    if latest_bar_time > reference_time:
+    if trigger_time > reference_time:
         return None
     freshness_window = pd.Timedelta(milliseconds=_interval_to_ms(interval) * 1.5)
-    if reference_time - latest_bar_time > freshness_window:
+    if reference_time - trigger_time > freshness_window:
         return None
-    return latest_bar_time
+    return trigger_time
 
 
 def _history_fetch_start_time_ms(history_days: int, interval: str, strategy_settings: StrategySettings) -> int:
@@ -1415,10 +1417,11 @@ class _TradeEngine:
         state.reload_requested_at = 0.0
         self._emit_signal_event(state)
         self._evaluate_backtest_auto_close(state)
+        trigger_time = fresh_entry_trigger_time(state.backtest, pd.Timestamp(bar["time"]), interval)
         self._evaluate_auto_trade(
             trigger_symbol=symbol,
             trigger_interval=interval,
-            trigger_bar_time=pd.Timestamp(bar["time"]),
+            trigger_bar_time=trigger_time if trigger_time is not None else pd.Timestamp(bar["time"]),
         )
 
     def _handle_price_update(
