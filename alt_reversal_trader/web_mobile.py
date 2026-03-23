@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
-from .binance_futures import _interval_to_ms
+from .binance_futures import BalanceSnapshot, BinanceFuturesClient, PositionSnapshot, _interval_to_ms
 from .qt_compat import QObject, Signal
 
 
@@ -28,6 +28,7 @@ WEB_SESSION_MAX_AGE_SECONDS = 60 * 60 * 2
 WEB_LOGIN_RATE_LIMIT_ATTEMPTS = 5
 WEB_LOGIN_RATE_LIMIT_WINDOW_SECONDS = 60 * 10
 WEB_PRICE_CACHE_SECONDS = 2.0
+WEB_MOBILE_ACCOUNT_SYNC_SECONDS = 1.0
 WEB_MAX_REQUEST_BYTES = 64 * 1024
 WEB_VENDOR_JS_PATH = (
     Path(__file__).resolve().parent.parent
@@ -184,6 +185,11 @@ class MobileWebServer:
         self.invoker = _UiInvoker()
         self._price_cache: dict[str, float] = {}
         self._price_cache_at = 0.0
+        self._mobile_balance_cache: Optional[BalanceSnapshot] = None
+        self._mobile_positions_cache: list[PositionSnapshot] = []
+        self._mobile_account_cache_at = 0.0
+        self._mobile_account_cache_lock = threading.Lock()
+        self._last_forced_account_refresh_at = 0.0
         self._sessions: Dict[str, _SessionState] = {}
         self._login_attempts: Dict[str, list[float]] = {}
         self._thread: Optional[threading.Thread] = None
@@ -524,6 +530,45 @@ class MobileWebServer:
             return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
         return f"{minutes:02d}:{seconds:02d}"
 
+    def _queue_app_account_refresh(self) -> None:
+        now = time.time()
+        if (now - self._last_forced_account_refresh_at) < 3.0:
+            return
+        self._last_forced_account_refresh_at = now
+        try:
+            self.invoker.post(self.window.refresh_account_info)
+        except Exception:
+            pass
+
+    def _mobile_exchange_account_snapshot(self) -> tuple[Optional[BalanceSnapshot], list[PositionSnapshot]]:
+        now = time.time()
+        with self._mobile_account_cache_lock:
+            if (now - self._mobile_account_cache_at) <= WEB_MOBILE_ACCOUNT_SYNC_SECONDS:
+                return self._mobile_balance_cache, list(self._mobile_positions_cache)
+        settings = getattr(self.window, "settings", None)
+        api_key = str(getattr(settings, "api_key", "") or "").strip()
+        api_secret = str(getattr(settings, "api_secret", "") or "").strip()
+        if not api_key or not api_secret:
+            return None, []
+        try:
+            client = BinanceFuturesClient(api_key, api_secret)
+            balance = client.get_balance_snapshot()
+            positions = client.get_open_positions()
+            with self._mobile_account_cache_lock:
+                self._mobile_balance_cache = balance
+                self._mobile_positions_cache = list(positions)
+                self._mobile_account_cache_at = time.time()
+            app_symbols = {position.symbol for position in getattr(self.window, "open_positions", [])}
+            exchange_symbols = {position.symbol for position in positions}
+            if app_symbols != exchange_symbols:
+                self._queue_app_account_refresh()
+            return balance, list(positions)
+        except Exception:
+            with self._mobile_account_cache_lock:
+                if self._mobile_account_cache_at > 0:
+                    return self._mobile_balance_cache, list(self._mobile_positions_cache)
+            return None, []
+
     def _build_dashboard_state(self) -> dict[str, object]:
         if self.window.current_symbol is None:
             first = next(iter(self.window._ordered_optimized_results()), None)
@@ -560,8 +605,10 @@ class MobileWebServer:
                     "isCurrent": result.symbol == self.window.current_symbol,
                 }
             )
+        exchange_balance, exchange_positions = self._mobile_exchange_account_snapshot()
+        positions_source = exchange_positions if exchange_positions or exchange_balance is not None else list(self.window.open_positions)
         positions = []
-        for position in self.window.open_positions:
+        for position in positions_source:
             values, upnl_value, return_pct = self.window._position_display_values(position)
             positions.append(
                 {
@@ -581,7 +628,7 @@ class MobileWebServer:
         for (sym, _ivl, _mode), (side, zone) in self.window.last_engine_entry_signal_by_key.items():
             if side and int(zone) > 0 and sym not in signal_symbols:
                 signal_symbols.append(sym)
-        snapshot = self.window.account_balance_snapshot
+        snapshot = exchange_balance if exchange_balance is not None else self.window.account_balance_snapshot
         equity = available = None
         if snapshot is not None:
             live_unrealized = self.window._live_total_unrealized_pnl()
