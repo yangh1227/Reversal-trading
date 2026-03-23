@@ -14,6 +14,7 @@ let countdownDeadlineMs = null;
 let foregroundSyncTimer = null;
 let recoverUiTimer = null;
 let recoveryToastCooldownUntil = 0;
+let autoTradeTogglePending = false;
 
 const els = {
   loginView: document.getElementById("login-view"),
@@ -452,7 +453,10 @@ function applyDashboardState(state) {
   els.currentInterval.textContent = state.current.interval || "-";
   startCountdown(state.current.barCloseDeadlineMs);
 
-  els.autoTradeToggle.checked = !!state.autoTradeEnabled;
+  if (!autoTradeTogglePending) {
+    els.autoTradeToggle.checked = !!state.autoTradeEnabled;
+  }
+  els.autoTradeToggle.disabled = autoTradeTogglePending;
   els.simpleAmount.value = state.simpleOrderAmount ?? 50;
 
   renderFavorable(state.favorableSymbols || [], state.signalSymbols || []);
@@ -657,6 +661,34 @@ async function toggleAutoTrade(enabled) {
   });
 }
 
+async function submitAutoTradeToggle(enabled) {
+  const currentEnabled = !!window.__dashboardState?.autoTradeEnabled;
+  if (autoTradeTogglePending) {
+    els.autoTradeToggle.checked = currentEnabled;
+    return;
+  }
+  if (enabled === currentEnabled) {
+    els.autoTradeToggle.checked = currentEnabled;
+    return;
+  }
+  autoTradeTogglePending = true;
+  els.autoTradeToggle.disabled = true;
+  els.autoTradeToggle.checked = currentEnabled;
+  try {
+    await toggleAutoTrade(enabled);
+    await refreshDashboard(true);
+    const actualEnabled = !!window.__dashboardState?.autoTradeEnabled;
+    els.autoTradeToggle.checked = actualEnabled;
+    showToast(actualEnabled ? "자동매매 활성화" : "자동매매 비활성화");
+  } catch (error) {
+    els.autoTradeToggle.checked = currentEnabled;
+    showToast(error.message, "error");
+  } finally {
+    autoTradeTogglePending = false;
+    els.autoTradeToggle.disabled = false;
+  }
+}
+
 function setOrderMode(mode) {
   els.modeCompound.classList.toggle("active", mode === "compound");
   els.modeSimple.classList.toggle("active", mode === "simple");
@@ -693,11 +725,9 @@ els.closeAllButton.addEventListener("click", () => {
     .catch((error) => showToast(error.message, "error"));
 });
 
-els.autoTradeToggle.addEventListener("change", (event) =>
-  toggleAutoTrade(event.target.checked)
-    .then(() => showToast(event.target.checked ? "자동매매 활성화" : "자동매매 비활성화"))
-    .catch((error) => showToast(error.message, "error"))
-);
+els.autoTradeToggle.addEventListener("change", (event) => {
+  submitAutoTradeToggle(event.target.checked).catch((error) => showToast(error.message, "error"));
+});
 
 els.modeCompound.addEventListener("click", () => setOrderMode("compound"));
 els.modeSimple.addEventListener("click", () => setOrderMode("simple"));
