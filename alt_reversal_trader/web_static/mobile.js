@@ -15,6 +15,7 @@ let foregroundSyncTimer = null;
 let recoverUiTimer = null;
 let recoveryToastCooldownUntil = 0;
 let autoTradeTogglePending = false;
+let orderActionPending = false;
 
 const els = {
   loginView: document.getElementById("login-view"),
@@ -85,6 +86,20 @@ function showChartLoading(show) {
   if (els.chartLoading) {
     els.chartLoading.style.display = show ? "flex" : "none";
   }
+}
+
+function setOrderActionPending(pending) {
+  orderActionPending = !!pending;
+  [
+    els.closeAllButton,
+    els.simpleLong,
+    els.simpleShort,
+    ...document.querySelectorAll("[data-fraction]"),
+  ].forEach((element) => {
+    if (element) {
+      element.disabled = orderActionPending;
+    }
+  });
 }
 
 function initChart() {
@@ -433,13 +448,24 @@ function renderPositions(items) {
       </div>
     `;
     row.addEventListener("click", () => selectSymbol(item.symbol));
-    row.querySelector("button").onclick = (event) => {
+    const closeButton = row.querySelector("button");
+    const autoCloseCheckbox = row.querySelector('input[type="checkbox"]');
+    closeButton.disabled = orderActionPending;
+    autoCloseCheckbox.disabled = orderActionPending;
+    closeButton.onclick = (event) => {
       event.stopPropagation();
-      closePosition(item.symbol);
+      runOrderAction(() => closePosition(item.symbol), "포지션 청산 접수", "포지션 청산 요청 실패").catch(() => {});
     };
-    row.querySelector('input[type="checkbox"]').onchange = (event) => {
+    autoCloseCheckbox.onchange = (event) => {
       event.stopPropagation();
-      toggleAutoClose(item.symbol, event.target.checked);
+      runOrderAction(
+        () => toggleAutoClose(item.symbol, event.target.checked),
+        event.target.checked ? "자동청산 ON 반영" : "자동청산 OFF 반영",
+        "자동청산 설정 실패",
+        { syncDelayMs: 0, showQueuedToast: false }
+      ).catch(() => {
+        event.target.checked = !event.target.checked;
+      });
     };
     els.positionsList.appendChild(row);
   });
@@ -468,6 +494,33 @@ async function refreshDashboard(forceChart = false) {
   const state = await api("/api/dashboard");
   applyDashboardState(state);
   await refreshChart(forceChart);
+}
+
+async function runOrderAction(action, successMessage, fallbackErrorMessage, options = {}) {
+  const syncDelayMs = Number(options.syncDelayMs ?? 600) || 0;
+  const showQueuedToast = options.showQueuedToast !== false;
+  if (orderActionPending) {
+    return false;
+  }
+  setOrderActionPending(true);
+  try {
+    const payload = await action();
+    if (showQueuedToast) {
+      showToast(successMessage || "요청 접수", "success");
+    }
+    queueForegroundSync(syncDelayMs);
+    return payload;
+  } catch (error) {
+    queueUiRecovery(0);
+    queueForegroundSync(0);
+    showToast(error?.message || fallbackErrorMessage || "요청 실패", "error", 3500);
+    throw error;
+  } finally {
+    setTimeout(() => {
+      setOrderActionPending(false);
+      refreshDashboard(false).catch(() => {});
+    }, 250);
+  }
 }
 
 function connectLiveSocket() {
@@ -697,32 +750,28 @@ function setOrderMode(mode) {
 }
 
 document.querySelectorAll("[data-fraction]").forEach((button) => {
-  button.addEventListener("click", () =>
-    submitFractional(button.dataset.side, Number(button.dataset.fraction))
-      .then(() => showToast("주문 완료", "success"))
-      .catch((error) => showToast(error.message, "error"))
-  );
+  button.addEventListener("click", () => {
+    runOrderAction(
+      () => submitFractional(button.dataset.side, Number(button.dataset.fraction)),
+      "주문 접수",
+      "주문 요청 실패"
+    ).catch(() => {});
+  });
 });
 
 els.simpleLong.addEventListener("click", () =>
-  submitSimple("BUY")
-    .then(() => showToast("LONG 주문 완료", "success"))
-    .catch((error) => showToast(error.message, "error"))
+  runOrderAction(() => submitSimple("BUY"), "LONG 주문 접수", "LONG 주문 요청 실패").catch(() => {})
 );
 
 els.simpleShort.addEventListener("click", () =>
-  submitSimple("SELL")
-    .then(() => showToast("SHORT 주문 완료", "success"))
-    .catch((error) => showToast(error.message, "error"))
+  runOrderAction(() => submitSimple("SELL"), "SHORT 주문 접수", "SHORT 주문 요청 실패").catch(() => {})
 );
 
 els.closeAllButton.addEventListener("click", () => {
   if (!confirm("모든 포지션을 청산하시겠습니까?")) {
     return;
   }
-  closeAll()
-    .then(() => showToast("전체 청산 완료", "success"))
-    .catch((error) => showToast(error.message, "error"));
+  runOrderAction(() => closeAll(), "전체 청산 접수", "전체 청산 요청 실패").catch(() => {});
 });
 
 els.autoTradeToggle.addEventListener("change", (event) => {
