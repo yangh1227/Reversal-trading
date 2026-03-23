@@ -391,7 +391,7 @@ function renderOptimized(items) {
   els.optimizedList.innerHTML = "";
   items.forEach((item) => {
     const row = document.createElement("div");
-    row.className = `list-item${item.favorable ? " favorable" : ""}`;
+    row.className = `list-item${item.favorable ? " favorable" : ""}${item.isCurrent ? " current-item" : ""}`;
     row.innerHTML = `
       <div class="list-title">
         <strong>${item.symbol}</strong>

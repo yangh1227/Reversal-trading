@@ -394,6 +394,16 @@ button.danger:hover { background: rgba(248,81,73,0.22); }
 /* Chart view button (full width) */
 .chart-view-btn { width: 100%; }
 
+/* 현재 선택된 최적화 종목 */
+.list-item.current-item {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 1px rgba(88,166,255,0.25), inset 0 0 0 1px rgba(88,166,255,0.08);
+}
+
+.list-item.current-item .list-title strong {
+  color: var(--blue);
+}
+
 /* Signal chip (진입신호 종목) */
 .chip.signal-chip {
   background: rgba(227,179,65,0.13);
