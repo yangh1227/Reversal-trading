@@ -17,6 +17,7 @@ from .auto_trade_runtime import (
     auto_trade_signal_from_backtest,
     evaluate_auto_trade_candidate,
     favorable_auto_trade_fraction,
+    favorable_zone_for_price,
     history_can_resume_backtest as _history_can_resume_backtest,
     inferred_auto_trade_fraction as _inferred_auto_trade_fraction,
     pick_auto_trade_candidate,
@@ -5920,23 +5921,12 @@ class AltReversalTraderWindow(QMainWindow):
         if favorable_fraction <= 1e-9:
             return None
         zone_prices = dict(signal.get("zone_prices") or {})
-        current_price_value = float(current_price)
-        for zone in (3, 2):
-            zone_price = float(zone_prices.get(zone, 0.0) or 0.0)
-            if zone_price <= 0:
-                continue
-            favorable = current_price_value < zone_price if side == "long" else current_price_value > zone_price
-            if favorable:
-                return zone
-        if zone_favorable_fraction(
+        return favorable_zone_for_price(
             side,
-            current_price_value,
+            float(current_price),
             float(signal.get("price") or 0.0),
             zone_prices,
-            float(filled_fraction),
-        ) > 1e-9:
-            return 1
-        return None
+        )
 
     def _optimized_result_has_favorable_entry(self, result: OptimizationResult, current_price: Optional[float]) -> bool:
         return self._optimized_result_favorable_zone(result, current_price) is not None

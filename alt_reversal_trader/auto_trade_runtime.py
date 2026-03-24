@@ -34,6 +34,24 @@ def auto_trade_signal_from_backtest(backtest: BacktestResult) -> Optional[Dict[s
     return strategy_active_auto_trade_signal(backtest)
 
 
+def favorable_zone_for_price(
+    side: str,
+    current_price: float,
+    signal_price: float,
+    zone_prices: Dict[int, float],
+) -> Optional[int]:
+    for zone in (3, 2, 1):
+        zone_price = float(zone_prices.get(zone, 0.0) or 0.0)
+        if zone == 1 and zone_price <= 0:
+            zone_price = float(signal_price or 0.0)
+        if zone_price <= 0:
+            continue
+        favorable = current_price < zone_price if side == "long" else current_price > zone_price
+        if favorable:
+            return zone
+    return None
+
+
 def zone_favorable_fraction(
     side: str,
     current_price: float,
@@ -41,19 +59,14 @@ def zone_favorable_fraction(
     zone_prices: Dict[int, float],
     filled_fraction: float,
 ) -> float:
-    for zone in (3, 2):
-        zone_price = zone_prices.get(zone)
-        if zone_price is None or zone_price <= 0:
-            continue
-        favorable = current_price < zone_price if side == "long" else current_price > zone_price
-        if favorable:
-            zone_fraction = signal_fraction_for_zone(zone)
-            remaining = max(0.0, zone_fraction - filled_fraction)
-            if remaining > 1e-9:
-                return remaining
-    favorable = current_price < signal_price if side == "long" else current_price > signal_price
-    if favorable:
-        return max(0.0, signal_fraction_for_zone(1) - filled_fraction)
+    favorable_zone = favorable_zone_for_price(
+        side,
+        float(current_price),
+        float(signal_price),
+        dict(zone_prices or {}),
+    )
+    if favorable_zone is not None:
+        return max(0.0, signal_fraction_for_zone(favorable_zone) - filled_fraction)
     return 0.0
 
 

@@ -7,6 +7,7 @@ import time
 
 import pandas as pd
 
+from alt_reversal_trader.auto_trade_runtime import favorable_zone_for_price, zone_favorable_fraction
 from alt_reversal_trader.binance_futures import PositionSnapshot
 from alt_reversal_trader.config import DEFAULT_HISTORY_DAYS, StrategySettings
 from alt_reversal_trader.strategy import BacktestCursor, BacktestResult, StrategyMetrics, TradeRecord, run_backtest
@@ -71,6 +72,18 @@ def test_fractional_order_margin_uses_equity_for_auto_trade() -> None:
 
     assert _fractional_order_margin(balance, 0.49, auto_trade=True) == 9.8
     assert _fractional_order_margin(balance, 0.49, auto_trade=False) == 4.9
+
+
+def test_favorable_price_can_use_earlier_active_zone_before_exit() -> None:
+    zone_prices = {1: 100.0, 2: 90.0}
+
+    assert favorable_zone_for_price("long", 95.0, 90.0, zone_prices) == 1
+    assert zone_favorable_fraction("long", 95.0, 90.0, zone_prices, 0.0) == 0.33
+
+    deeper_zone_prices = {2: 90.0, 3: 80.0}
+
+    assert favorable_zone_for_price("long", 85.0, 80.0, deeper_zone_prices) == 2
+    assert zone_favorable_fraction("long", 85.0, 80.0, deeper_zone_prices, 0.0) == 0.50
 
 
 def make_signal_backtest(
