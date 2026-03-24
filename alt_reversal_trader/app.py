@@ -434,9 +434,8 @@ def _chart_candle_frame(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def _is_provisional_exit_trade(trade, latest_time: Optional[pd.Timestamp]) -> bool:
-    if latest_time is None:
-        return False
-    return trade.reason == "end_of_test" and pd.Timestamp(trade.exit_time) == latest_time
+    _ = latest_time
+    return str(getattr(trade, "reason", "")).strip() == "end_of_test"
 
 
 def _latest_backtest_exit_event(backtest: Optional[BacktestResult]) -> Optional[Dict[str, object]]:
@@ -444,10 +443,12 @@ def _latest_backtest_exit_event(backtest: Optional[BacktestResult]) -> Optional[
         return None
     latest_time = pd.Timestamp(backtest.indicators["time"].iloc[-1])
     for trade in reversed(backtest.trades):
+        if _is_provisional_exit_trade(trade, latest_time):
+            continue
         exit_time = pd.Timestamp(trade.exit_time)
         if exit_time < latest_time:
             break
-        if exit_time != latest_time or _is_provisional_exit_trade(trade, latest_time):
+        if exit_time != latest_time:
             continue
         return {
             "side": str(trade.side).lower(),
