@@ -61,6 +61,7 @@ from .qt_compat import (
     QFormLayout,
     QGraphicsOpacityEffect,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -2372,7 +2373,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.positions_table.setSelectionMode(SINGLE_SELECTION)
         self.positions_table.setEditTriggers(NO_EDIT_TRIGGERS)
         positions_header = self.positions_table.horizontalHeader()
-        positions_header.setSectionResizeMode(0, RESIZE_TO_CONTENTS)
+        positions_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         positions_header.setStretchLastSection(True)
         self.positions_table.installEventFilter(self)
         self.positions_table.itemSelectionChanged.connect(self.on_positions_selection_changed)
