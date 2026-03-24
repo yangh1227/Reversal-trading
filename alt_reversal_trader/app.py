@@ -4194,9 +4194,14 @@ class AltReversalTraderWindow(QMainWindow):
         if symbol:
             remembered_interval = self.settings.position_intervals.get(symbol)
             has_open_position = self._find_open_position(symbol) is not None
+            prefers_locked_position_settings = (
+                self.current_chart_prefers_locked_position_settings
+                and symbol == self.current_symbol
+                and interval == self.current_interval
+            )
             remembered_events = list(self.position_open_entry_events_by_symbol.get(symbol, ()))
             if (
-                has_open_position
+                (has_open_position or prefers_locked_position_settings)
                 and interval in APP_INTERVAL_OPTIONS
                 and remembered_interval == interval
                 and remembered_events
