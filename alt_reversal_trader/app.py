@@ -1870,10 +1870,14 @@ class AltReversalTraderWindow(QMainWindow):
         chart_header_row.setContentsMargins(0, 0, 0, 0)
         chart_header_row.setSpacing(10)
         self.chart_header_symbol_label = QLabel("-")
-        self.chart_header_symbol_label.setStyleSheet("color: #111827; font-weight: 800; font-size: 14px;")
+        self.chart_header_symbol_label.setStyleSheet(
+            f"color: #ffffff; background: #1546b0; border-radius: 10px; padding: 2px 10px; {status_strip_font_style}"
+        )
         chart_header_row.addWidget(self.chart_header_symbol_label)
         self.chart_header_tf_label = QLabel("TF -")
-        self.chart_header_tf_label.setStyleSheet("color: #4b5563; font-weight: 700; font-size: 12px;")
+        self.chart_header_tf_label.setStyleSheet(
+            f"color: #ffffff; background: #6b7280; border-radius: 10px; padding: 2px 10px; {status_strip_font_style}"
+        )
         chart_header_row.addWidget(self.chart_header_tf_label)
         chart_header_row.addStretch(1)
         chart_header_row.addWidget(QLabel("차트 전환"))
