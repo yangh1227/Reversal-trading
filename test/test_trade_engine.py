@@ -954,6 +954,51 @@ def test_trade_engine_enters_fresh_confirmed_additional_signal_for_open_position
     assert round(float(submitted[0]["fraction"]), 2) == 0.49
 
 
+def test_trade_engine_enters_fresh_confirmed_additional_signal_even_if_active_signal_lags() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.auto_trade_enabled = True
+    engine.client = FakeTickerClient({"TESTUSDT": 120.0})
+    backtest = make_signal_backtest(
+        zone=2,
+        signal_time="2026-01-01 00:20:00",
+        entry_time="2026-01-01 00:10:00",
+    )
+    backtest = replace(
+        backtest,
+        open_entry_events=((pd.Timestamp("2026-01-01 00:20:00"), "L3"),),
+    )
+    key = ("TESTUSDT", "1m")
+    engine.watchlist[key] = EngineWatchlistItem(
+        symbol="TESTUSDT",
+        interval="1m",
+        score=7.0,
+        return_pct=12.0,
+        strategy_settings=StrategySettings(),
+    )
+    engine.symbol_states[key] = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="1m",
+        strategy_settings=StrategySettings(),
+        backtest=backtest,
+    )
+    engine.open_positions["TESTUSDT"] = make_position()
+    engine.position_intervals["TESTUSDT"] = "1m"
+    engine.filled_fraction_by_symbol["TESTUSDT"] = 0.5
+    engine.auto_trade_cursor_entry_time["TESTUSDT"] = pd.Timestamp("2026-01-01 00:10:00")
+    submitted: list[dict[str, object]] = []
+    engine._enqueue_open_order = lambda **kwargs: submitted.append(kwargs)
+
+    engine._evaluate_auto_trade(
+        trigger_symbol="TESTUSDT",
+        trigger_interval="1m",
+        trigger_bar_time=pd.Timestamp("2026-01-01 00:20:00"),
+    )
+
+    assert len(submitted) == 1
+    assert submitted[0]["side"] == "BUY"
+    assert round(float(submitted[0]["fraction"]), 2) == 0.49
+
+
 def test_trade_engine_skips_stale_confirmed_signal_without_matching_trigger_bar() -> None:
     engine = _TradeEngine(mp.Queue(), mp.Queue())
     engine.auto_trade_enabled = True

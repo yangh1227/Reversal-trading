@@ -131,39 +131,65 @@ def evaluate_auto_trade_candidate(
     trigger_interval: str = "",
     trigger_bar_time: Optional[pd.Timestamp] = None,
 ) -> AutoTradeEvaluationResult:
-    if latest_backtest is None or current_price is None or current_price <= 0:
+    if latest_backtest is None:
         return AutoTradeEvaluationResult()
     if open_position is not None and remembered_interval in APP_INTERVAL_OPTIONS and remembered_interval != interval:
         return AutoTradeEvaluationResult()
     signal = auto_trade_signal_from_backtest(latest_backtest)
-    if signal is None:
-        return AutoTradeEvaluationResult()
-    signal_price = float(signal["price"])
-    zone_prices = dict(signal.get("zone_prices") or {})
+    signal_price = 0.0
+    zone_prices: Dict[int, float] = {}
+    side = ""
+    fraction = 0.0
+    cursor_entry_time = None
+    if signal is not None:
+        signal_price = float(signal["price"])
+        zone_prices = dict(signal.get("zone_prices") or {})
+        side = str(signal["side"])
+        fraction = float(signal["fraction"])
+        cursor_entry_time = signal.get("cursor_entry_time")
     normalized_trigger_time = pd.Timestamp(trigger_bar_time).tz_localize(None) if trigger_bar_time is not None else None
     confirmed_entry = (
         latest_confirmed_entry_event(latest_backtest, normalized_trigger_time)
         if normalized_trigger_time is not None and symbol == trigger_symbol and interval == trigger_interval
         else None
     )
-    side = str(signal["side"])
     has_fresh_confirmed_entry = (
-        confirmed_entry is not None
+        signal is not None
+        and confirmed_entry is not None
         and str(confirmed_entry["side"]) == side
         and int(confirmed_entry["zone"]) == int(signal["zone"])
     )
+    fresh_confirmed_additional_entry = False
+    if open_position is not None and confirmed_entry is not None:
+        position_side = "long" if float(open_position.amount) > 0 else "short"
+        confirmed_side = str(confirmed_entry["side"])
+        confirmed_zone = int(confirmed_entry["zone"])
+        confirmed_fraction = signal_fraction_for_zone(confirmed_zone)
+        if (
+            confirmed_side == position_side
+            and confirmed_zone in {1, 2, 3}
+            and confirmed_fraction > float(filled_fraction) + 1e-9
+        ):
+            side = confirmed_side
+            fraction = confirmed_fraction
+            fresh_confirmed_additional_entry = True
+            has_fresh_confirmed_entry = True
+            if latest_backtest.cursor is not None and latest_backtest.cursor.entry_time is not None:
+                cursor_entry_time = pd.Timestamp(latest_backtest.cursor.entry_time)
+    if signal is None and not fresh_confirmed_additional_entry:
+        return AutoTradeEvaluationResult()
+    if not has_fresh_confirmed_entry and (current_price is None or current_price <= 0):
+        return AutoTradeEvaluationResult()
     latest_state = latest_backtest.latest_state
     if latest_state and open_position is not None:
         if side == "long" and (bool(latest_state.get("trend_to_short")) or bool(latest_state.get("final_bear"))):
             return AutoTradeEvaluationResult()
         if side == "short" and (bool(latest_state.get("trend_to_long")) or bool(latest_state.get("final_bull"))):
             return AutoTradeEvaluationResult()
-    fraction = float(signal["fraction"])
     if open_position is not None:
         position_side = "long" if float(open_position.amount) > 0 else "short"
         if side != position_side:
             return AutoTradeEvaluationResult()
-        cursor_entry_time = signal.get("cursor_entry_time")
         if remembered_cursor_entry_time is not None and cursor_entry_time is not None:
             if pd.Timestamp(remembered_cursor_entry_time).tz_localize(None) != pd.Timestamp(cursor_entry_time).tz_localize(None):
                 return AutoTradeEvaluationResult(reentry_position_side=position_side)
@@ -206,6 +232,6 @@ def evaluate_auto_trade_candidate(
             "return_pct": float(latest_backtest.metrics.total_return_pct),
             "fraction": float(fraction),
             "strategy_settings": strategy_settings,
-            "cursor_entry_time": signal.get("cursor_entry_time"),
+            "cursor_entry_time": cursor_entry_time,
         }
     )
