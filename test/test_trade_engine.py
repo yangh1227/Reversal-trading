@@ -298,6 +298,40 @@ class FakeTickerClient:
         }
 
 
+def test_trade_engine_auto_close_ignores_mismatched_interval_state_for_position() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    symbol = "TESTUSDT"
+    engine.open_positions[symbol] = make_position(symbol=symbol)
+    engine.position_intervals[symbol] = "2m"
+    backtest = make_signal_backtest(
+        side="long",
+        zone=2,
+        signal_time="2026-01-01 00:10:00",
+        latest_time="2026-01-01 00:30:00",
+        price=100.0,
+        position_qty=1.0,
+    )
+    backtest = replace(
+        backtest,
+        latest_state={"trend_to_short": True},
+        indicators=backtest.indicators.assign(trend_to_short=[True], final_bear=[False]),
+    )
+    state = _EngineSymbolState(
+        symbol=symbol,
+        interval="1m",
+        strategy_settings=StrategySettings(),
+        history=make_sample_ohlcv(10),
+        backtest=backtest,
+        loading=False,
+    )
+    close_calls: list[tuple[str, str | None, bool]] = []
+    engine._enqueue_close_order = lambda sym, reason, auto_close: close_calls.append((sym, reason, auto_close))
+
+    engine._evaluate_backtest_auto_close(state)
+
+    assert close_calls == []
+
+
 def test_trade_engine_prefers_locked_strategy_for_open_positions() -> None:
     engine = _TradeEngine(mp.Queue(), mp.Queue())
     locked_settings = StrategySettings(atr_period=7)

@@ -1497,6 +1497,13 @@ class _TradeEngine:
         if state.backtest is None:
             return
         position = self.open_positions.get(state.symbol)
+        locked_interval = self.position_intervals.get(state.symbol)
+        if (
+            position is not None
+            and locked_interval in APP_INTERVAL_OPTIONS
+            and state.interval != locked_interval
+        ):
+            return
         exit_event = _confirmed_exit_event_from_position_backtest(position, state.backtest)
         if exit_event is None:
             exit_event = _latest_backtest_exit_event(state.backtest)
@@ -1644,6 +1651,11 @@ class _TradeEngine:
         for item in eligible_items:
             cooldown_until = self.auto_trade_reentry_cooldown_until.get((item.symbol, item.interval), 0.0)
             if cooldown_until > time.time():
+                if _dbg_trigger and item.symbol == trigger_symbol and item.interval == trigger_interval:
+                    remaining = max(0.0, cooldown_until - time.time())
+                    print(
+                        f"[자동매매 진단] {item.symbol}/{item.interval} ❌ 차단: 재진입 쿨다운 {remaining:.1f}초 남음"
+                    )
                 continue
             if item.symbol in self.pending_order_symbols:
                 if _dbg_trigger and item.symbol == trigger_symbol:
