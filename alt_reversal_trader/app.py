@@ -1610,6 +1610,10 @@ class AltReversalTraderWindow(QMainWindow):
         self.preserve_lists_during_refresh = False
         self.open_positions: List[PositionSnapshot] = []
         self.position_strategy_by_symbol: Dict[str, StrategySettings] = dict(self.settings.position_strategy_settings)
+        self.position_open_entry_events_by_symbol: Dict[str, List[Tuple[pd.Timestamp, str]]] = {
+            symbol: [(pd.Timestamp(event_time), str(label)) for event_time, label in events]
+            for symbol, events in self.settings.position_open_entry_events.items()
+        }
         self.current_position_snapshot: Optional[PositionSnapshot] = None
         self.current_symbol: Optional[str] = None
         self.current_interval = self.settings.kline_interval
@@ -3199,6 +3203,8 @@ class AltReversalTraderWindow(QMainWindow):
             self.pending_open_order_interval = event.interval
             if event.strategy_settings is not None:
                 self._remember_position_strategy_settings(event.symbol, event.strategy_settings)
+            if not event.auto_close:
+                self._remember_position_open_entry_events_for_key(event.symbol, event.interval)
             if event.auto_trade:
                 self.auto_trade_entry_pending_symbol = event.symbol
                 self.auto_trade_entry_pending_at = time.time()
@@ -3717,6 +3723,52 @@ class AltReversalTraderWindow(QMainWindow):
         if persist:
             self._persist_position_intervals()
 
+    def _remember_position_open_entry_events(
+        self,
+        symbol: str,
+        backtest: Optional[BacktestResult],
+        persist: bool = True,
+    ) -> None:
+        if not symbol or backtest is None:
+            return
+        raw_events = list(getattr(backtest, "open_entry_events", ()) or ())
+        if not raw_events:
+            return
+        normalized = sorted(
+            {
+                (pd.Timestamp(event_time).tz_localize(None), str(event_label))
+                for event_time, event_label in raw_events
+                if str(event_label or "").strip()
+            },
+            key=lambda item: item[0],
+        )
+        if not normalized:
+            return
+        if (
+            self.position_open_entry_events_by_symbol.get(symbol) == normalized
+            and self.settings.position_open_entry_events.get(symbol) == normalized
+        ):
+            return
+        self.position_open_entry_events_by_symbol[symbol] = normalized
+        self.settings.position_open_entry_events[symbol] = normalized
+        if persist:
+            self._persist_position_intervals()
+
+    def _remember_position_open_entry_events_for_key(
+        self,
+        symbol: str,
+        interval: Optional[str],
+        persist: bool = True,
+    ) -> None:
+        normalized_interval = str(interval or "").strip()
+        backtest: Optional[BacktestResult] = None
+        if symbol == self.current_symbol and normalized_interval == self.current_interval and self.current_backtest is not None:
+            backtest = self.current_backtest
+        elif normalized_interval in APP_INTERVAL_OPTIONS:
+            backtest = self.backtest_cache.get((symbol, normalized_interval))
+        if backtest is not None:
+            self._remember_position_open_entry_events(symbol, backtest, persist=persist)
+
     def _forget_closed_position_intervals(self, open_symbols: set[str], persist: bool = True) -> None:
         removed = False
         for symbol in list(self.settings.position_intervals):
@@ -3741,6 +3793,12 @@ class AltReversalTraderWindow(QMainWindow):
                 continue
             self.settings.position_cursor_entry_times.pop(symbol, None)
             self.auto_trade_cursor_entry_time_by_symbol.pop(symbol, None)
+            removed = True
+        for symbol in list(self.settings.position_open_entry_events):
+            if symbol in open_symbols:
+                continue
+            self.settings.position_open_entry_events.pop(symbol, None)
+            self.position_open_entry_events_by_symbol.pop(symbol, None)
             removed = True
         if removed and persist:
             self._persist_position_intervals()
@@ -3768,6 +3826,8 @@ class AltReversalTraderWindow(QMainWindow):
                 self.auto_trade_filled_fraction_by_symbol[symbol] = self.settings.position_filled_fractions[symbol]
             if symbol in self.settings.position_cursor_entry_times:
                 self.auto_trade_cursor_entry_time_by_symbol[symbol] = self.settings.position_cursor_entry_times[symbol]
+            if symbol in self.settings.position_open_entry_events:
+                self.position_open_entry_events_by_symbol[symbol] = self.settings.position_open_entry_events[symbol]
         if changed:
             self._persist_position_intervals()
 
@@ -4096,11 +4156,19 @@ class AltReversalTraderWindow(QMainWindow):
             )
         return markers
 
-    def _open_entry_markers(self, backtest: Optional[BacktestResult]) -> List[Dict[str, object]]:
-        if backtest is None:
+    def _open_entry_markers(self, backtest: Optional[BacktestResult], symbol: Optional[str] = None) -> List[Dict[str, object]]:
+        if backtest is None and not symbol:
             return []
         markers: List[Dict[str, object]] = []
-        for event_time, event_label in list(getattr(backtest, "open_entry_events", ()) or ()):
+        merged_events: List[Tuple[pd.Timestamp, str]] = []
+        if backtest is not None:
+            merged_events.extend(
+                (pd.Timestamp(event_time).tz_localize(None), str(event_label))
+                for event_time, event_label in list(getattr(backtest, "open_entry_events", ()) or ())
+            )
+        if symbol:
+            merged_events.extend(self.position_open_entry_events_by_symbol.get(symbol, ()))
+        for event_time, event_label in sorted(set(merged_events), key=lambda item: item[0]):
             label_text = str(event_label)
             is_long = label_text.upper().startswith("L")
             markers.append(
@@ -4441,7 +4509,7 @@ class AltReversalTraderWindow(QMainWindow):
         )
         latest_time = pd.Timestamp(candle_df["time"].iloc[-1]) if not candle_df.empty else None
         markers = self._trade_markers(snapshot.backtest.trades, latest_time)
-        markers.extend(self._open_entry_markers(snapshot.backtest))
+        markers.extend(self._open_entry_markers(snapshot.backtest, snapshot.symbol))
         return candle_df, indicators, equity_df, markers
 
     def _clear_lightweight_volume_series(self) -> None:
@@ -7095,6 +7163,12 @@ class AltReversalTraderWindow(QMainWindow):
         }
         self._forget_closed_position_intervals(open_symbols, persist=False)
         self._remember_missing_open_position_intervals(open_symbols)
+        for symbol in sorted(open_symbols):
+            self._remember_position_open_entry_events_for_key(
+                symbol,
+                self.settings.position_intervals.get(symbol),
+                persist=False,
+            )
         if self.current_symbol and requested_symbol == self.current_symbol:
             self.current_position_snapshot = position
         elif self.current_symbol:
@@ -7133,6 +7207,7 @@ class AltReversalTraderWindow(QMainWindow):
     def _on_account_info_failed(self, message: str) -> None:
         self.open_positions = []
         self.position_strategy_by_symbol = {}
+        self.position_open_entry_events_by_symbol = {}
         self.current_position_snapshot = None
         self.account_balance_snapshot = None
         self._refresh_position_price_streams()

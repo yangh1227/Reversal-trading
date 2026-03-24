@@ -147,6 +147,12 @@ class TestConfigPath(unittest.TestCase):
                 position_strategy_settings={"BTCUSDT": locked_settings},
                 position_filled_fractions={"BTCUSDT": 0.5},
                 position_cursor_entry_times={"BTCUSDT": pd.Timestamp("2026-01-01 00:10:00")},
+                position_open_entry_events={
+                    "BTCUSDT": [
+                        (pd.Timestamp("2026-01-01 00:10:00"), "L2"),
+                        (pd.Timestamp("2026-01-01 00:20:00"), "L3"),
+                    ]
+                },
             )
 
             settings.save(config_path)
@@ -160,6 +166,13 @@ class TestConfigPath(unittest.TestCase):
             self.assertEqual(loaded.position_strategy_settings["BTCUSDT"], locked_settings)
             self.assertEqual(loaded.position_filled_fractions["BTCUSDT"], 0.5)
             self.assertEqual(loaded.position_cursor_entry_times["BTCUSDT"], pd.Timestamp("2026-01-01 00:10:00"))
+            self.assertEqual(
+                loaded.position_open_entry_events["BTCUSDT"],
+                [
+                    (pd.Timestamp("2026-01-01 00:10:00"), "L2"),
+                    (pd.Timestamp("2026-01-01 00:20:00"), "L3"),
+                ],
+            )
 
     def test_legacy_chart_display_days_migrates_to_hours(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

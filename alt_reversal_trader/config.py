@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field
 import os
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import json
 import pandas as pd
 
@@ -144,6 +144,37 @@ def _normalize_position_cursor_entry_times(
     return normalized
 
 
+def _normalize_position_open_entry_events(
+    payload: Dict[str, Any] | None,
+) -> Dict[str, List[Tuple[pd.Timestamp, str]]]:
+    normalized: Dict[str, List[Tuple[pd.Timestamp, str]]] = {}
+    for symbol, raw_events in dict(payload or {}).items():
+        symbol_text = str(symbol or "").strip()
+        if not symbol_text:
+            continue
+        events: List[Tuple[pd.Timestamp, str]] = []
+        for raw_event in list(raw_events or []):
+            if isinstance(raw_event, dict):
+                raw_time = raw_event.get("time")
+                raw_label = raw_event.get("label")
+            elif isinstance(raw_event, (list, tuple)) and len(raw_event) >= 2:
+                raw_time, raw_label = raw_event[0], raw_event[1]
+            else:
+                continue
+            try:
+                event_time = pd.Timestamp(raw_time).tz_localize(None)
+            except Exception:
+                continue
+            label_text = str(raw_label or "").strip()
+            if not label_text:
+                continue
+            events.append((event_time, label_text))
+        if events:
+            deduped = sorted(set(events), key=lambda item: item[0])
+            normalized[symbol_text] = deduped
+    return normalized
+
+
 @dataclass
 class AppSettings:
     api_key: str = ""
@@ -183,6 +214,7 @@ class AppSettings:
     position_strategy_settings: Dict[str, StrategySettings] = field(default_factory=dict)
     position_filled_fractions: Dict[str, float] = field(default_factory=dict)
     position_cursor_entry_times: Dict[str, pd.Timestamp] = field(default_factory=dict)
+    position_open_entry_events: Dict[str, List[Tuple[pd.Timestamp, str]]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.order_mode not in {"compound", "simple"}:
@@ -215,6 +247,7 @@ class AppSettings:
             if str(symbol or "").strip()
         }
         self.position_cursor_entry_times = _normalize_position_cursor_entry_times(self.position_cursor_entry_times)
+        self.position_open_entry_events = _normalize_position_open_entry_events(self.position_open_entry_events)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -261,6 +294,13 @@ class AppSettings:
                 symbol: timestamp.isoformat()
                 for symbol, timestamp in self.position_cursor_entry_times.items()
             },
+            "position_open_entry_events": {
+                symbol: [
+                    {"time": event_time.isoformat(), "label": label}
+                    for event_time, label in events
+                ]
+                for symbol, events in self.position_open_entry_events.items()
+            },
         }
 
     @classmethod
@@ -272,6 +312,7 @@ class AppSettings:
         position_strategy_settings = payload.pop("position_strategy_settings", {}) or {}
         position_filled_fractions = payload.pop("position_filled_fractions", {}) or {}
         position_cursor_entry_times = payload.pop("position_cursor_entry_times", {}) or {}
+        position_open_entry_events = payload.pop("position_open_entry_events", {}) or {}
         simple_order_amount = payload.pop("simple_order_amount", None)
         chart_display_hours = payload.pop("chart_display_hours", None)
         legacy_chart_display_days = payload.pop("chart_display_days", None)
@@ -308,6 +349,7 @@ class AppSettings:
             if str(symbol or "").strip()
         }
         settings.position_cursor_entry_times = _normalize_position_cursor_entry_times(position_cursor_entry_times)
+        settings.position_open_entry_events = _normalize_position_open_entry_events(position_open_entry_events)
         return settings
 
     @classmethod
