@@ -2366,6 +2366,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.positions_table.setSelectionMode(SINGLE_SELECTION)
         self.positions_table.setEditTriggers(NO_EDIT_TRIGGERS)
         self.positions_table.horizontalHeader().setStretchLastSection(True)
+        self.positions_table.installEventFilter(self)
         self.positions_table.itemSelectionChanged.connect(self.on_positions_selection_changed)
         self.positions_table.cellClicked.connect(self.on_positions_cell_clicked)
         layout.addWidget(self.positions_table)
@@ -3731,7 +3732,12 @@ class AltReversalTraderWindow(QMainWindow):
     ) -> None:
         if not symbol or backtest is None:
             return
-        raw_events = list(getattr(backtest, "open_entry_events", ()) or ())
+        cursor = getattr(backtest, "cursor", None)
+        raw_events: List[Tuple[object, object]] = []
+        if cursor is not None and abs(float(getattr(cursor, "position_qty", 0.0) or 0.0)) > 1e-12:
+            raw_events = list(getattr(cursor, "zone_event_times", ()) or ())
+        if not raw_events:
+            raw_events = list(getattr(backtest, "open_entry_events", ()) or ())
         if not raw_events:
             return
         normalized = sorted(
@@ -5652,8 +5658,9 @@ class AltReversalTraderWindow(QMainWindow):
         if not hasattr(self, "positions_table"):
             return
         selected_rows = {index.row() for index in self.positions_table.selectionModel().selectedRows()}
+        highlight_active = self.positions_table.hasFocus()
         for row in range(self.positions_table.rowCount()):
-            selected = row in selected_rows
+            selected = highlight_active and row in selected_rows
             for col in (5, 6):
                 widget = self.positions_table.cellWidget(row, col)
                 if not isinstance(widget, QLabel):
@@ -5940,15 +5947,20 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _notify_telegram_auto_trade_close(self, event: EngineOrderCompletedEvent) -> None:
         interval = str(event.interval or self.settings.kline_interval)
+        position = self._find_open_position(event.symbol)
+        lines = [
+            "[자동매매 청산]",
+            f"종목: {event.symbol}",
+            f"차트TF: {interval}",
+        ]
+        if position is not None:
+            pnl_value = float(position.unrealized_pnl)
+            return_pct = _position_return_pct(position)
+            lines.append(f"PnL: {pnl_value:+.2f} USDT")
+            lines.append(f"수익률: {return_pct:+.2f}%")
+        lines.append(str(event.message))
         self._notify_telegram(
-            "\n".join(
-                [
-                    "[자동매매 청산]",
-                    f"종목: {event.symbol}",
-                    f"차트TF: {interval}",
-                    str(event.message),
-                ]
-            ),
+            "\n".join(lines),
             key=f"auto-trade-close:{event.symbol}:{interval}:{event.message}",
             cooldown_seconds=3.0,
         )
@@ -5957,28 +5969,9 @@ class AltReversalTraderWindow(QMainWindow):
         self,
         favorable_rows: List[Tuple[str, str, Optional[float], Optional[int]]],
     ) -> None:
-        current_symbols = {symbol for symbol, _interval, _price, _zone in favorable_rows}
-        new_symbols = current_symbols - self.telegram_favorable_symbols
-        self.telegram_favorable_symbols = current_symbols
-        if not new_symbols:
-            return
-        favorable_map = {symbol: (interval, price, zone) for symbol, interval, price, zone in favorable_rows}
-        for symbol in sorted(new_symbols):
-            interval, price, zone = favorable_map[symbol]
-            price_text = f"{float(price):.12f}".rstrip("0").rstrip(".") if price else "-"
-            zone_text = f"L{zone}" if zone in {1, 2, 3} else "-"
-            self._notify_telegram(
-                "\n".join(
-                    [
-                        "[유리한 가격 새 발생]",
-                        f"종목: {symbol}",
-                        f"차트TF: {interval}",
-                        f"현재가: {price_text}",
-                    ]
-                ),
-                key=f"favorable:{symbol}:{interval}:{zone_text}",
-                cooldown_seconds=30.0,
-            )
+        self.telegram_favorable_symbols = {
+            symbol for symbol, _interval, _price, _zone in favorable_rows
+        }
 
     def _refresh_optimized_table_highlights(self) -> None:
         if not hasattr(self, "optimized_table"):
@@ -6404,6 +6397,11 @@ class AltReversalTraderWindow(QMainWindow):
                 et = int(event.type())
                 if et in (14, 17):  # QEvent::Resize=14, QEvent::Show=17
                     self._reposition_favorable_label()
+        if source is getattr(self, "positions_table", None):
+            if hasattr(event, "type"):
+                et = int(event.type())
+                if et in (8, 9, 10):  # FocusIn, FocusOut, Enter
+                    self._refresh_position_metric_selection_colors()
         if source in (getattr(self, "candidate_table", None), getattr(self, "optimized_table", None)):
             if hasattr(event, "type") and event.type() == EVENT_KEY_PRESS:
                 key = event.key()
@@ -6498,10 +6496,22 @@ class AltReversalTraderWindow(QMainWindow):
         optimization = self._optimization_result(symbol, target_interval)
         cache_key = self._symbol_interval_key(symbol, target_interval)
         self.current_interval = target_interval
+        locked_settings = (
+            self._locked_position_strategy_settings(symbol, target_interval)
+            if prefer_locked_position_settings
+            else None
+        )
         cached_history = self._get_history_frame(symbol, target_interval)
         cached_chart_history = self._get_chart_history_frame(symbol, target_interval)
         seed_backtest = self.backtest_cache.get(cache_key)
-        if seed_backtest is None and optimization is not None and optimization.best_interval == target_interval:
+        if locked_settings is not None and seed_backtest is not None and seed_backtest.settings != locked_settings:
+            seed_backtest = None
+        if (
+            seed_backtest is None
+            and optimization is not None
+            and optimization.best_interval == target_interval
+            and (locked_settings is None or optimization.best_backtest.settings == locked_settings)
+        ):
             seed_backtest = optimization.best_backtest
         initial_settings = self._backtest_settings_for_symbol_interval(
             symbol,
