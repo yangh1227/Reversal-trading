@@ -2371,7 +2371,9 @@ class AltReversalTraderWindow(QMainWindow):
         self.positions_table.setSelectionBehavior(SELECT_ROWS)
         self.positions_table.setSelectionMode(SINGLE_SELECTION)
         self.positions_table.setEditTriggers(NO_EDIT_TRIGGERS)
-        self.positions_table.horizontalHeader().setStretchLastSection(True)
+        positions_header = self.positions_table.horizontalHeader()
+        positions_header.setSectionResizeMode(0, RESIZE_TO_CONTENTS)
+        positions_header.setStretchLastSection(True)
         self.positions_table.installEventFilter(self)
         self.positions_table.itemSelectionChanged.connect(self.on_positions_selection_changed)
         self.positions_table.cellClicked.connect(self.on_positions_cell_clicked)
@@ -3756,6 +3758,15 @@ class AltReversalTraderWindow(QMainWindow):
         )
         if not normalized:
             return
+        existing_events = list(self.position_open_entry_events_by_symbol.get(symbol, ()))
+        if existing_events:
+            normalized = sorted(
+                {
+                    *existing_events,
+                    *normalized,
+                },
+                key=lambda item: item[0],
+            )
         if (
             self.position_open_entry_events_by_symbol.get(symbol) == normalized
             and self.settings.position_open_entry_events.get(symbol) == normalized
@@ -4168,17 +4179,35 @@ class AltReversalTraderWindow(QMainWindow):
             )
         return markers
 
-    def _open_entry_markers(self, backtest: Optional[BacktestResult], symbol: Optional[str] = None) -> List[Dict[str, object]]:
+    def _open_entry_markers(
+        self,
+        backtest: Optional[BacktestResult],
+        symbol: Optional[str] = None,
+        interval: Optional[str] = None,
+    ) -> List[Dict[str, object]]:
         if backtest is None and not symbol:
             return []
         markers: List[Dict[str, object]] = []
         merged_events: List[Tuple[pd.Timestamp, str]] = []
-        if backtest is not None:
+        use_locked_position_events = False
+        if symbol:
+            remembered_interval = self.settings.position_intervals.get(symbol)
+            has_open_position = self._find_open_position(symbol) is not None
+            remembered_events = list(self.position_open_entry_events_by_symbol.get(symbol, ()))
+            if (
+                has_open_position
+                and interval in APP_INTERVAL_OPTIONS
+                and remembered_interval == interval
+                and remembered_events
+            ):
+                merged_events.extend(remembered_events)
+                use_locked_position_events = True
+        if backtest is not None and not use_locked_position_events:
             merged_events.extend(
                 (pd.Timestamp(event_time).tz_localize(None), str(event_label))
                 for event_time, event_label in list(getattr(backtest, "open_entry_events", ()) or ())
             )
-        if symbol:
+        if symbol and not use_locked_position_events:
             merged_events.extend(self.position_open_entry_events_by_symbol.get(symbol, ()))
         for event_time, event_label in sorted(set(merged_events), key=lambda item: item[0]):
             label_text = str(event_label)
@@ -4521,7 +4550,7 @@ class AltReversalTraderWindow(QMainWindow):
         )
         latest_time = pd.Timestamp(candle_df["time"].iloc[-1]) if not candle_df.empty else None
         markers = self._trade_markers(snapshot.backtest.trades, latest_time)
-        markers.extend(self._open_entry_markers(snapshot.backtest, snapshot.symbol))
+        markers.extend(self._open_entry_markers(snapshot.backtest, snapshot.symbol, snapshot.interval))
         return candle_df, indicators, equity_df, markers
 
     def _clear_lightweight_volume_series(self) -> None:
@@ -5818,6 +5847,7 @@ class AltReversalTraderWindow(QMainWindow):
 
                 self.positions_table.setCellWidget(row, 7, action_widget)
                 self.position_close_buttons.append(button)
+            self.positions_table.resizeColumnToContents(0)
             self._set_position_close_buttons_enabled(not self._is_order_pending())
             self._refresh_position_metric_selection_colors()
         finally:
@@ -6937,7 +6967,7 @@ class AltReversalTraderWindow(QMainWindow):
                 return False
             self.equity_line.update(equity_df.iloc[-1].copy())
             new_markers = self._trade_markers(new_backtest.trades, latest_chart_time)
-            new_markers.extend(self._open_entry_markers(new_backtest))
+            new_markers.extend(self._open_entry_markers(new_backtest, symbol, self.current_interval))
             self._render_lightweight_markers(new_markers)
             candle_df = _chart_candle_frame(new_frame)
             render_signature = self._chart_render_signature_for_payload(candle_df, new_frame, equity_df, new_markers)
