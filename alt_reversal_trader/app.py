@@ -1875,12 +1875,12 @@ class AltReversalTraderWindow(QMainWindow):
         chart_header_row.setSpacing(10)
         self.chart_header_symbol_label = QLabel("-")
         self.chart_header_symbol_label.setStyleSheet(
-            f"color: #ffffff; background: #1546b0; border-radius: 10px; padding: 2px 10px; {status_strip_font_style}"
+            f"color: #ffffff; background: #1546b0; border-radius: 4px; padding: 2px 10px; {status_strip_font_style}"
         )
         chart_header_row.addWidget(self.chart_header_symbol_label)
         self.chart_header_tf_label = QLabel("TF -")
         self.chart_header_tf_label.setStyleSheet(
-            f"color: #ffffff; background: #6b7280; border-radius: 10px; padding: 2px 10px; {status_strip_font_style}"
+            f"color: #ffffff; background: #6b7280; border-radius: 4px; padding: 2px 10px; {status_strip_font_style}"
         )
         chart_header_row.addWidget(self.chart_header_tf_label)
         chart_header_row.addStretch(1)
@@ -5642,10 +5642,27 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _build_position_metric_widget(self, text: str, value: float) -> QLabel:
         label = QLabel(text)
+        label.setProperty("metricDefaultColor", self._pnl_color(value))
         label.setStyleSheet(
             f"font-weight: 700; color: {self._pnl_color(value)}; padding-left: 4px; padding-right: 4px; background: transparent;"
         )
         return label
+
+    def _refresh_position_metric_selection_colors(self) -> None:
+        if not hasattr(self, "positions_table"):
+            return
+        selected_rows = {index.row() for index in self.positions_table.selectionModel().selectedRows()}
+        for row in range(self.positions_table.rowCount()):
+            selected = row in selected_rows
+            for col in (5, 6):
+                widget = self.positions_table.cellWidget(row, col)
+                if not isinstance(widget, QLabel):
+                    continue
+                default_color = str(widget.property("metricDefaultColor") or "#1f2937")
+                color = "#ffffff" if selected else default_color
+                widget.setStyleSheet(
+                    f"font-weight: 700; color: {color}; padding-left: 4px; padding-right: 4px; background: transparent;"
+                )
 
     def _position_status_html(self, position: PositionSnapshot) -> str:
         side = "LONG" if position.amount > 0 else "SHORT"
@@ -5713,6 +5730,7 @@ class AltReversalTraderWindow(QMainWindow):
             position = next((entry for entry in self.open_positions if entry.symbol == symbol), None)
             if position is not None:
                 self._populate_position_row(row, position)
+                self._refresh_position_metric_selection_colors()
             break
 
     def _refresh_position_status_label(self) -> None:
@@ -5771,6 +5789,7 @@ class AltReversalTraderWindow(QMainWindow):
                 self.positions_table.setCellWidget(row, 7, action_widget)
                 self.position_close_buttons.append(button)
             self._set_position_close_buttons_enabled(not self._is_order_pending())
+            self._refresh_position_metric_selection_colors()
         finally:
             self.positions_table.blockSignals(False)
             self.suppress_positions_selection_load = previous_suppress
@@ -6434,6 +6453,7 @@ class AltReversalTraderWindow(QMainWindow):
                 self._request_symbol_load(symbol, interval, prefer_locked_position_settings=False)
 
     def on_positions_selection_changed(self) -> None:
+        self._refresh_position_metric_selection_colors()
         if self.suppress_positions_selection_load or not self.positions_table.hasFocus():
             return
         selected = self.positions_table.selectedItems()
@@ -6443,6 +6463,7 @@ class AltReversalTraderWindow(QMainWindow):
                 self._request_symbol_load(symbol, interval, prefer_locked_position_settings=True)
 
     def on_positions_cell_clicked(self, row: int, _column: int) -> None:
+        self._refresh_position_metric_selection_colors()
         item = self.positions_table.item(row, 0)
         if item:
             symbol, interval = self._item_symbol_interval(item)
