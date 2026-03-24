@@ -19,6 +19,7 @@ from .auto_trade_runtime import (
     history_can_resume_backtest as _history_can_resume_backtest,
     inferred_auto_trade_fraction as _inferred_auto_trade_fraction,
     pick_auto_trade_candidate,
+    zone_favorable_fraction,
 )
 from .binance_futures import BinanceFuturesClient, PositionSnapshot, resolve_base_interval
 from .config import APP_INTERVAL_OPTIONS, DEFAULT_HISTORY_DAYS, StrategySettings
@@ -1693,6 +1694,7 @@ class _TradeEngine:
             )
             if _dbg_trigger:
                 signal = _auto_trade_signal_from_backtest(latest_backtest)
+                confirmed = latest_confirmed_entry_event(latest_backtest, normalized_trigger_time)
                 favor_mode = "유리가격ON" if self.auto_trade_use_favorable_price else "유리가격OFF"
                 pos_info = f"포지션={open_position.amount:.4f}" if open_position else "포지션없음"
                 price_info = f"현재가={current_price}" if current_price else "현재가없음"
@@ -1732,6 +1734,33 @@ class _TradeEngine:
                                     print(f"[자동매매 진단] {item.symbol}/{item.interval} ❌ 차단: 기타(추세 반전 감지?) | {sig_info} | {pos_info} | {price_info}")
                             else:
                                 print(f"[자동매매 진단] {item.symbol}/{item.interval} ❌ 차단: 기타 | {sig_info} | {pos_info} | {price_info} | {favor_mode}")
+            if _dbg_trigger and evaluation.candidate is None:
+                signal_dbg = _auto_trade_signal_from_backtest(latest_backtest)
+                confirmed_dbg = latest_confirmed_entry_event(latest_backtest, normalized_trigger_time)
+                zone_prices_dbg = dict(signal_dbg.get("zone_prices") or {}) if signal_dbg is not None else {}
+                favorable_fraction_dbg = (
+                    zone_favorable_fraction(
+                        str(signal_dbg.get("side") or ""),
+                        float(current_price),
+                        float(signal_dbg.get("price") or 0.0),
+                        zone_prices_dbg,
+                        float(filled_fraction),
+                    )
+                    if signal_dbg is not None and current_price is not None and float(current_price) > 0
+                    else 0.0
+                )
+                latest_backtest_time_dbg = (
+                    pd.Timestamp(latest_backtest.indicators["time"].iloc[-1])
+                    if latest_backtest is not None and not latest_backtest.indicators.empty
+                    else "??"
+                )
+                print(
+                    "[???? ?? ??] "
+                    f"{item.symbol}/{item.interval} | ????={signal_dbg or '??'} | "
+                    f"????={confirmed_dbg or '??'} | ???={current_price} | "
+                    f"???={zone_prices_dbg or '??'} | ????={favorable_fraction_dbg:.3f} | "
+                    f"?????={filled_fraction:.3f} | ???????={latest_backtest_time_dbg}"
+                )
             if evaluation.reentry_position_side:
                 self._trigger_reentry_auto_close(item.symbol, evaluation.reentry_position_side, latest_backtest)
                 continue
