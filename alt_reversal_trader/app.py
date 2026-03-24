@@ -1864,6 +1864,10 @@ class AltReversalTraderWindow(QMainWindow):
         self.bar_close_countdown_label.setStyleSheet(f"color: #d63b53; {status_strip_font_style}")
         self.bar_close_countdown_label.setFixedHeight(18)
         balance_layout.addWidget(self.bar_close_countdown_label)
+        self.reentry_cooldown_label = QLabel("진입 쿨다운: -")
+        self.reentry_cooldown_label.setStyleSheet(f"color: #2563eb; {status_strip_font_style}")
+        self.reentry_cooldown_label.setFixedHeight(18)
+        balance_layout.addWidget(self.reentry_cooldown_label)
         self.optimization_chart_notice_label = QLabel("")
         self.optimization_chart_notice_label.setStyleSheet(f"color: #f59e0b; {status_strip_font_style}")
         self.optimization_chart_notice_label.setFixedHeight(18)
@@ -5531,6 +5535,13 @@ class AltReversalTraderWindow(QMainWindow):
             return
         self.bar_close_countdown_label.setText(f"봉마감: {countdown}" if countdown else "봉마감: -")
 
+    def _set_reentry_cooldown_text(self, countdown: Optional[str]) -> None:
+        if not hasattr(self, "reentry_cooldown_label"):
+            return
+        self.reentry_cooldown_label.setText(
+            f"진입 쿨다운: {countdown}" if countdown else "진입 쿨다운: -"
+        )
+
     def _set_chart_interval_text(self, interval: Optional[str]) -> None:
         if not hasattr(self, "chart_interval_label"):
             return
@@ -5576,6 +5587,7 @@ class AltReversalTraderWindow(QMainWindow):
             self._set_chart_interval_text(None)
             self.current_price_label.setText("현재가: -")
             self._set_bar_close_countdown_text(None)
+            self._set_reentry_cooldown_text(None)
             self._set_lightweight_bar_close_overlay(None, None)
             return
 
@@ -5586,6 +5598,7 @@ class AltReversalTraderWindow(QMainWindow):
         if frame is None or frame.empty:
             self.current_price_label.setText("현재가: -")
             self._set_bar_close_countdown_text(None)
+            self._set_reentry_cooldown_text(None)
             self._set_lightweight_bar_close_overlay(None, None)
             return
 
@@ -5605,6 +5618,7 @@ class AltReversalTraderWindow(QMainWindow):
             floor_freq = f"{value}d"
         else:
             self._set_bar_close_countdown_text(None)
+            self._set_reentry_cooldown_text(None)
             self._set_lightweight_bar_close_overlay(None, None)
             return
 
@@ -5618,6 +5632,13 @@ class AltReversalTraderWindow(QMainWindow):
         else:
             countdown = f"{minutes:02d}:{seconds:02d}"
         self._set_bar_close_countdown_text(countdown)
+        cooldown_until = self.auto_trade_reentry_cooldown_until.get((symbol, interval), 0.0)
+        cooldown_remaining_seconds = max(0, int(cooldown_until - time.time()))
+        if cooldown_remaining_seconds > 0:
+            cooldown_minutes, cooldown_seconds = divmod(cooldown_remaining_seconds, 60)
+            self._set_reentry_cooldown_text(f"{cooldown_minutes:02d}:{cooldown_seconds:02d}")
+        else:
+            self._set_reentry_cooldown_text(None)
         self._set_lightweight_bar_close_overlay(countdown, latest_price)
 
     def _position_display_values(self, position: PositionSnapshot) -> Tuple[List[str], float, float]:
