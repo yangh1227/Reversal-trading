@@ -18,6 +18,7 @@ from alt_reversal_trader.trade_engine import (
     _OrderExecutor,
     _OrderExecutionResult,
     _TradeEngine,
+    _fractional_order_margin,
 )
 
 
@@ -56,6 +57,20 @@ def test_trade_engine_defaults_history_days_to_shared_config_default() -> None:
     engine = _TradeEngine(mp.Queue(), mp.Queue())
 
     assert engine.history_days == DEFAULT_HISTORY_DAYS
+
+
+def test_fractional_order_margin_uses_equity_for_auto_trade() -> None:
+    from alt_reversal_trader.binance_futures import BalanceSnapshot
+
+    balance = BalanceSnapshot(
+        total_wallet_balance=20.0,
+        available_balance=10.0,
+        equity=20.0,
+        unrealized_pnl=0.0,
+    )
+
+    assert _fractional_order_margin(balance, 0.49, auto_trade=True) == 9.8
+    assert _fractional_order_margin(balance, 0.49, auto_trade=False) == 4.9
 
 
 def make_signal_backtest(

@@ -218,6 +218,11 @@ class _OrderExecutionResult:
     no_open_position: bool = False
 
 
+def _fractional_order_margin(balance: BalanceSnapshot, fraction: float, auto_trade: bool) -> float:
+    base_balance = float(balance.equity) if auto_trade else float(balance.available_balance)
+    return base_balance * float(fraction)
+
+
 def _interval_to_ms(interval: str) -> int:
     unit = interval[-1]
     value = int(interval[:-1])
@@ -594,7 +599,11 @@ class _OrderExecutor(threading.Thread):
                         margin = float(request.margin)
                     else:
                         balance = client.get_balance_snapshot()
-                        margin = balance.available_balance * float(request.fraction or 0.0)
+                        margin = _fractional_order_margin(
+                            balance,
+                            float(request.fraction or 0.0),
+                            bool(request.auto_trade),
+                        )
                     if margin <= 0:
                         raise RuntimeError("order amount must be positive")
                     if request.apply_leverage:
