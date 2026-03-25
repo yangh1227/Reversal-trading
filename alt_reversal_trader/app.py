@@ -20,7 +20,6 @@ from .auto_trade_runtime import (
     inferred_auto_trade_fraction as _inferred_auto_trade_fraction,
     pick_auto_trade_candidate,
     resolve_favorable_auto_trade_zone,
-    resolve_latest_auto_trade_backtest,
     zone_favorable_fraction,
 )
 from .binance_futures import (
@@ -33,6 +32,11 @@ from .binance_futures import (
 )
 from .config import APP_INTERVAL_OPTIONS, PARAMETER_SPECS, AppSettings, StrategySettings
 from .crash_logger import log_runtime_event
+from .favorable_backtest_process import (
+    FavorableBacktestJob,
+    FavorableBacktestProcess,
+    FavorableBacktestResultPayload,
+)
 from .live_chart_utils import (
     history_with_live_preview as _history_with_live_preview,
     merge_live_bar as _merge_live_bar,
@@ -1602,6 +1606,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.history_cache: Dict[Tuple[str, str], pd.DataFrame] = {}
         self.chart_history_cache: Dict[Tuple[str, str], pd.DataFrame] = {}
         self.backtest_cache: Dict[Tuple[str, str], BacktestResult] = {}
+        self.resolved_auto_trade_backtest_cache: Dict[Tuple[str, str], BacktestResult] = {}
+        self.resolved_auto_trade_backtest_meta: Dict[Tuple[str, str], Tuple[Tuple[object, ...], str]] = {}
         self.chart_indicator_cache: Dict[Tuple[str, str], pd.DataFrame] = {}
         self.history_refresh_times: Dict[Tuple[str, str], float] = {}
         self.price_precision_cache: Dict[str, int] = {}
@@ -1631,6 +1637,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.account_worker: Optional[AccountInfoWorker] = None
         self.order_worker: Optional[OrderWorker] = None
         self.trade_engine: Optional[TradeEngineController] = None
+        self.favorable_backtest_process = FavorableBacktestProcess()
         self.load_request_id = 0
         self.load_request_reset_view: Dict[int, bool] = {}
         self.load_request_targets: Dict[int, Tuple[str, str]] = {}
@@ -1698,7 +1705,10 @@ class AltReversalTraderWindow(QMainWindow):
         self.live_update_timer = QTimer(self)
         self.optimized_table_timer = QTimer(self)
         self.optimized_table_highlight_timer = QTimer(self)
+        self.favorable_backtest_poll_timer = QTimer(self)
         self.trade_engine_poll_timer = QTimer(self)
+        self.favorable_refresh_pending: Dict[Tuple[str, str], Tuple[Tuple[object, ...], str]] = {}
+        self.favorable_zone_cache: Dict[Tuple[str, str], Optional[int]] = {}
         self.telegram_notifier = TelegramNotifier(log=self._log_telegram_failure)
         self.telegram_favorable_symbols: set[str] = set()
         self.backtest_summary_text = ""
@@ -1753,6 +1763,9 @@ class AltReversalTraderWindow(QMainWindow):
         self.optimized_table_highlight_timer.setInterval(OPTIMIZED_TABLE_HIGHLIGHT_REFRESH_MS)
         self.optimized_table_highlight_timer.timeout.connect(self._refresh_optimized_table_highlights)
         self.optimized_table_highlight_timer.start()
+        self.favorable_backtest_poll_timer.setInterval(150)
+        self.favorable_backtest_poll_timer.timeout.connect(self._poll_favorable_backtest_results)
+        self.favorable_backtest_poll_timer.start()
         self.trade_engine_poll_timer.setInterval(TRADE_ENGINE_POLL_INTERVAL_MS)
         self.trade_engine_poll_timer.timeout.connect(self._poll_trade_engine_events)
         self.price_label_timer.setInterval(250)
@@ -3295,38 +3308,136 @@ class AltReversalTraderWindow(QMainWindow):
     def _eligible_auto_trade_results(self) -> List[OptimizationResult]:
         return list(self._ordered_optimized_results())
 
-    def _latest_auto_trade_backtest(self, result: OptimizationResult) -> BacktestResult:
-        interval = result.best_interval or self.settings.kline_interval
-        target_settings = result.best_backtest.settings
-        history = self._get_history_frame(result.symbol, interval)
-        seed_backtest = None
+    def _strategy_settings_signature(self, settings: StrategySettings) -> str:
+        return json.dumps(settings.to_dict(), sort_keys=True, ensure_ascii=True)
+
+    def _favorable_backtest_seed(
+        self,
+        result: OptimizationResult,
+        interval: str,
+        target_settings: StrategySettings,
+    ) -> Optional[BacktestResult]:
+        key = self._symbol_interval_key(result.symbol, interval)
         if (
             self.current_symbol == result.symbol
             and self.current_interval == interval
             and self.current_backtest is not None
             and self.current_backtest.settings == target_settings
         ):
-            seed_backtest = self.current_backtest
-        cached_backtest = self.backtest_cache.get(self._symbol_interval_key(result.symbol, interval))
+            return self.current_backtest
+        resolved_backtest = self.resolved_auto_trade_backtest_cache.get(key)
+        if resolved_backtest is not None and resolved_backtest.settings == target_settings:
+            return resolved_backtest
+        cached_backtest = self.backtest_cache.get(key)
+        if cached_backtest is not None and cached_backtest.settings == target_settings:
+            return cached_backtest
+        if result.best_backtest.settings == target_settings:
+            return result.best_backtest
+        return None
+
+    def _enqueue_favorable_backtest_refresh(
+        self,
+        result: OptimizationResult,
+        history: Optional[pd.DataFrame],
+        target_settings: StrategySettings,
+    ) -> None:
+        if history is None or history.empty:
+            return
+        interval = result.best_interval or self.settings.kline_interval
+        key = self._symbol_interval_key(result.symbol, interval)
+        history_signature = _history_frame_signature(history)
+        settings_signature = self._strategy_settings_signature(target_settings)
         if (
-            seed_backtest is None
-            and cached_backtest is not None
-            and cached_backtest.settings == target_settings
+            key in self.resolved_auto_trade_backtest_cache
+            and self.resolved_auto_trade_backtest_meta.get(key) == (history_signature, settings_signature)
         ):
-            seed_backtest = cached_backtest
-        if seed_backtest is None and result.best_backtest.settings == target_settings:
-            seed_backtest = result.best_backtest
-        resolution = resolve_latest_auto_trade_backtest(
-            seed_backtest,
-            history,
-            target_settings,
-            fee_rate=self.settings.fee_rate,
-            backtest_start_time=pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms"),
+            return
+        if self.favorable_refresh_pending.get(key) == (history_signature, settings_signature):
+            return
+        seed_backtest = self._favorable_backtest_seed(result, interval, target_settings)
+        self.favorable_backtest_process.submit(
+            FavorableBacktestJob(
+                symbol=result.symbol,
+                interval=interval,
+                strategy_settings=target_settings,
+                history=history.copy(),
+                seed_backtest=seed_backtest,
+                fee_rate=self.settings.fee_rate,
+                backtest_start_time=pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms"),
+                history_signature=history_signature,
+                settings_signature=settings_signature,
+            )
         )
-        if resolution.backtest is not None:
-            self.backtest_cache[self._symbol_interval_key(result.symbol, interval)] = resolution.backtest
-            return resolution.backtest
-        return result.best_backtest
+        self.favorable_refresh_pending[key] = (history_signature, settings_signature)
+        self.log(f"highlight_refresh_enqueued: {result.symbol}/{interval}")
+
+    def _poll_favorable_backtest_results(self) -> None:
+        payloads = self.favorable_backtest_process.drain_results()
+        if not payloads:
+            return
+        applied_any = False
+        for payload in payloads:
+            key = self._symbol_interval_key(payload.symbol, payload.interval)
+            self.favorable_refresh_pending.pop(key, None)
+            optimization = self.optimized_results.get(key)
+            current_history = self._get_history_frame(payload.symbol, payload.interval)
+            current_history_signature = _history_frame_signature(current_history)
+            current_settings_signature = (
+                self._strategy_settings_signature(optimization.best_backtest.settings)
+                if optimization is not None
+                else ""
+            )
+            if payload.error:
+                self.log(f"highlight_refresh_discarded: {payload.symbol}/{payload.interval} source={payload.source}")
+                continue
+            if (
+                optimization is None
+                or payload.backtest is None
+                or payload.history_signature != current_history_signature
+                or payload.settings_signature != current_settings_signature
+            ):
+                self.log(f"highlight_refresh_discarded: {payload.symbol}/{payload.interval} source={payload.source}")
+                continue
+            self.resolved_auto_trade_backtest_cache[key] = payload.backtest
+            self.resolved_auto_trade_backtest_meta[key] = (payload.history_signature, payload.settings_signature)
+            self.backtest_cache[key] = payload.backtest
+            applied_any = True
+            self.log(f"highlight_refresh_applied: {payload.symbol}/{payload.interval} source={payload.source}")
+        if applied_any:
+            self._refresh_optimized_table_highlights()
+
+    def _latest_auto_trade_backtest(self, result: OptimizationResult) -> Optional[BacktestResult]:
+        interval = result.best_interval or self.settings.kline_interval
+        target_settings = result.best_backtest.settings
+        history = self._get_history_frame(result.symbol, interval)
+        key = self._symbol_interval_key(result.symbol, interval)
+        seed_backtest = None
+        if (
+            self.current_symbol == result.symbol
+            and self.current_interval == interval
+            and self.current_backtest is not None
+            and self.current_backtest.settings == target_settings
+            and _backtest_matches_history(self.current_backtest, history)
+        ):
+            return self.current_backtest
+        resolved_backtest = self.resolved_auto_trade_backtest_cache.get(key)
+        if (
+            resolved_backtest is not None
+            and resolved_backtest.settings == target_settings
+            and self.resolved_auto_trade_backtest_meta.get(key)
+            == (_history_frame_signature(history), self._strategy_settings_signature(target_settings))
+            and _backtest_matches_history(resolved_backtest, history)
+        ):
+            return resolved_backtest
+        cached_backtest = self.backtest_cache.get(key)
+        if (
+            cached_backtest is not None
+            and cached_backtest.settings == target_settings
+            and _backtest_matches_history(cached_backtest, history)
+        ):
+            return cached_backtest
+        self._enqueue_favorable_backtest_refresh(result, history, target_settings)
+        return None
 
     def _fallback_auto_trade_items(self) -> List[Dict[str, object]]:
         items: List[Dict[str, object]] = []
@@ -5939,20 +6050,24 @@ class AltReversalTraderWindow(QMainWindow):
         if current_price is None or current_price <= 0:
             return None
         symbol = str(result.symbol)
+        interval = str(result.best_interval or self.settings.kline_interval)
+        key = self._symbol_interval_key(symbol, interval)
         open_position = self._find_open_position(symbol)
         latest_backtest = self._latest_auto_trade_backtest(result)
         if latest_backtest is None:
-            return None
+            return self.favorable_zone_cache.get(key) if key in self.favorable_refresh_pending else None
         filled_fraction = self.auto_trade_filled_fraction_by_symbol.get(
             symbol,
             _inferred_auto_trade_fraction(latest_backtest, open_position) if open_position is not None else 0.0,
         )
-        return resolve_favorable_auto_trade_zone(
+        favorable_zone = resolve_favorable_auto_trade_zone(
             latest_backtest,
             float(current_price),
             open_position,
             filled_fraction,
         )
+        self.favorable_zone_cache[key] = favorable_zone
+        return favorable_zone
 
     def _optimized_result_has_favorable_entry(self, result: OptimizationResult, current_price: Optional[float]) -> bool:
         return self._optimized_result_favorable_zone(result, current_price) is not None
@@ -7566,6 +7681,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.live_update_timer.stop()
             self.optimized_table_timer.stop()
             self.optimized_table_highlight_timer.stop()
+            self.favorable_backtest_poll_timer.stop()
             self.auto_close_retry_timer.stop()
             self.auto_trade_timer.stop()
             self.trade_engine_poll_timer.stop()
@@ -7582,6 +7698,7 @@ class AltReversalTraderWindow(QMainWindow):
             self._stop_all_auto_close_monitors()
             self._stop_trade_engine()
             self._stop_mobile_web_server()
+            self.favorable_backtest_process.stop()
             self._drain_tracked_threads()
             self.save_settings()
         finally:

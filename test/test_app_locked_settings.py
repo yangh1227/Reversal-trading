@@ -334,6 +334,31 @@ def test_window_init_starts_optimized_table_highlight_timer() -> None:
     assert "self.optimized_table_highlight_timer.setInterval(OPTIMIZED_TABLE_HIGHLIGHT_REFRESH_MS)" in source_segment
     assert "self.optimized_table_highlight_timer.timeout.connect(self._refresh_optimized_table_highlights)" in source_segment
     assert "self.optimized_table_highlight_timer.start()" in source_segment
+    assert "self.favorable_backtest_poll_timer = QTimer(self)" in source_segment
+    assert "self.favorable_backtest_poll_timer.timeout.connect(self._poll_favorable_backtest_results)" in source_segment
+    assert "self.favorable_backtest_poll_timer.start()" in source_segment
+
+
+def test_latest_auto_trade_backtest_uses_background_refresh_instead_of_materializing_in_ui() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_latest_auto_trade_backtest"),
+    ) or ""
+
+    assert "_enqueue_favorable_backtest_refresh(" in source_segment
+    assert "resolve_latest_auto_trade_backtest(" not in source_segment
+    assert "run_backtest(" not in source_segment
+    assert "resume_backtest(" not in source_segment
+
+
+def test_close_event_stops_favorable_backtest_process() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("closeEvent"),
+    ) or ""
+
+    assert "self.favorable_backtest_poll_timer.stop()" in source_segment
+    assert "self.favorable_backtest_process.stop()" in source_segment
 
 
 def test_optimized_table_highlight_refresh_restores_palette_base_for_non_favorable_rows() -> None:
