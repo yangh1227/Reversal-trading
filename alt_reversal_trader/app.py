@@ -3733,6 +3733,55 @@ class AltReversalTraderWindow(QMainWindow):
         if persist:
             self._persist_position_intervals()
 
+    def _normalized_position_entry_chain(
+        self,
+        symbol: str,
+        raw_events: List[Tuple[object, object]],
+    ) -> List[Tuple[pd.Timestamp, str]]:
+        chain_start = (
+            self.settings.position_cursor_entry_times.get(symbol)
+            or self.auto_trade_cursor_entry_time_by_symbol.get(symbol)
+        )
+        normalized = sorted(
+            {
+                (pd.Timestamp(event_time).tz_localize(None), str(event_label).strip().upper())
+                for event_time, event_label in raw_events
+                if str(event_label or "").strip()
+            },
+            key=lambda item: item[0],
+        )
+        if chain_start is not None:
+            normalized = [
+                (event_time, event_label)
+                for event_time, event_label in normalized
+                if event_time >= pd.Timestamp(chain_start).tz_localize(None)
+            ]
+        if not normalized:
+            return []
+        latest_label = str(normalized[-1][1] or "").strip().upper()
+        active_prefix = latest_label[:1] if latest_label[:1] in {"L", "S"} else ""
+        if active_prefix:
+            normalized = [
+                (event_time, event_label)
+                for event_time, event_label in normalized
+                if str(event_label or "").strip().upper().startswith(active_prefix)
+            ]
+        cleaned: List[Tuple[pd.Timestamp, str]] = []
+        last_zone = 0
+        for event_time, event_label in normalized:
+            label_text = str(event_label or "").strip().upper()
+            if len(label_text) < 2 or label_text[:1] not in {"L", "S"}:
+                continue
+            try:
+                zone = int(label_text[1:])
+            except Exception:
+                continue
+            if zone not in {1, 2, 3} or zone <= last_zone:
+                continue
+            cleaned.append((pd.Timestamp(event_time).tz_localize(None), label_text))
+            last_zone = zone
+        return cleaned
+
     def _remember_position_open_entry_events(
         self,
         symbol: str,
@@ -3743,31 +3792,24 @@ class AltReversalTraderWindow(QMainWindow):
             return
         cursor = getattr(backtest, "cursor", None)
         raw_events: List[Tuple[object, object]] = []
+        has_authoritative_cursor_events = False
         if cursor is not None and abs(float(getattr(cursor, "position_qty", 0.0) or 0.0)) > 1e-12:
             raw_events = list(getattr(cursor, "zone_event_times", ()) or ())
+            has_authoritative_cursor_events = bool(raw_events)
         if not raw_events:
             raw_events = list(getattr(backtest, "open_entry_events", ()) or ())
         if not raw_events:
             return
-        normalized = sorted(
-            {
-                (pd.Timestamp(event_time).tz_localize(None), str(event_label))
-                for event_time, event_label in raw_events
-                if str(event_label or "").strip()
-            },
-            key=lambda item: item[0],
-        )
+        normalized = self._normalized_position_entry_chain(symbol, raw_events)
         if not normalized:
             return
-        existing_events = list(self.position_open_entry_events_by_symbol.get(symbol, ()))
-        if existing_events:
-            normalized = sorted(
-                {
-                    *existing_events,
-                    *normalized,
-                },
-                key=lambda item: item[0],
+        if not has_authoritative_cursor_events:
+            existing_events = self._normalized_position_entry_chain(
+                symbol,
+                list(self.position_open_entry_events_by_symbol.get(symbol, ())),
             )
+            if existing_events:
+                normalized = existing_events
         if (
             self.position_open_entry_events_by_symbol.get(symbol) == normalized
             and self.settings.position_open_entry_events.get(symbol) == normalized
@@ -4199,7 +4241,10 @@ class AltReversalTraderWindow(QMainWindow):
                 and symbol == self.current_symbol
                 and interval == self.current_interval
             )
-            remembered_events = list(self.position_open_entry_events_by_symbol.get(symbol, ()))
+            remembered_events = self._normalized_position_entry_chain(
+                symbol,
+                list(self.position_open_entry_events_by_symbol.get(symbol, ())),
+            )
             if (
                 (has_open_position or prefers_locked_position_settings)
                 and interval in APP_INTERVAL_OPTIONS
