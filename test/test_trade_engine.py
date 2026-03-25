@@ -7,7 +7,12 @@ import time
 
 import pandas as pd
 
-from alt_reversal_trader.auto_trade_runtime import favorable_zone_for_price, zone_favorable_fraction
+from alt_reversal_trader.auto_trade_runtime import (
+    favorable_zone_for_price,
+    resolve_favorable_auto_trade_zone,
+    resolve_latest_auto_trade_backtest,
+    zone_favorable_fraction,
+)
 from alt_reversal_trader.binance_futures import PositionSnapshot
 from alt_reversal_trader.config import DEFAULT_HISTORY_DAYS, StrategySettings
 from alt_reversal_trader.strategy import BacktestCursor, BacktestResult, StrategyMetrics, TradeRecord, run_backtest
@@ -84,6 +89,47 @@ def test_favorable_price_can_use_earlier_active_zone_before_exit() -> None:
 
     assert favorable_zone_for_price("long", 85.0, 80.0, deeper_zone_prices) == 2
     assert zone_favorable_fraction("long", 85.0, 80.0, deeper_zone_prices, 0.0) == 0.50
+
+
+def test_resolve_latest_auto_trade_backtest_uses_cached_when_history_matches() -> None:
+    history = make_sample_ohlcv(120)
+    settings = StrategySettings()
+    backtest = run_backtest(history, settings=settings)
+
+    resolved = resolve_latest_auto_trade_backtest(backtest, history, settings)
+
+    assert resolved.source == "cached"
+    assert resolved.backtest is backtest
+
+
+def test_resolve_latest_auto_trade_backtest_resumes_when_history_is_newer() -> None:
+    history = make_sample_ohlcv(120)
+    seed_history = history.head(100).reset_index(drop=True)
+    settings = StrategySettings()
+    seed_backtest = run_backtest(seed_history, settings=settings)
+
+    resolved = resolve_latest_auto_trade_backtest(seed_backtest, history, settings)
+
+    assert resolved.source == "resumed"
+    assert resolved.backtest is not None
+    assert pd.Timestamp(resolved.backtest.indicators["time"].iloc[-1]) == pd.Timestamp(history["time"].iloc[-1])
+
+
+def test_resolve_latest_auto_trade_backtest_materializes_without_seed() -> None:
+    history = make_sample_ohlcv(120)
+    settings = StrategySettings()
+
+    resolved = resolve_latest_auto_trade_backtest(None, history, settings)
+
+    assert resolved.source == "materialized"
+    assert resolved.backtest is not None
+    assert pd.Timestamp(resolved.backtest.indicators["time"].iloc[-1]) == pd.Timestamp(history["time"].iloc[-1])
+
+
+def test_resolve_favorable_auto_trade_zone_uses_earlier_live_zone_before_exit() -> None:
+    backtest = make_stale_multi_zone_backtest()
+
+    assert resolve_favorable_auto_trade_zone(backtest, 110.0, None, 0.0) == 2
 
 
 def make_signal_backtest(
@@ -343,6 +389,39 @@ def test_trade_engine_auto_close_ignores_mismatched_interval_state_for_position(
     engine._evaluate_backtest_auto_close(state)
 
     assert close_calls == []
+
+
+def test_trade_engine_latest_auto_trade_backtest_uses_latest_state_history() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    key = ("TESTUSDT", "1m")
+    settings = StrategySettings()
+    full_history = make_sample_ohlcv(120)
+    seed_history = full_history.head(100).reset_index(drop=True)
+    seed_backtest = run_backtest(seed_history, settings=settings)
+    engine.symbol_states[key] = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="1m",
+        strategy_settings=settings,
+        history=full_history,
+        backtest=seed_backtest,
+        loading=False,
+    )
+    item = EngineWatchlistItem(
+        symbol="TESTUSDT",
+        interval="1m",
+        score=1.0,
+        return_pct=1.0,
+        strategy_settings=settings,
+    )
+
+    resolved_backtest, source = engine._latest_auto_trade_backtest(item)
+
+    assert source == "resumed"
+    assert resolved_backtest is not None
+    assert pd.Timestamp(resolved_backtest.indicators["time"].iloc[-1]) == pd.Timestamp(full_history["time"].iloc[-1])
+    assert pd.Timestamp(engine.symbol_states[key].backtest.indicators["time"].iloc[-1]) == pd.Timestamp(
+        full_history["time"].iloc[-1]
+    )
 
 
 def test_trade_engine_prefers_locked_strategy_for_open_positions() -> None:

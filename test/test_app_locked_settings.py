@@ -308,17 +308,18 @@ def test_optimized_table_marks_favorable_rows_light_green() -> None:
     ) or ""
 
     assert "OPTIMIZED_TABLE_FAVORABLE_ROW_COLOR" in APP_PATH.read_text(encoding="utf-8")
-    assert "favorable_auto_trade_fraction(" in APP_PATH.read_text(encoding="utf-8")
+    assert "resolve_favorable_auto_trade_zone(" in APP_PATH.read_text(encoding="utf-8")
     assert "item.setBackground(favorable_row_brush)" in source_segment
 
 
 def test_optimized_table_favorable_highlight_avoids_stale_optimization_backtests() -> None:
     source_segment = ast.get_source_segment(
         APP_PATH.read_text(encoding="utf-8"),
-        _window_method_node("_optimized_result_has_favorable_entry"),
+        _window_method_node("_optimized_result_favorable_zone"),
     ) or ""
 
-    assert "latest_backtest: Optional[BacktestResult] = None" in source_segment
+    assert "latest_backtest = self._latest_auto_trade_backtest(result)" in source_segment
+    assert "resolve_favorable_auto_trade_zone(" in source_segment
     assert "return result.best_backtest" not in source_segment
     assert "if latest_backtest is None:" in source_segment
 

@@ -16,11 +16,11 @@ import websocket
 from .auto_trade_runtime import (
     auto_trade_signal_from_backtest,
     evaluate_auto_trade_candidate,
-    favorable_auto_trade_fraction,
-    favorable_zone_for_price,
     history_can_resume_backtest as _history_can_resume_backtest,
     inferred_auto_trade_fraction as _inferred_auto_trade_fraction,
     pick_auto_trade_candidate,
+    resolve_favorable_auto_trade_zone,
+    resolve_latest_auto_trade_backtest,
     zone_favorable_fraction,
 )
 from .binance_futures import (
@@ -1866,10 +1866,6 @@ class AltReversalTraderWindow(QMainWindow):
         self.bar_close_countdown_label.setStyleSheet(f"color: #d63b53; {status_strip_font_style}")
         self.bar_close_countdown_label.setFixedHeight(18)
         balance_layout.addWidget(self.bar_close_countdown_label)
-        self.reentry_cooldown_label = QLabel("진입 쿨다운: -")
-        self.reentry_cooldown_label.setStyleSheet(f"color: #2563eb; {status_strip_font_style}")
-        self.reentry_cooldown_label.setFixedHeight(18)
-        balance_layout.addWidget(self.reentry_cooldown_label)
         self.optimization_chart_notice_label = QLabel("")
         self.optimization_chart_notice_label.setStyleSheet(f"color: #f59e0b; {status_strip_font_style}")
         self.optimization_chart_notice_label.setFixedHeight(18)
@@ -3303,38 +3299,33 @@ class AltReversalTraderWindow(QMainWindow):
         interval = result.best_interval or self.settings.kline_interval
         target_settings = result.best_backtest.settings
         history = self._get_history_frame(result.symbol, interval)
+        seed_backtest = None
         if (
             self.current_symbol == result.symbol
             and self.current_interval == interval
             and self.current_backtest is not None
             and self.current_backtest.settings == target_settings
-            and _backtest_matches_history(self.current_backtest, history)
         ):
-            return self.current_backtest
+            seed_backtest = self.current_backtest
         cached_backtest = self.backtest_cache.get(self._symbol_interval_key(result.symbol, interval))
         if (
-            cached_backtest is not None
+            seed_backtest is None
+            and cached_backtest is not None
             and cached_backtest.settings == target_settings
-            and _backtest_matches_history(cached_backtest, history)
         ):
-            return cached_backtest
-        materialized = self._materialize_cached_backtest(
-            result.symbol,
-            interval,
+            seed_backtest = cached_backtest
+        if seed_backtest is None and result.best_backtest.settings == target_settings:
+            seed_backtest = result.best_backtest
+        resolution = resolve_latest_auto_trade_backtest(
+            seed_backtest,
             history,
-            self.current_backtest
-            if (
-                self.current_symbol == result.symbol
-                and self.current_interval == interval
-                and self.current_backtest is not None
-                and self.current_backtest.settings == target_settings
-            )
-            else cached_backtest,
             target_settings,
+            fee_rate=self.settings.fee_rate,
+            backtest_start_time=pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms"),
         )
-        if materialized is not None:
-            self.backtest_cache[self._symbol_interval_key(result.symbol, interval)] = materialized
-            return materialized
+        if resolution.backtest is not None:
+            self.backtest_cache[self._symbol_interval_key(result.symbol, interval)] = resolution.backtest
+            return resolution.backtest
         return result.best_backtest
 
     def _fallback_auto_trade_items(self) -> List[Dict[str, object]]:
@@ -5616,13 +5607,6 @@ class AltReversalTraderWindow(QMainWindow):
             return
         self.bar_close_countdown_label.setText(f"봉마감: {countdown}" if countdown else "봉마감: -")
 
-    def _set_reentry_cooldown_text(self, countdown: Optional[str]) -> None:
-        if not hasattr(self, "reentry_cooldown_label"):
-            return
-        self.reentry_cooldown_label.setText(
-            f"진입 쿨다운: {countdown}" if countdown else "진입 쿨다운: -"
-        )
-
     def _set_chart_interval_text(self, interval: Optional[str]) -> None:
         if not hasattr(self, "chart_interval_label"):
             return
@@ -5668,7 +5652,6 @@ class AltReversalTraderWindow(QMainWindow):
             self._set_chart_interval_text(None)
             self.current_price_label.setText("현재가: -")
             self._set_bar_close_countdown_text(None)
-            self._set_reentry_cooldown_text(None)
             self._set_lightweight_bar_close_overlay(None, None)
             return
 
@@ -5679,7 +5662,6 @@ class AltReversalTraderWindow(QMainWindow):
         if frame is None or frame.empty:
             self.current_price_label.setText("현재가: -")
             self._set_bar_close_countdown_text(None)
-            self._set_reentry_cooldown_text(None)
             self._set_lightweight_bar_close_overlay(None, None)
             return
 
@@ -5699,7 +5681,6 @@ class AltReversalTraderWindow(QMainWindow):
             floor_freq = f"{value}d"
         else:
             self._set_bar_close_countdown_text(None)
-            self._set_reentry_cooldown_text(None)
             self._set_lightweight_bar_close_overlay(None, None)
             return
 
@@ -5713,13 +5694,6 @@ class AltReversalTraderWindow(QMainWindow):
         else:
             countdown = f"{minutes:02d}:{seconds:02d}"
         self._set_bar_close_countdown_text(countdown)
-        cooldown_until = self.auto_trade_reentry_cooldown_until.get((symbol, interval), 0.0)
-        cooldown_remaining_seconds = max(0, int(cooldown_until - time.time()))
-        if cooldown_remaining_seconds > 0:
-            cooldown_minutes, cooldown_seconds = divmod(cooldown_remaining_seconds, 60)
-            self._set_reentry_cooldown_text(f"{cooldown_minutes:02d}:{cooldown_seconds:02d}")
-        else:
-            self._set_reentry_cooldown_text(None)
         self._set_lightweight_bar_close_overlay(countdown, latest_price)
 
     def _position_display_values(self, position: PositionSnapshot) -> Tuple[List[str], float, float]:
@@ -5965,48 +5939,19 @@ class AltReversalTraderWindow(QMainWindow):
         if current_price is None or current_price <= 0:
             return None
         symbol = str(result.symbol)
-        interval = str(result.best_interval or self.settings.kline_interval)
         open_position = self._find_open_position(symbol)
-        latest_backtest: Optional[BacktestResult] = None
-        if (
-            self.current_symbol == symbol
-            and self.current_interval == interval
-            and self.current_backtest is not None
-            and self.current_backtest.settings == result.best_backtest.settings
-        ):
-            latest_backtest = self.current_backtest
-        else:
-            cached_backtest = self.backtest_cache.get(self._symbol_interval_key(symbol, interval))
-            if cached_backtest is not None and cached_backtest.settings == result.best_backtest.settings:
-                latest_backtest = cached_backtest
+        latest_backtest = self._latest_auto_trade_backtest(result)
         if latest_backtest is None:
             return None
         filled_fraction = self.auto_trade_filled_fraction_by_symbol.get(
             symbol,
             _inferred_auto_trade_fraction(latest_backtest, open_position) if open_position is not None else 0.0,
         )
-        signal = auto_trade_signal_from_backtest(latest_backtest)
-        if signal is None:
-            return None
-        side = str(signal.get("side") or "")
-        if open_position is not None:
-            position_side = "long" if float(open_position.amount) > 0 else "short"
-            if side != position_side:
-                return None
-        favorable_fraction = favorable_auto_trade_fraction(
+        return resolve_favorable_auto_trade_zone(
             latest_backtest,
             float(current_price),
             open_position,
             filled_fraction,
-        )
-        if favorable_fraction <= 1e-9:
-            return None
-        zone_prices = dict(signal.get("zone_prices") or {})
-        return favorable_zone_for_price(
-            side,
-            float(current_price),
-            float(signal.get("price") or 0.0),
-            zone_prices,
         )
 
     def _optimized_result_has_favorable_entry(self, result: OptimizationResult, current_price: Optional[float]) -> bool:

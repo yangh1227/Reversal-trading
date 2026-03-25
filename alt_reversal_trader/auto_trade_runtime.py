@@ -12,6 +12,8 @@ from .strategy import (
     active_auto_trade_signal as strategy_active_auto_trade_signal,
     BacktestResult,
     latest_confirmed_entry_event,
+    resume_backtest,
+    run_backtest,
     signal_fraction_for_zone,
 )
 
@@ -20,6 +22,108 @@ from .strategy import (
 class AutoTradeEvaluationResult:
     candidate: Optional[Dict[str, object]] = None
     reentry_position_side: str = ""
+
+
+@dataclass(frozen=True)
+class ResolvedAutoTradeBacktest:
+    backtest: Optional[BacktestResult] = None
+    source: str = "none"
+
+
+def backtest_matches_history(backtest: Optional[BacktestResult], history: Optional[pd.DataFrame]) -> bool:
+    if backtest is None or history is None or history.empty or backtest.indicators.empty:
+        return False
+    history_signature = getattr(backtest, "history_signature", ())
+    if history_signature:
+        history_times = pd.to_datetime(history["time"])
+        last_row = history.iloc[-1]
+        values: List[object] = [pd.Timestamp(history_times.iloc[-1]), int(len(history))]
+        for column in ("open", "high", "low", "close", "volume"):
+            if column not in history.columns:
+                continue
+            value = last_row[column]
+            values.append(None if pd.isna(value) else float(value))
+        return tuple(history_signature) == tuple(values)
+    if "time" not in backtest.indicators.columns or "time" not in history.columns:
+        return False
+    indicator_times = pd.to_datetime(backtest.indicators["time"])
+    history_times = pd.to_datetime(history["time"])
+    if indicator_times.empty or history_times.empty:
+        return False
+    return (
+        len(backtest.indicators) == len(history)
+        and pd.Timestamp(indicator_times.iloc[-1]) == pd.Timestamp(history_times.iloc[-1])
+    )
+
+
+def resolve_latest_auto_trade_backtest(
+    seed_backtest: Optional[BacktestResult],
+    history: Optional[pd.DataFrame],
+    strategy_settings: StrategySettings,
+    *,
+    fee_rate: float = 0.0004,
+    starting_equity: float = 1_000.0,
+    backtest_start_time: Optional[pd.Timestamp | str] = None,
+) -> ResolvedAutoTradeBacktest:
+    usable_seed = (
+        seed_backtest
+        if seed_backtest is not None and seed_backtest.settings == strategy_settings
+        else None
+    )
+    if history is None or history.empty:
+        return ResolvedAutoTradeBacktest(usable_seed, "cached" if usable_seed is not None else "none")
+    if usable_seed is not None:
+        if backtest_matches_history(usable_seed, history):
+            return ResolvedAutoTradeBacktest(usable_seed, "cached")
+        if history_can_resume_backtest(usable_seed, history):
+            return ResolvedAutoTradeBacktest(
+                resume_backtest(
+                    history,
+                    previous_result=usable_seed,
+                    settings=strategy_settings,
+                    fee_rate=fee_rate,
+                    starting_equity=starting_equity,
+                    backtest_start_time=backtest_start_time,
+                ),
+                "resumed",
+            )
+    return ResolvedAutoTradeBacktest(
+        run_backtest(
+            history,
+            settings=strategy_settings,
+            fee_rate=fee_rate,
+            starting_equity=starting_equity,
+            backtest_start_time=backtest_start_time,
+        ),
+        "materialized",
+    )
+
+
+def resolve_favorable_auto_trade_zone(
+    latest_backtest: Optional[BacktestResult],
+    current_price: Optional[float],
+    open_position: Optional[PositionSnapshot],
+    filled_fraction: float,
+) -> Optional[int]:
+    if latest_backtest is None or current_price is None or current_price <= 0:
+        return None
+    signal = auto_trade_signal_from_backtest(latest_backtest)
+    if signal is None:
+        return None
+    favorable_fraction = favorable_auto_trade_fraction(
+        latest_backtest,
+        float(current_price),
+        open_position,
+        float(filled_fraction),
+    )
+    if favorable_fraction <= 1e-9:
+        return None
+    return favorable_zone_for_price(
+        str(signal.get("side") or ""),
+        float(current_price),
+        float(signal.get("price") or 0.0),
+        dict(signal.get("zone_prices") or {}),
+    )
 
 
 def history_can_resume_backtest(backtest: Optional[BacktestResult], history: Optional[pd.DataFrame]) -> bool:
