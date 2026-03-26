@@ -2184,3 +2184,118 @@ def resume_backtest(
         cursor=cursor,
         history_signature=_indicator_history_signature(result_indicators),
     )
+
+
+def _preview_exit_reason(position_qty: float, latest_state: Dict[str, object]) -> Optional[str]:
+    if position_qty > 0:
+        if bool(latest_state.get("trend_to_short")):
+            return "trend_to_short"
+        if bool(latest_state.get("final_bear")):
+            return "opposite_signal"
+        return None
+    if position_qty < 0:
+        if bool(latest_state.get("trend_to_long")):
+            return "trend_to_long"
+        if bool(latest_state.get("final_bull")):
+            return "opposite_signal"
+    return None
+
+
+def _preview_entry_signal(
+    cursor,
+    latest_state: Dict[str, object],
+    settings: StrategySettings,
+) -> Optional[Tuple[str, int]]:
+    if cursor is None:
+        return None
+    position_qty = float(getattr(cursor, "position_qty", 0.0))
+    long_zone_used = list(getattr(cursor, "long_zone_used", (False, False, False)))
+    short_zone_used = list(getattr(cursor, "short_zone_used", (False, False, False)))
+    last_long_zone = int(getattr(cursor, "last_long_zone", 0))
+    last_short_zone = int(getattr(cursor, "last_short_zone", 0))
+
+    def reset_zones() -> None:
+        nonlocal last_long_zone, last_short_zone
+        long_zone_used[:] = [False, False, False]
+        short_zone_used[:] = [False, False, False]
+        last_long_zone = 0
+        last_short_zone = 0
+
+    if abs(position_qty) < 1e-12:
+        reset_zones()
+
+    if _preview_exit_reason(position_qty, latest_state) is not None:
+        position_qty = 0.0
+        reset_zones()
+
+    if abs(position_qty) < 1e-12:
+        reset_zones()
+
+    lev_zone = int(latest_state.get("zone") or 0)
+    if lev_zone not in {1, 2, 3}:
+        return None
+
+    trend = str(latest_state.get("trend", "")).upper()
+    is_long_trend = trend == "LONG"
+    is_short_trend = trend == "SHORT"
+    final_bull = bool(latest_state.get("final_bull"))
+    final_bear = bool(latest_state.get("final_bear"))
+
+    can_long_z1 = (
+        (not settings.beast_mode)
+        and is_long_trend
+        and final_bull
+        and lev_zone == 1
+        and (not long_zone_used[0])
+        and last_long_zone == 0
+    )
+    can_long_z2 = (
+        is_long_trend
+        and final_bull
+        and lev_zone == 2
+        and (not long_zone_used[1])
+        and last_long_zone in (0, 1)
+    )
+    can_long_z3 = (
+        is_long_trend
+        and final_bull
+        and lev_zone == 3
+        and (not long_zone_used[2])
+        and last_long_zone in (0, 2)
+    )
+    can_short_z1 = (
+        (not settings.beast_mode)
+        and is_short_trend
+        and final_bear
+        and lev_zone == 1
+        and (not short_zone_used[0])
+        and last_short_zone == 0
+    )
+    can_short_z2 = (
+        is_short_trend
+        and final_bear
+        and lev_zone == 2
+        and (not short_zone_used[1])
+        and last_short_zone in (0, 1)
+    )
+    can_short_z3 = (
+        is_short_trend
+        and final_bear
+        and lev_zone == 3
+        and (not short_zone_used[2])
+        and last_short_zone in (0, 2)
+    )
+
+    if can_long_z1:
+        return ("long", 1)
+    if can_long_z2:
+        return ("long", 2)
+    if can_long_z3:
+        return ("long", 3)
+    if can_short_z1:
+        return ("short", 1)
+    if can_short_z2:
+        return ("short", 2)
+    if can_short_z3:
+        return ("short", 3)
+    return None

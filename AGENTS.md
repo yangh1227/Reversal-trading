@@ -1,6 +1,10 @@
 
 # Repository Guidelines
 
+- 모든 파일은 반드시 UTF-8로 저장 (ASCII/ANSI 금지)
+- 한글 절대 깨뜨리지 말고 그대로 유지 (\u 변환 금지)
+- 인코딩 확신 없으면 수정하지 말고 중단
+
 ## 프로젝트 구조
 - `alt_reversal_trader/`: PyQt 기반 자동매매 앱, 전략 로직, Binance 클라이언트, 트레이드 엔진이 들어 있습니다.
 - `lightweight_charts/`: 재사용 가능한 Python 차트 패키지와 번들된 JS 자산입니다.

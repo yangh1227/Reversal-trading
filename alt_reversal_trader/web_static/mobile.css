@@ -406,9 +406,9 @@ button.danger:hover { background: rgba(248,81,73,0.22); }
 
 /* Signal chip (진입신호 종목) */
 .chip.signal-chip {
-  background: rgba(227,179,65,0.13);
-  border: 1px solid rgba(227,179,65,0.35);
-  color: var(--yellow);
+  background: var(--red-dim);
+  border: 1px solid rgba(248,81,73,0.35);
+  color: var(--red);
 }
 
 .signal-text.sig-long  { color: var(--green); }
@@ -533,6 +533,11 @@ button.danger:hover { background: rgba(248,81,73,0.22); }
   background: var(--green-dim);
 }
 
+.list-item.signal {
+  border-color: rgba(248,81,73,0.28);
+  background: var(--red-dim);
+}
+
 /* Position side indicator */
 .list-item.long-pos  { border-left: 3px solid var(--green); }
 .list-item.short-pos { border-left: 3px solid var(--red); }
@@ -543,6 +548,14 @@ button.danger:hover { background: rgba(248,81,73,0.22); }
   align-items: center;
   gap: 8px;
   margin-bottom: 6px;
+}
+
+.title-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .list-title strong { font-size: 15px; font-weight: 700; }

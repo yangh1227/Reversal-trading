@@ -579,30 +579,50 @@ class MobileWebServer:
         if not price_map and ordered_results:
             price_map = self._cached_price_map()
         favorable_entries: list[dict[str, object]] = []
+        signal_entries: list[dict[str, object]] = []
         optimized_rows: list[dict[str, object]] = []
         for result in ordered_results:
             metrics = result.best_backtest.metrics
+            result_interval = result.best_interval or self.window.settings.kline_interval
             favorable_zone = self.window._optimized_result_favorable_zone(result, price_map.get(result.symbol))
             favorable = favorable_zone is not None
+            preview_signal = self.window._optimized_result_preview_signal(result)
+            preview = preview_signal is not None
+            preview_side = "" if preview_signal is None else str(preview_signal[0])
+            preview_zone = 0 if preview_signal is None else int(preview_signal[1])
+            signal_mode = str(getattr(self.window.settings, "auto_trade_focus_signal_mode", None) or "preview")
+            focused_side, focused_zone = self.window._engine_entry_signal(result.symbol, result_interval, mode=signal_mode)
             if favorable:
                 favorable_entries.append(
                     {
                         "symbol": result.symbol,
-                        "interval": result.best_interval or self.window.settings.kline_interval,
+                        "interval": result_interval,
                         "zone": int(favorable_zone or 0),
+                    }
+                )
+            if focused_side and focused_zone > 0:
+                signal_entries.append(
+                    {
+                        "symbol": result.symbol,
+                        "interval": result_interval,
+                        "side": focused_side,
+                        "zone": focused_zone,
                     }
                 )
             optimized_rows.append(
                 {
                     "symbol": result.symbol,
-                    "interval": result.best_interval or self.window.settings.kline_interval,
+                    "interval": result_interval,
                     "score": round(float(result.score), 2),
                     "returnPct": round(float(metrics.total_return_pct), 2),
                     "mddPct": round(float(metrics.max_drawdown_pct), 2),
                     "trades": int(metrics.trade_count),
                     "favorable": favorable,
+                    "preview": preview,
+                    "previewSide": preview_side,
+                    "previewZone": preview_zone,
                     "currentPrice": _format_compact_number(price_map.get(result.symbol)),
-                    "isCurrent": result.symbol == self.window.current_symbol and (result.best_interval or self.window.settings.kline_interval) == (self.window.current_interval or self.window.settings.kline_interval),
+                    "isCurrent": result.symbol == self.window.current_symbol and result_interval == (self.window.current_interval or self.window.settings.kline_interval),
                 }
             )
         exchange_balance, exchange_positions = self._mobile_exchange_account_snapshot()
@@ -623,11 +643,6 @@ class MobileWebServer:
                     "autoCloseEnabled": position.symbol in self.window.auto_close_enabled_symbols or self.window.auto_trade_enabled,
                 }
             )
-        # 예상 진입신호가 나온 종목 수집
-        signal_symbols: list[str] = []
-        for (sym, _ivl, _mode), (side, zone) in self.window.last_engine_entry_signal_by_key.items():
-            if side and int(zone) > 0 and sym not in signal_symbols:
-                signal_symbols.append(sym)
         snapshot = exchange_balance if exchange_balance is not None else self.window.account_balance_snapshot
         equity = available = None
         if snapshot is not None:
@@ -650,7 +665,7 @@ class MobileWebServer:
             "optimized": optimized_rows,
             "favorableSymbols": [entry["symbol"] for entry in favorable_entries],
             "favorableEntries": favorable_entries,
-            "signalSymbols": signal_symbols,
+            "signalEntries": signal_entries,
             "positions": positions,
         }
 

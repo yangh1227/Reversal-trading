@@ -91,6 +91,8 @@ from .qt_compat import (
 from .strategy import (
     CHART_INDICATOR_COLUMNS,
     BacktestResult,
+    _preview_entry_signal,
+    _preview_exit_reason,
     compact_indicator_frame,
     evaluate_latest_state,
     estimate_warmup_bars,
@@ -140,6 +142,7 @@ AUTO_CLOSE_RETRY_INTERVAL_MS = 10_000
 TRADE_ENGINE_POLL_INTERVAL_MS = 100
 _SNAPSHOT_KEEP = object()
 OPTIMIZED_TABLE_FAVORABLE_ROW_COLOR = "#d8f0de"
+OPTIMIZED_TABLE_PREVIEW_ROW_COLOR = "#f7dddd"
 
 
 @dataclass
@@ -516,21 +519,6 @@ def _auto_close_reason_text(reason: str) -> str:
     return labels.get(reason, reason)
 
 
-def _preview_exit_reason(position_qty: float, latest_state: Dict[str, object]) -> Optional[str]:
-    if position_qty > 0:
-        if bool(latest_state.get("trend_to_short")):
-            return "trend_to_short"
-        if bool(latest_state.get("final_bear")):
-            return "opposite_signal"
-        return None
-    if position_qty < 0:
-        if bool(latest_state.get("trend_to_long")):
-            return "trend_to_long"
-        if bool(latest_state.get("final_bull")):
-            return "opposite_signal"
-    return None
-
-
 def _confirmed_exit_event_from_state(
     position_qty: float,
     latest_state: Dict[str, object],
@@ -592,105 +580,6 @@ def _confirmed_entry_event_from_cursor(
         return None
     return {"side": side, "zone": int(zone), "bar_time": pd.Timestamp(bar_time)}
 
-
-def _preview_entry_signal(
-    cursor,
-    latest_state: Dict[str, object],
-    settings: StrategySettings,
-) -> Optional[Tuple[str, int]]:
-    if cursor is None:
-        return None
-    position_qty = float(getattr(cursor, "position_qty", 0.0))
-    long_zone_used = list(getattr(cursor, "long_zone_used", (False, False, False)))
-    short_zone_used = list(getattr(cursor, "short_zone_used", (False, False, False)))
-    last_long_zone = int(getattr(cursor, "last_long_zone", 0))
-    last_short_zone = int(getattr(cursor, "last_short_zone", 0))
-
-    def reset_zones() -> None:
-        nonlocal last_long_zone, last_short_zone
-        long_zone_used[:] = [False, False, False]
-        short_zone_used[:] = [False, False, False]
-        last_long_zone = 0
-        last_short_zone = 0
-
-    if abs(position_qty) < 1e-12:
-        reset_zones()
-
-    if _preview_exit_reason(position_qty, latest_state) is not None:
-        position_qty = 0.0
-        reset_zones()
-
-    if abs(position_qty) < 1e-12:
-        reset_zones()
-
-    lev_zone = int(latest_state.get("zone") or 0)
-    if lev_zone not in {1, 2, 3}:
-        return None
-
-    trend = str(latest_state.get("trend", "")).upper()
-    is_long_trend = trend == "LONG"
-    is_short_trend = trend == "SHORT"
-    final_bull = bool(latest_state.get("final_bull"))
-    final_bear = bool(latest_state.get("final_bear"))
-
-    can_long_z1 = (
-        (not settings.beast_mode)
-        and is_long_trend
-        and final_bull
-        and lev_zone == 1
-        and (not long_zone_used[0])
-        and last_long_zone == 0
-    )
-    can_long_z2 = (
-        is_long_trend
-        and final_bull
-        and lev_zone == 2
-        and (not long_zone_used[1])
-        and last_long_zone in (0, 1)
-    )
-    can_long_z3 = (
-        is_long_trend
-        and final_bull
-        and lev_zone == 3
-        and (not long_zone_used[2])
-        and last_long_zone in (0, 2)
-    )
-    can_short_z1 = (
-        (not settings.beast_mode)
-        and is_short_trend
-        and final_bear
-        and lev_zone == 1
-        and (not short_zone_used[0])
-        and last_short_zone == 0
-    )
-    can_short_z2 = (
-        is_short_trend
-        and final_bear
-        and lev_zone == 2
-        and (not short_zone_used[1])
-        and last_short_zone in (0, 1)
-    )
-    can_short_z3 = (
-        is_short_trend
-        and final_bear
-        and lev_zone == 3
-        and (not short_zone_used[2])
-        and last_short_zone in (0, 2)
-    )
-
-    if can_long_z1:
-        return ("long", 1)
-    if can_long_z2:
-        return ("long", 2)
-    if can_long_z3:
-        return ("long", 3)
-    if can_short_z1:
-        return ("short", 1)
-    if can_short_z2:
-        return ("short", 2)
-    if can_short_z3:
-        return ("short", 3)
-    return None
 
 def _position_return_pct(position: PositionSnapshot) -> float:
     notional = abs(float(position.amount)) * float(position.entry_price)
@@ -2347,6 +2236,11 @@ class AltReversalTraderWindow(QMainWindow):
             "color: #ffffff; font-weight: 700; background: #1f9d55; border-radius: 8px; padding: 1px 8px;"
         )
         self.optimized_favorable_label.hide()
+        self.optimized_preview_label = QLabel("", group)
+        self.optimized_preview_label.setStyleSheet(
+            "color: #ffffff; font-weight: 700; background: #d64550; border-radius: 8px; padding: 1px 8px;"
+        )
+        self.optimized_preview_label.hide()
         group.installEventFilter(self)
         layout = QVBoxLayout(group)
         self.optimized_table = QTableWidget(0, 9)
@@ -2363,15 +2257,21 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _reposition_favorable_label(self) -> None:
         group = getattr(self, "optimized_group", None)
-        label = getattr(self, "optimized_favorable_label", None)
-        if group is None or label is None:
+        favorable_label = getattr(self, "optimized_favorable_label", None)
+        preview_label = getattr(self, "optimized_preview_label", None)
+        if group is None or favorable_label is None:
             return
         fm = QFontMetrics(group.font())
         title_width = fm.horizontalAdvance("최적화 종목")
-        label.adjustSize()
         x = 9 + title_width + 8
-        y = max(1, (group.fontMetrics().height() - label.height()) // 2)
-        label.move(x, y)
+        spacing = 6
+        for label in (favorable_label, preview_label):
+            if label is None or not label.isVisible():
+                continue
+            label.adjustSize()
+            y = max(1, (group.fontMetrics().height() - label.height()) // 2)
+            label.move(x, y)
+            x += label.width() + spacing
 
     def _build_positions_group(self) -> QGroupBox:
         group = QGroupBox("Open Positions")
@@ -3064,6 +2964,7 @@ class AltReversalTraderWindow(QMainWindow):
         if self.trade_engine is not None:
             self.trade_engine.stop()
         self.trade_engine = None
+        self.last_engine_entry_signal_by_key.clear()
         self.engine_failed = False
         self.trade_engine_recovery_scheduled = False
 
@@ -3161,6 +3062,7 @@ class AltReversalTraderWindow(QMainWindow):
         if self.trade_engine is not None:
             self.trade_engine.stop()
             self.trade_engine = None
+        self.last_engine_entry_signal_by_key.clear()
         self.log(message)
         self._refresh_auto_trade_button_state()
         self._set_order_buttons_enabled(True)
@@ -3191,11 +3093,15 @@ class AltReversalTraderWindow(QMainWindow):
         if isinstance(event, EngineSignalEvent):
             focus_mode = str(self.settings.auto_trade_focus_signal_mode)
             signal_key = (event.symbol, event.interval, focus_mode)
-            if focus_mode == "confirmed":
-                next_signal = (str(event.entry_side or ""), int(event.entry_zone or 0))
-            else:
-                next_signal = (str(event.preview_entry_side or ""), int(event.preview_entry_zone or 0))
             previous_signal = self.last_engine_entry_signal_by_key.get(signal_key, ("", 0))
+            confirmed_signal = (str(event.entry_side or ""), int(event.entry_zone or 0))
+            preview_signal = (str(event.preview_entry_side or ""), int(event.preview_entry_zone or 0))
+            self.last_engine_entry_signal_by_key[(event.symbol, event.interval, "confirmed")] = confirmed_signal
+            self.last_engine_entry_signal_by_key[(event.symbol, event.interval, "preview")] = preview_signal
+            if focus_mode == "confirmed":
+                next_signal = confirmed_signal
+            else:
+                next_signal = preview_signal
             self.last_engine_entry_signal_by_key[signal_key] = next_signal
             _focus_on_signal = (
                 bool(self.auto_trade_focus_enable_check.isChecked())
@@ -6072,6 +5978,46 @@ class AltReversalTraderWindow(QMainWindow):
     def _optimized_result_has_favorable_entry(self, result: OptimizationResult, current_price: Optional[float]) -> bool:
         return self._optimized_result_favorable_zone(result, current_price) is not None
 
+    def _engine_entry_signal(
+        self,
+        symbol: str,
+        interval: Optional[str] = None,
+        *,
+        mode: str = "preview",
+    ) -> Tuple[str, int]:
+        signal_key = (symbol, interval or self.current_interval or self.settings.kline_interval, mode)
+        side, zone = self.last_engine_entry_signal_by_key.get(signal_key, ("", 0))
+        normalized_side = str(side or "").lower()
+        normalized_zone = int(zone or 0)
+        if normalized_side not in {"long", "short"} or normalized_zone not in {1, 2, 3}:
+            return "", 0
+        return normalized_side, normalized_zone
+
+    def _optimized_result_preview_signal(self, result: OptimizationResult) -> Optional[Tuple[str, int]]:
+        interval = str(result.best_interval or self.settings.kline_interval)
+        side, zone = self._engine_entry_signal(result.symbol, interval, mode="preview")
+        if not side or zone <= 0:
+            return None
+        return side, zone
+
+    def _update_optimized_status_labels(self, favorable_count: int, preview_count: int) -> None:
+        favorable_label = getattr(self, "optimized_favorable_label", None)
+        preview_label = getattr(self, "optimized_preview_label", None)
+        if favorable_label is not None:
+            if favorable_count:
+                favorable_label.setText("유리" if favorable_count == 1 else f"유리 {favorable_count}")
+                favorable_label.show()
+            else:
+                favorable_label.hide()
+        if preview_label is not None:
+            if preview_count:
+                preview_label.setText("예상" if preview_count == 1 else f"예상 {preview_count}")
+                preview_label.show()
+            else:
+                preview_label.hide()
+        if favorable_count or preview_count:
+            self._reposition_favorable_label()
+
     def _log_telegram_failure(self, message: str) -> None:
         if hasattr(self, "log_box"):
             self.log(message)
@@ -6135,46 +6081,52 @@ class AltReversalTraderWindow(QMainWindow):
             return
         price_map = self._optimized_table_price_map(log_failures=False)
         favorable_row_brush = QColor(OPTIMIZED_TABLE_FAVORABLE_ROW_COLOR)
+        preview_row_brush = QColor(OPTIMIZED_TABLE_PREVIEW_ROW_COLOR)
         default_row_brush = self.optimized_table.palette().base().color()
         favorable_count = 0
+        preview_count = 0
         favorable_rows: List[Tuple[str, str, Optional[float], Optional[int]]] = []
         for row, result in enumerate(ordered):
             result_interval = result.best_interval or self.settings.kline_interval
             favorable_zone = self._optimized_result_favorable_zone(result, price_map.get(result.symbol))
             favorable_entry = favorable_zone is not None
+            preview_signal = self._optimized_result_preview_signal(result)
+            preview_entry = preview_signal is not None
             if favorable_entry:
                 favorable_count += 1
                 favorable_rows.append((result.symbol, result_interval, price_map.get(result.symbol), favorable_zone))
-            brush = favorable_row_brush if favorable_entry else default_row_brush
+            if preview_entry:
+                preview_count += 1
+            brush = preview_row_brush if preview_entry else favorable_row_brush if favorable_entry else default_row_brush
             for col in range(self.optimized_table.columnCount()):
                 item = self.optimized_table.item(row, col)
                 if item is not None:
                     item.setBackground(brush)
         self._update_favorable_telegram_alerts(favorable_rows)
-        if hasattr(self, "optimized_favorable_label"):
-            if favorable_count:
-                self.optimized_favorable_label.setText("유리" if favorable_count == 1 else f"유리 {favorable_count}")
-                self.optimized_favorable_label.show()
-                self._reposition_favorable_label()
-            else:
-                self.optimized_favorable_label.hide()
+        self._update_optimized_status_labels(favorable_count, preview_count)
 
     def update_optimized_table(self) -> None:
         self.optimized_table.setUpdatesEnabled(False)
         ordered = self._ordered_optimized_results()
         price_map = self._optimized_table_price_map(log_failures=True)
         favorable_row_brush = QColor(OPTIMIZED_TABLE_FAVORABLE_ROW_COLOR)
+        preview_row_brush = QColor(OPTIMIZED_TABLE_PREVIEW_ROW_COLOR)
         self.optimized_table.setRowCount(len(ordered))
         favorable_count = 0
+        preview_count = 0
         favorable_rows: List[Tuple[str, str, Optional[float], Optional[int]]] = []
         for row, result in enumerate(ordered):
             metrics = result.best_backtest.metrics
             result_interval = result.best_interval or self.settings.kline_interval
             favorable_zone = self._optimized_result_favorable_zone(result, price_map.get(result.symbol))
             favorable_entry = favorable_zone is not None
+            preview_signal = self._optimized_result_preview_signal(result)
+            preview_entry = preview_signal is not None
             if favorable_entry:
                 favorable_count += 1
                 favorable_rows.append((result.symbol, result_interval, price_map.get(result.symbol), favorable_zone))
+            if preview_entry:
+                preview_count += 1
             values = [
                 result.symbol,
                 result_interval,
@@ -6189,18 +6141,14 @@ class AltReversalTraderWindow(QMainWindow):
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setData(USER_ROLE, (result.symbol, result_interval))
-                if favorable_entry:
+                if preview_entry:
+                    item.setBackground(preview_row_brush)
+                elif favorable_entry:
                     item.setBackground(favorable_row_brush)
                 self.optimized_table.setItem(row, col, item)
         self.optimized_table.setUpdatesEnabled(True)
         self._update_favorable_telegram_alerts(favorable_rows)
-        if hasattr(self, "optimized_favorable_label"):
-            if favorable_count:
-                self.optimized_favorable_label.setText("유리" if favorable_count == 1 else f"유리 {favorable_count}")
-                self.optimized_favorable_label.show()
-                self._reposition_favorable_label()
-            else:
-                self.optimized_favorable_label.hide()
+        self._update_optimized_status_labels(favorable_count, preview_count)
         self._sync_trade_engine_state()
 
     def _schedule_optimized_table_refresh(self) -> None:

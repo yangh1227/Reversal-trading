@@ -3,6 +3,8 @@ from pathlib import Path
 
 
 APP_PATH = Path(__file__).resolve().parents[1] / "alt_reversal_trader" / "app.py"
+WEB_MOBILE_PATH = Path(__file__).resolve().parents[1] / "alt_reversal_trader" / "web_mobile.py"
+MOBILE_JS_PATH = Path(__file__).resolve().parents[1] / "alt_reversal_trader" / "web_static" / "mobile.js"
 
 
 def _load_app_module_ast() -> ast.Module:
@@ -79,6 +81,16 @@ def test_engine_signal_event_auto_focuses_chart_when_favorable_price_toggle_is_o
     assert 'event.entry_zone' in source_segment
     assert "next_signal != previous_signal" in source_segment
     assert "prefer_locked_position_settings=False" in source_segment
+
+
+def test_engine_signal_event_caches_preview_and_confirmed_signals_separately() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_handle_trade_engine_event"),
+    ) or ""
+
+    assert 'self.last_engine_entry_signal_by_key[(event.symbol, event.interval, "confirmed")] = confirmed_signal' in source_segment
+    assert 'self.last_engine_entry_signal_by_key[(event.symbol, event.interval, "preview")] = preview_signal' in source_segment
 
 
 def test_lightweight_chart_initializes_optimization_overlay() -> None:
@@ -310,6 +322,17 @@ def test_optimized_table_marks_favorable_rows_light_green() -> None:
     assert "OPTIMIZED_TABLE_FAVORABLE_ROW_COLOR" in APP_PATH.read_text(encoding="utf-8")
     assert "resolve_favorable_auto_trade_zone(" in APP_PATH.read_text(encoding="utf-8")
     assert "item.setBackground(favorable_row_brush)" in source_segment
+
+
+def test_optimized_table_marks_preview_signal_rows_light_red() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("update_optimized_table"),
+    ) or ""
+
+    assert "OPTIMIZED_TABLE_PREVIEW_ROW_COLOR" in APP_PATH.read_text(encoding="utf-8")
+    assert "_optimized_result_preview_signal(result)" in source_segment
+    assert "item.setBackground(preview_row_brush)" in source_segment
 
 
 def test_optimized_table_favorable_highlight_avoids_stale_optimization_backtests() -> None:
@@ -586,12 +609,45 @@ def test_optimized_favorable_badge_uses_green_chip_style() -> None:
     ) or ""
     update_source = ast.get_source_segment(
         APP_PATH.read_text(encoding="utf-8"),
-        _window_method_node("update_optimized_table"),
+        _window_method_node("_update_optimized_status_labels"),
     ) or ""
 
     assert "background: #1f9d55" in build_source
     assert "color: #ffffff" in build_source
-    assert 'self.optimized_favorable_label.setText("유리" if favorable_count == 1 else f"유리 {favorable_count}")' in update_source
+    assert 'favorable_label.setText("유리" if favorable_count == 1 else f"유리 {favorable_count}")' in update_source
+
+
+def test_optimized_preview_badge_uses_red_chip_style() -> None:
+    build_source = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_build_optimized_group"),
+    ) or ""
+    update_source = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_update_optimized_status_labels"),
+    ) or ""
+
+    assert 'self.optimized_preview_label = QLabel("", group)' in build_source
+    assert "background: #d64550" in build_source
+    assert 'preview_label.setText("예상" if preview_count == 1 else f"예상 {preview_count}")' in update_source
+
+
+def test_mobile_dashboard_state_exports_preview_signal_entries() -> None:
+    source = WEB_MOBILE_PATH.read_text(encoding="utf-8")
+
+    assert "_optimized_result_preview_signal(result)" in source
+    assert '"signalEntries": signal_entries' in source
+    assert '"preview": preview' in source
+    assert '"previewSide": preview_side' in source
+
+
+def test_mobile_frontend_renders_preview_signal_entries_and_red_cards() -> None:
+    source = MOBILE_JS_PATH.read_text(encoding="utf-8")
+
+    assert "renderFavorable(state.favorableEntries || [], state.signalEntries || [])" in source
+    assert "previewSignalCode(entry)" in source
+    assert 'return "예상";' in source
+    assert 'item.preview ? " signal" : ""' in source
 
 
 def test_status_strip_uses_uniform_spacing_and_label_heights() -> None:

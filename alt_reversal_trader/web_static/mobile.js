@@ -355,10 +355,24 @@ function startCountdown(deadlineMs) {
   countdownTimer = setInterval(() => renderCountdown(countdownDeadlineMs), 1000);
 }
 
-function renderFavorable(favorableEntries, signalSymbols) {
+function previewSignalCode(entry) {
+  const side = String(entry?.side || "").toLowerCase();
+  const zone = Number(entry?.zone || 0);
+  if (!zone || (side !== "long" && side !== "short")) {
+    return "예상";
+  }
+  return `${side === "short" ? "S" : "L"}${zone} 예상`;
+}
+
+function renderFavorable(favorableEntries, signalEntries) {
   els.favorableList.innerHTML = "";
-  const favorableSymbols = favorableEntries.map((entry) => entry.symbol);
-  const total = favorableEntries.length + signalSymbols.length;
+  const favorableKeys = new Set(
+    favorableEntries.map((entry) => `${entry.symbol}:${entry.interval || ""}`)
+  );
+  const uniqueSignalEntries = signalEntries.filter(
+    (entry) => !favorableKeys.has(`${entry.symbol}:${entry.interval || ""}`)
+  );
+  const total = favorableEntries.length + uniqueSignalEntries.length;
   els.favorableCount.textContent = String(total);
   if (!total) {
     els.favorableList.innerHTML = '<span class="muted">현재 없음</span>';
@@ -372,12 +386,11 @@ function renderFavorable(favorableEntries, signalSymbols) {
     chip.onclick = () => selectSymbol(entry.symbol, entry.interval || "");
     els.favorableList.appendChild(chip);
   });
-  signalSymbols.forEach((symbol) => {
-    if (favorableSymbols.includes(symbol)) return;
+  uniqueSignalEntries.forEach((entry) => {
     const chip = document.createElement("span");
     chip.className = "chip symbol signal-chip";
-    chip.textContent = `⚡ ${symbol}`;
-    chip.onclick = () => selectSymbol(symbol);
+    chip.textContent = `${entry.symbol} ${previewSignalCode(entry)}`;
+    chip.onclick = () => selectSymbol(entry.symbol, entry.interval || "");
     els.favorableList.appendChild(chip);
   });
 }
@@ -391,11 +404,17 @@ function renderOptimized(items) {
   els.optimizedList.innerHTML = "";
   items.forEach((item) => {
     const row = document.createElement("div");
-    row.className = `list-item${item.favorable ? " favorable" : ""}${item.isCurrent ? " current-item" : ""}`;
+    const previewBadge = item.preview
+      ? `<span class="side-badge ${item.previewSide === "short" ? "short" : "long"}">${previewSignalCode({ side: item.previewSide, zone: item.previewZone })}</span>`
+      : "";
+    row.className = `list-item${item.favorable ? " favorable" : ""}${item.preview ? " signal" : ""}${item.isCurrent ? " current-item" : ""}`;
     row.innerHTML = `
       <div class="list-title">
         <strong>${item.symbol}</strong>
-        <span class="interval-badge">${item.interval}</span>
+        <div class="title-badges">
+          <span class="interval-badge">${item.interval}</span>
+          ${previewBadge}
+        </div>
       </div>
       <div class="list-meta">Score ${item.score} · Return ${item.returnPct}% · MDD ${item.mddPct}% · Trades ${item.trades}</div>
       <div class="list-meta">${item.currentPrice ? `현재가 ${formatCompactPrice(item.currentPrice)}` : "현재가 -"}</div>
@@ -487,7 +506,7 @@ function applyDashboardState(state) {
   els.autoTradeToggle.disabled = autoTradeTogglePending;
   els.simpleAmount.value = state.simpleOrderAmount ?? 50;
 
-  renderFavorable(state.favorableEntries || [], state.signalSymbols || []);
+  renderFavorable(state.favorableEntries || [], state.signalEntries || []);
   renderOptimized(state.optimized || []);
   renderPositions(state.positions || []);
 }
