@@ -411,6 +411,12 @@ button.danger:hover { background: rgba(248,81,73,0.22); }
   color: var(--red);
 }
 
+.chip.favorable-chip {
+  background: var(--green-dim);
+  border: 1px solid rgba(63,185,80,0.35);
+  color: var(--green);
+}
+
 .signal-text.sig-long  { color: var(--green); }
 .signal-text.sig-short { color: var(--red); }
 

@@ -584,29 +584,31 @@ class MobileWebServer:
         for result in ordered_results:
             metrics = result.best_backtest.metrics
             result_interval = result.best_interval or self.window.settings.kline_interval
-            favorable_zone = self.window._optimized_result_favorable_zone(result, price_map.get(result.symbol))
-            favorable = favorable_zone is not None
-            preview_signal = self.window._optimized_result_preview_signal(result)
-            preview = preview_signal is not None
-            preview_side = "" if preview_signal is None else str(preview_signal[0])
-            preview_zone = 0 if preview_signal is None else int(preview_signal[1])
-            signal_mode = str(getattr(self.window.settings, "auto_trade_focus_signal_mode", None) or "preview")
-            focused_side, focused_zone = self.window._engine_entry_signal(result.symbol, result_interval, mode=signal_mode)
+            actionable_signal = self.window._optimized_result_actionable_signal(result)
+            actionable = actionable_signal is not None
+            actionable_side = "" if actionable_signal is None else str(actionable_signal[0])
+            actionable_zone = 0 if actionable_signal is None else int(actionable_signal[1])
+            actionable_kind = "" if actionable_signal is None else str(actionable_signal[2])
+            favorable = actionable_kind == "favorable"
+            signal = actionable_kind == "confirmed"
             if favorable:
                 favorable_entries.append(
                     {
                         "symbol": result.symbol,
                         "interval": result_interval,
-                        "zone": int(favorable_zone or 0),
+                        "side": actionable_side,
+                        "zone": actionable_zone,
+                        "kind": actionable_kind,
                     }
                 )
-            if focused_side and focused_zone > 0:
+            if signal:
                 signal_entries.append(
                     {
                         "symbol": result.symbol,
                         "interval": result_interval,
-                        "side": focused_side,
-                        "zone": focused_zone,
+                        "side": actionable_side,
+                        "zone": actionable_zone,
+                        "kind": actionable_kind,
                     }
                 )
             optimized_rows.append(
@@ -618,9 +620,10 @@ class MobileWebServer:
                     "mddPct": round(float(metrics.max_drawdown_pct), 2),
                     "trades": int(metrics.trade_count),
                     "favorable": favorable,
-                    "preview": preview,
-                    "previewSide": preview_side,
-                    "previewZone": preview_zone,
+                    "actionable": actionable,
+                    "actionableSide": actionable_side,
+                    "actionableZone": actionable_zone,
+                    "actionableKind": actionable_kind,
                     "currentPrice": _format_compact_number(price_map.get(result.symbol)),
                     "isCurrent": result.symbol == self.window.current_symbol and result_interval == (self.window.current_interval or self.window.settings.kline_interval),
                 }

@@ -79,11 +79,14 @@ def test_engine_signal_event_auto_focuses_chart_when_favorable_price_toggle_is_o
     assert 'event.preview_entry_zone' in source_segment
     assert 'event.entry_side' in source_segment
     assert 'event.entry_zone' in source_segment
+    assert 'event.actionable_entry_side' in source_segment
+    assert 'event.actionable_entry_zone' in source_segment
+    assert 'event.actionable_entry_kind' in source_segment
     assert "next_signal != previous_signal" in source_segment
     assert "prefer_locked_position_settings=False" in source_segment
 
 
-def test_engine_signal_event_caches_preview_and_confirmed_signals_separately() -> None:
+def test_engine_signal_event_caches_preview_confirmed_and_actionable_signals_separately() -> None:
     source_segment = ast.get_source_segment(
         APP_PATH.read_text(encoding="utf-8"),
         _window_method_node("_handle_trade_engine_event"),
@@ -91,6 +94,7 @@ def test_engine_signal_event_caches_preview_and_confirmed_signals_separately() -
 
     assert 'self.last_engine_entry_signal_by_key[(event.symbol, event.interval, "confirmed")] = confirmed_signal' in source_segment
     assert 'self.last_engine_entry_signal_by_key[(event.symbol, event.interval, "preview")] = preview_signal' in source_segment
+    assert "self._set_engine_actionable_signal(" in source_segment
 
 
 def test_lightweight_chart_initializes_optimization_overlay() -> None:
@@ -166,12 +170,14 @@ def test_close_event_stops_mobile_web_server() -> None:
     assert "self._stop_mobile_web_server()" in source_segment
 
 
-def test_preview_and_fast_markers_use_unified_signal_text() -> None:
+def test_preview_markers_are_reference_only_and_fast_markers_use_actionable_text() -> None:
     source = APP_PATH.read_text(encoding="utf-8")
 
-    assert '"text": "예상청산신호"' in source
-    assert '예상진입신호' in source
-    assert '"opposite_signal": "예상청산신호"' in source
+    assert '"text": "예상청산(참고)"' in source
+    assert "예상진입(참고)" in source
+    assert '"opposite_signal": "청산신호"' in source
+    assert '"text": "청산신호"' in source
+    assert "진입신호" in source
     assert "_auto_close_reason_text(reason)" not in ast.get_source_segment(
         source, _window_method_node("_build_fast_exit_markers")
     )
@@ -320,19 +326,21 @@ def test_optimized_table_marks_favorable_rows_light_green() -> None:
     ) or ""
 
     assert "OPTIMIZED_TABLE_FAVORABLE_ROW_COLOR" in APP_PATH.read_text(encoding="utf-8")
-    assert "resolve_favorable_auto_trade_zone(" in APP_PATH.read_text(encoding="utf-8")
+    assert "_optimized_result_actionable_signal(result)" in source_segment
+    assert 'actionable_signal[2] == "favorable"' in source_segment
     assert "item.setBackground(favorable_row_brush)" in source_segment
 
 
-def test_optimized_table_marks_preview_signal_rows_light_red() -> None:
+def test_optimized_table_marks_confirmed_signal_rows_light_red() -> None:
     source_segment = ast.get_source_segment(
         APP_PATH.read_text(encoding="utf-8"),
         _window_method_node("update_optimized_table"),
     ) or ""
 
-    assert "OPTIMIZED_TABLE_PREVIEW_ROW_COLOR" in APP_PATH.read_text(encoding="utf-8")
-    assert "_optimized_result_preview_signal(result)" in source_segment
-    assert "item.setBackground(preview_row_brush)" in source_segment
+    assert "OPTIMIZED_TABLE_SIGNAL_ROW_COLOR" in APP_PATH.read_text(encoding="utf-8")
+    assert "_optimized_result_actionable_signal(result)" in source_segment
+    assert 'actionable_signal[2] == "confirmed"' in source_segment
+    assert "item.setBackground(signal_row_brush)" in source_segment
 
 
 def test_optimized_table_favorable_highlight_avoids_stale_optimization_backtests() -> None:
@@ -510,6 +518,8 @@ def test_fallback_auto_trade_cycle_uses_shared_runtime_evaluator() -> None:
     ) or ""
 
     assert "evaluate_auto_trade_candidate(" in source_segment
+    assert "self._actionable_signal_from_evaluation(evaluation)" in source_segment
+    assert "next_actionable_signals" in source_segment
     assert "pick_auto_trade_candidate(" in source_segment
     assert "allow_favorable_price_entries=bool(self.settings.auto_trade_use_favorable_price)" in source_segment
     assert "self._pick_auto_trade_candidate(" not in source_segment
@@ -617,7 +627,7 @@ def test_optimized_favorable_badge_uses_green_chip_style() -> None:
     assert 'favorable_label.setText("유리" if favorable_count == 1 else f"유리 {favorable_count}")' in update_source
 
 
-def test_optimized_preview_badge_uses_red_chip_style() -> None:
+def test_optimized_entry_badge_uses_red_chip_style() -> None:
     build_source = ast.get_source_segment(
         APP_PATH.read_text(encoding="utf-8"),
         _window_method_node("_build_optimized_group"),
@@ -627,27 +637,29 @@ def test_optimized_preview_badge_uses_red_chip_style() -> None:
         _window_method_node("_update_optimized_status_labels"),
     ) or ""
 
-    assert 'self.optimized_preview_label = QLabel("", group)' in build_source
+    assert 'self.optimized_entry_label = QLabel("", group)' in build_source
     assert "background: #d64550" in build_source
-    assert 'preview_label.setText("예상" if preview_count == 1 else f"예상 {preview_count}")' in update_source
+    assert 'entry_label.setText("진입" if entry_count == 1 else f"진입 {entry_count}")' in update_source
 
 
-def test_mobile_dashboard_state_exports_preview_signal_entries() -> None:
+def test_mobile_dashboard_state_exports_actionable_signal_entries() -> None:
     source = WEB_MOBILE_PATH.read_text(encoding="utf-8")
 
-    assert "_optimized_result_preview_signal(result)" in source
+    assert "_optimized_result_actionable_signal(result)" in source
     assert '"signalEntries": signal_entries' in source
-    assert '"preview": preview' in source
-    assert '"previewSide": preview_side' in source
+    assert '"actionable": actionable' in source
+    assert '"actionableSide": actionable_side' in source
+    assert '"actionableKind": actionable_kind' in source
+    assert "auto_trade_focus_signal_mode" not in source
 
 
-def test_mobile_frontend_renders_preview_signal_entries_and_red_cards() -> None:
+def test_mobile_frontend_renders_actionable_signal_entries_and_red_cards() -> None:
     source = MOBILE_JS_PATH.read_text(encoding="utf-8")
 
     assert "renderFavorable(state.favorableEntries || [], state.signalEntries || [])" in source
-    assert "previewSignalCode(entry)" in source
-    assert 'return "예상";' in source
-    assert 'item.preview ? " signal" : ""' in source
+    assert "actionableSignalCode(entry)" in source
+    assert 'return suffix;' in source
+    assert 'item.actionableKind === "confirmed" ? " signal" : ""' in source
 
 
 def test_status_strip_uses_uniform_spacing_and_label_heights() -> None:

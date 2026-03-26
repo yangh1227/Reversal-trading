@@ -355,13 +355,15 @@ function startCountdown(deadlineMs) {
   countdownTimer = setInterval(() => renderCountdown(countdownDeadlineMs), 1000);
 }
 
-function previewSignalCode(entry) {
+function actionableSignalCode(entry) {
   const side = String(entry?.side || "").toLowerCase();
   const zone = Number(entry?.zone || 0);
+  const kind = String(entry?.kind || entry?.actionableKind || "").toLowerCase();
+  const suffix = kind === "favorable" ? "유리" : "진입";
   if (!zone || (side !== "long" && side !== "short")) {
-    return "예상";
+    return suffix;
   }
-  return `${side === "short" ? "S" : "L"}${zone} 예상`;
+  return `${side === "short" ? "S" : "L"}${zone} ${suffix}`;
 }
 
 function renderFavorable(favorableEntries, signalEntries) {
@@ -380,16 +382,15 @@ function renderFavorable(favorableEntries, signalEntries) {
   }
   favorableEntries.forEach((entry) => {
     const chip = document.createElement("span");
-    chip.className = "chip symbol";
-    const zoneText = entry.zone ? ` L${entry.zone}` : "";
-    chip.textContent = `${entry.symbol}${zoneText}`;
+    chip.className = "chip symbol favorable-chip";
+    chip.textContent = `${entry.symbol} ${actionableSignalCode(entry)}`;
     chip.onclick = () => selectSymbol(entry.symbol, entry.interval || "");
     els.favorableList.appendChild(chip);
   });
   uniqueSignalEntries.forEach((entry) => {
     const chip = document.createElement("span");
     chip.className = "chip symbol signal-chip";
-    chip.textContent = `${entry.symbol} ${previewSignalCode(entry)}`;
+    chip.textContent = `${entry.symbol} ${actionableSignalCode(entry)}`;
     chip.onclick = () => selectSymbol(entry.symbol, entry.interval || "");
     els.favorableList.appendChild(chip);
   });
@@ -404,16 +405,16 @@ function renderOptimized(items) {
   els.optimizedList.innerHTML = "";
   items.forEach((item) => {
     const row = document.createElement("div");
-    const previewBadge = item.preview
-      ? `<span class="side-badge ${item.previewSide === "short" ? "short" : "long"}">${previewSignalCode({ side: item.previewSide, zone: item.previewZone })}</span>`
+    const actionableBadge = item.actionable
+      ? `<span class="side-badge ${item.actionableSide === "short" ? "short" : "long"}">${actionableSignalCode({ side: item.actionableSide, zone: item.actionableZone, kind: item.actionableKind })}</span>`
       : "";
-    row.className = `list-item${item.favorable ? " favorable" : ""}${item.preview ? " signal" : ""}${item.isCurrent ? " current-item" : ""}`;
+    row.className = `list-item${item.actionableKind === "favorable" ? " favorable" : ""}${item.actionableKind === "confirmed" ? " signal" : ""}${item.isCurrent ? " current-item" : ""}`;
     row.innerHTML = `
       <div class="list-title">
         <strong>${item.symbol}</strong>
         <div class="title-badges">
           <span class="interval-badge">${item.interval}</span>
-          ${previewBadge}
+          ${actionableBadge}
         </div>
       </div>
       <div class="list-meta">Score ${item.score} · Return ${item.returnPct}% · MDD ${item.mddPct}% · Trades ${item.trades}</div>

@@ -13,6 +13,7 @@ import pandas as pd
 import websocket
 
 from .auto_trade_runtime import (
+    AutoTradeEvaluationResult,
     auto_trade_signal_from_backtest as _auto_trade_signal_from_backtest,
     evaluate_auto_trade_candidate,
     favorable_auto_trade_fraction,
@@ -163,6 +164,9 @@ class EngineSignalEvent:
     entry_zone: int = 0
     preview_entry_side: str = ""
     preview_entry_zone: int = 0
+    actionable_entry_side: str = ""
+    actionable_entry_zone: int = 0
+    actionable_entry_kind: str = ""
     exit_reason: str = ""
     bar_time: Optional[pd.Timestamp] = None
 
@@ -186,6 +190,7 @@ class _EngineSymbolState:
     last_price_update_at: float = 0.0
     stale_since: float = 0.0
     reload_requested_at: float = 0.0
+    last_signal_event: Optional[EngineSignalEvent] = None
 
 
 @dataclass(frozen=True)
@@ -1156,6 +1161,7 @@ class _TradeEngine:
                 backtest_start_time=backtest_start_time,
             )
             trigger_bar_time: Optional[pd.Timestamp] = None
+            is_initial_load_trigger = False
             pending_closed_bar = dict(state.pending_closed_bar) if state.pending_closed_bar is not None else None
             if pending_closed_bar is not None:
                 history = _merge_live_bar(history, pending_closed_bar)
@@ -1178,6 +1184,7 @@ class _TradeEngine:
                 state.pending_closed_bar = None
             elif not had_existing_history:
                 trigger_bar_time = _fresh_initial_trigger_bar_time(backtest, state.interval)
+                is_initial_load_trigger = trigger_bar_time is not None
             state.history = history
             state.backtest = backtest
             state.loaded_strategy_settings = state.strategy_settings
@@ -1195,6 +1202,7 @@ class _TradeEngine:
                     trigger_symbol=state.symbol,
                     trigger_interval=state.interval,
                     trigger_bar_time=trigger_bar_time,
+                    from_initial_load=is_initial_load_trigger,
                 )
             else:
                 if signal_on_load:
@@ -1396,10 +1404,19 @@ class _TradeEngine:
         self.last_stream_price_eval_at[key] = now
         self._evaluate_auto_trade(trigger_symbol=symbol, trigger_interval=interval)
 
-    def _emit_signal_event(self, state: _EngineSymbolState) -> None:
+    def _emit_signal_event(
+        self,
+        state: _EngineSymbolState,
+        evaluation: Optional[AutoTradeEvaluationResult] = None,
+    ) -> None:
         if state.backtest is None:
             return
-        signal = _auto_trade_signal_from_backtest(state.backtest)
+        latest_bar_time: Optional[pd.Timestamp] = None
+        if state.history is not None and not state.history.empty:
+            latest_bar_time = pd.Timestamp(state.history["time"].iloc[-1]).tz_localize(None)
+        elif not state.backtest.indicators.empty and "time" in state.backtest.indicators.columns:
+            latest_bar_time = pd.Timestamp(state.backtest.indicators["time"].iloc[-1]).tz_localize(None)
+        confirmed_entry = latest_confirmed_entry_event(state.backtest, latest_bar_time) if latest_bar_time is not None else None
         exit_event = _latest_backtest_exit_event(state.backtest)
         preview_side = ""
         preview_zone = 0
@@ -1412,18 +1429,23 @@ class _TradeEngine:
             preview_signal = _preview_entry_signal(state.backtest.cursor, latest_state, state.backtest.settings)
             if preview_signal is not None:
                 preview_side, preview_zone = preview_signal
-        self.emit(
-            EngineSignalEvent(
-                symbol=state.symbol,
-                interval=state.interval,
-                entry_side="" if signal is None else str(signal["side"]),
-                entry_zone=0 if signal is None else int(signal["zone"]),
-                preview_entry_side=preview_side,
-                preview_entry_zone=preview_zone,
-                exit_reason="" if exit_event is None else str(exit_event.get("reason", "")),
-                bar_time=None if exit_event is None else pd.Timestamp(exit_event.get("bar_time")),
-            )
+        event = EngineSignalEvent(
+            symbol=state.symbol,
+            interval=state.interval,
+            entry_side="" if confirmed_entry is None else str(confirmed_entry["side"]),
+            entry_zone=0 if confirmed_entry is None else int(confirmed_entry["zone"]),
+            preview_entry_side=preview_side,
+            preview_entry_zone=preview_zone,
+            actionable_entry_side="" if evaluation is None else str(evaluation.signal_side or ""),
+            actionable_entry_zone=0 if evaluation is None else int(evaluation.signal_zone or 0),
+            actionable_entry_kind="" if evaluation is None else str(evaluation.signal_kind or ""),
+            exit_reason="" if exit_event is None else str(exit_event.get("reason", "")),
+            bar_time=None if exit_event is None else pd.Timestamp(exit_event.get("bar_time")),
         )
+        if event == state.last_signal_event:
+            return
+        state.last_signal_event = event
+        self.emit(event)
 
     def _evaluate_backtest_auto_close(self, state: _EngineSymbolState) -> None:
         if state.backtest is None:
@@ -1556,6 +1578,7 @@ class _TradeEngine:
         trigger_symbol: Optional[str] = None,
         trigger_interval: Optional[str] = None,
         trigger_bar_time: Optional[pd.Timestamp] = None,
+        from_initial_load: bool = False,
     ) -> None:
         if not self.auto_trade_enabled or self.client is None:
             return
@@ -1590,6 +1613,7 @@ class _TradeEngine:
         candidates: List[Dict[str, object]] = []
         _dbg_trigger = bool(trigger_symbol) and normalized_trigger_time is not None
         for item in eligible_items:
+            state = self.symbol_states.get((item.symbol, item.interval))
             cooldown_until = self.auto_trade_reentry_cooldown_until.get((item.symbol, item.interval), 0.0)
             if cooldown_until > time.time():
                 if _dbg_trigger and item.symbol == trigger_symbol and item.interval == trigger_interval:
@@ -1597,10 +1621,14 @@ class _TradeEngine:
                     print(
                         f"[Auto-trade diagnostic] {item.symbol}/{item.interval} blocked: re-entry cooldown {remaining:.1f}s remaining"
                     )
+                if state is not None:
+                    self._emit_signal_event(state, AutoTradeEvaluationResult())
                 continue
             if item.symbol in self.pending_order_symbols:
                 if _dbg_trigger and item.symbol == trigger_symbol:
                     print(f"[Auto-trade diagnostic] {item.symbol}/{item.interval}: pending order -> skip")
+                if state is not None:
+                    self._emit_signal_event(state, AutoTradeEvaluationResult())
                 continue
             if trigger_symbol and item.symbol != trigger_symbol:
                 continue
@@ -1610,12 +1638,16 @@ class _TradeEngine:
             if open_positions_by_symbol and open_position is None:
                 if _dbg_trigger:
                     print(f"[Auto-trade diagnostic] {item.symbol}/{item.interval}: other symbol position exists ({list(open_positions_by_symbol)}) -> skip new entry")
+                if state is not None:
+                    self._emit_signal_event(state, AutoTradeEvaluationResult())
                 continue
             if open_position is not None:
                 remembered_interval = self.position_intervals.get(item.symbol)
                 if remembered_interval in APP_INTERVAL_OPTIONS and remembered_interval != item.interval:
                     if _dbg_trigger:
                         print(f"[Auto-trade diagnostic] {item.symbol}/{item.interval}: position interval mismatch ({remembered_interval}) -> skip")
+                    if state is not None:
+                        self._emit_signal_event(state, AutoTradeEvaluationResult())
                     continue
             latest_backtest, backtest_source = self._latest_auto_trade_backtest(item)
             if latest_backtest is None:
@@ -1624,6 +1656,8 @@ class _TradeEngine:
                         f"[Auto-trade diagnostic] {item.symbol}/{item.interval}: no backtest (loading?) -> skip | "
                         f"backtest_source={backtest_source}"
                     )
+                if state is not None:
+                    self._emit_signal_event(state, AutoTradeEvaluationResult())
                 continue
             current_price = current_price_for(item.symbol, item.interval)
             filled_fraction = self.filled_fraction_by_symbol.get(
@@ -1644,10 +1678,13 @@ class _TradeEngine:
                 filled_fraction=filled_fraction,
                 remembered_cursor_entry_time=self.auto_trade_cursor_entry_time.get(item.symbol),
                 allow_favorable_price_entries=self.auto_trade_use_favorable_price,
+                from_initial_load=from_initial_load,
                 trigger_symbol=trigger_symbol,
                 trigger_interval=trigger_interval,
                 trigger_bar_time=normalized_trigger_time,
             )
+            if state is not None:
+                self._emit_signal_event(state, evaluation)
             if _dbg_trigger:
                 signal = _auto_trade_signal_from_backtest(latest_backtest)
                 confirmed = latest_confirmed_entry_event(latest_backtest, normalized_trigger_time)

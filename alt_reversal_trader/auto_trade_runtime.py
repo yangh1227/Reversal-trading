@@ -22,6 +22,9 @@ from .strategy import (
 class AutoTradeEvaluationResult:
     candidate: Optional[Dict[str, object]] = None
     reentry_position_side: str = ""
+    signal_side: str = ""
+    signal_zone: int = 0
+    signal_kind: str = ""
 
 
 @dataclass(frozen=True)
@@ -110,20 +113,21 @@ def resolve_favorable_auto_trade_zone(
     signal = auto_trade_signal_from_backtest(latest_backtest)
     if signal is None:
         return None
-    favorable_fraction = favorable_auto_trade_fraction(
-        latest_backtest,
-        float(current_price),
-        open_position,
-        float(filled_fraction),
-    )
-    if favorable_fraction <= 1e-9:
-        return None
-    return favorable_zone_for_price(
-        str(signal.get("side") or ""),
+    signal_side = str(signal.get("side") or "")
+    if open_position is not None:
+        position_side = "long" if float(open_position.amount) > 0 else "short"
+        if signal_side != position_side:
+            return None
+    favorable_zone, favorable_fraction = favorable_signal_state(
+        signal_side,
         float(current_price),
         float(signal.get("price") or 0.0),
         dict(signal.get("zone_prices") or {}),
+        float(filled_fraction),
     )
+    if favorable_zone <= 0 or favorable_fraction <= 1e-9:
+        return None
+    return favorable_zone
 
 
 def history_can_resume_backtest(backtest: Optional[BacktestResult], history: Optional[pd.DataFrame]) -> bool:
@@ -156,6 +160,24 @@ def favorable_zone_for_price(
     return None
 
 
+def favorable_signal_state(
+    side: str,
+    current_price: float,
+    signal_price: float,
+    zone_prices: Dict[int, float],
+    filled_fraction: float,
+) -> tuple[int, float]:
+    favorable_zone = favorable_zone_for_price(
+        side,
+        float(current_price),
+        float(signal_price),
+        dict(zone_prices or {}),
+    )
+    if favorable_zone is None:
+        return 0, 0.0
+    return favorable_zone, max(0.0, signal_fraction_for_zone(favorable_zone) - float(filled_fraction))
+
+
 def zone_favorable_fraction(
     side: str,
     current_price: float,
@@ -163,15 +185,14 @@ def zone_favorable_fraction(
     zone_prices: Dict[int, float],
     filled_fraction: float,
 ) -> float:
-    favorable_zone = favorable_zone_for_price(
+    _favorable_zone, favorable_fraction = favorable_signal_state(
         side,
         float(current_price),
         float(signal_price),
         dict(zone_prices or {}),
+        float(filled_fraction),
     )
-    if favorable_zone is not None:
-        return max(0.0, signal_fraction_for_zone(favorable_zone) - filled_fraction)
-    return 0.0
+    return favorable_fraction
 
 
 def favorable_auto_trade_fraction(
@@ -244,6 +265,7 @@ def evaluate_auto_trade_candidate(
     filled_fraction: float,
     remembered_cursor_entry_time: Optional[pd.Timestamp],
     allow_favorable_price_entries: bool = True,
+    from_initial_load: bool = False,
     trigger_symbol: str = "",
     trigger_interval: str = "",
     trigger_bar_time: Optional[pd.Timestamp] = None,
@@ -256,12 +278,17 @@ def evaluate_auto_trade_candidate(
     signal_price = 0.0
     zone_prices: Dict[int, float] = {}
     side = ""
+    signal_zone = 0
     fraction = 0.0
     cursor_entry_time = None
+    actionable_side = ""
+    actionable_zone = 0
+    actionable_kind = ""
     if signal is not None:
         signal_price = float(signal["price"])
         zone_prices = dict(signal.get("zone_prices") or {})
         side = str(signal["side"])
+        signal_zone = int(signal.get("zone") or 0)
         fraction = float(signal["fraction"])
         cursor_entry_time = signal.get("cursor_entry_time")
     normalized_trigger_time = pd.Timestamp(trigger_bar_time).tz_localize(None) if trigger_bar_time is not None else None
@@ -288,9 +315,13 @@ def evaluate_auto_trade_candidate(
             and confirmed_fraction > float(filled_fraction) + 1e-9
         ):
             side = confirmed_side
+            signal_zone = confirmed_zone
             fraction = confirmed_fraction
             fresh_confirmed_additional_entry = True
             has_fresh_confirmed_entry = True
+            actionable_side = confirmed_side
+            actionable_zone = confirmed_zone
+            actionable_kind = "confirmed"
             if latest_backtest.cursor is not None and latest_backtest.cursor.entry_time is not None:
                 cursor_entry_time = pd.Timestamp(latest_backtest.cursor.entry_time)
     if signal is None and not fresh_confirmed_additional_entry:
@@ -316,39 +347,65 @@ def evaluate_auto_trade_candidate(
         if not has_fresh_confirmed_entry:
             if not allow_favorable_price_entries:
                 return AutoTradeEvaluationResult()
-            favorable_fraction = zone_favorable_fraction(
+            favorable_zone, favorable_fraction = favorable_signal_state(
                 side,
                 float(current_price),
                 signal_price,
                 zone_prices,
                 float(filled_fraction),
             )
-            if favorable_fraction <= 1e-9:
+            if favorable_zone <= 0 or favorable_fraction <= 1e-9:
                 return AutoTradeEvaluationResult()
             fraction = min(fraction, favorable_fraction)
+            actionable_side = side
+            actionable_zone = favorable_zone
+            actionable_kind = "favorable"
     else:
-        if not has_fresh_confirmed_entry:
-            if not allow_favorable_price_entries:
+        # 초기 로드 시에는 신호봉이 과거이므로 confirmed_entry여도 현재가 존 검사 적용
+        if not has_fresh_confirmed_entry or from_initial_load:
+            if not allow_favorable_price_entries and not from_initial_load:
                 return AutoTradeEvaluationResult()
-            favorable_fraction = zone_favorable_fraction(
+            if current_price is None or current_price <= 0:
+                return AutoTradeEvaluationResult()
+            favorable_zone, favorable_fraction = favorable_signal_state(
                 side,
                 float(current_price),
                 signal_price,
                 zone_prices,
                 0.0,
             )
-            if favorable_fraction <= 1e-9:
+            if favorable_zone <= 0 or favorable_fraction <= 1e-9:
                 return AutoTradeEvaluationResult()
             fraction = min(fraction, favorable_fraction)
+            actionable_side = side
+            actionable_zone = favorable_zone
+            actionable_kind = "favorable"
+    if has_fresh_confirmed_entry and actionable_kind != "confirmed":
+        actionable_side = side
+        actionable_zone = signal_zone
+        actionable_kind = "confirmed"
+    if actionable_side not in {"long", "short"}:
+        return AutoTradeEvaluationResult()
+    if actionable_zone not in {1, 2, 3}:
+        return AutoTradeEvaluationResult()
+    if actionable_kind not in {"confirmed", "favorable"}:
+        return AutoTradeEvaluationResult()
+    candidate = {
+        "symbol": symbol,
+        "interval": interval,
+        "side": "BUY" if side == "long" else "SELL",
+        "score": float(score),
+        "return_pct": float(latest_backtest.metrics.total_return_pct),
+        "fraction": float(fraction),
+        "strategy_settings": strategy_settings,
+        "cursor_entry_time": cursor_entry_time,
+        "signal_side": actionable_side,
+        "signal_zone": int(actionable_zone),
+        "signal_kind": actionable_kind,
+    }
     return AutoTradeEvaluationResult(
-        candidate={
-            "symbol": symbol,
-            "interval": interval,
-            "side": "BUY" if side == "long" else "SELL",
-            "score": float(score),
-            "return_pct": float(latest_backtest.metrics.total_return_pct),
-            "fraction": float(fraction),
-            "strategy_settings": strategy_settings,
-            "cursor_entry_time": cursor_entry_time,
-        }
+        candidate=candidate,
+        signal_side=actionable_side,
+        signal_zone=int(actionable_zone),
+        signal_kind=actionable_kind,
     )
