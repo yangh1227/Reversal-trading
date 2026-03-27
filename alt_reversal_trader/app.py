@@ -3382,6 +3382,20 @@ class AltReversalTraderWindow(QMainWindow):
         self._enqueue_favorable_backtest_refresh(result, history, target_settings)
         return None
 
+    def _best_available_auto_trade_backtest_for_display(
+        self,
+        result: OptimizationResult,
+    ) -> Optional[BacktestResult]:
+        latest_backtest = self._latest_auto_trade_backtest(result)
+        if latest_backtest is not None:
+            return latest_backtest
+        interval = str(result.best_interval or self.settings.kline_interval)
+        return self._favorable_backtest_seed(
+            result,
+            interval,
+            result.best_backtest.settings,
+        )
+
     def _fallback_auto_trade_items(self) -> List[Dict[str, object]]:
         items: List[Dict[str, object]] = []
         existing_keys: set[Tuple[str, str]] = set()
@@ -6045,13 +6059,17 @@ class AltReversalTraderWindow(QMainWindow):
         return prices
 
     def _optimized_result_favorable_zone(self, result: OptimizationResult, current_price: Optional[float]) -> Optional[int]:
-        if current_price is None or current_price <= 0:
-            return None
         symbol = str(result.symbol)
         interval = str(result.best_interval or self.settings.kline_interval)
         key = self._symbol_interval_key(symbol, interval)
+        actionable_side, actionable_zone, actionable_kind = self._actionable_signal(symbol, interval)
+        if actionable_kind == "favorable" and actionable_side and actionable_zone in {1, 2, 3}:
+            self.favorable_zone_cache[key] = int(actionable_zone)
+            return int(actionable_zone)
+        if current_price is None or current_price <= 0:
+            return self.favorable_zone_cache.get(key) if key in self.favorable_refresh_pending else None
         open_position = self._find_open_position(symbol)
-        latest_backtest = self._latest_auto_trade_backtest(result)
+        latest_backtest = self._best_available_auto_trade_backtest_for_display(result)
         if latest_backtest is None:
             return self.favorable_zone_cache.get(key) if key in self.favorable_refresh_pending else None
         filled_fraction = self.auto_trade_filled_fraction_by_symbol.get(
@@ -6208,7 +6226,7 @@ class AltReversalTraderWindow(QMainWindow):
         current_price: Optional[float],
     ) -> Optional[Tuple[str, int, str]]:
         interval = str(result.best_interval or self.settings.kline_interval)
-        latest_backtest = self._latest_auto_trade_backtest(result)
+        latest_backtest = self._best_available_auto_trade_backtest_for_display(result)
         if latest_backtest is None:
             return None
         trigger_bar_time: Optional[pd.Timestamp] = None

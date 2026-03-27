@@ -351,9 +351,11 @@ def test_optimized_table_favorable_highlight_avoids_stale_optimization_backtests
         _window_method_node("_optimized_result_favorable_zone"),
     ) or ""
 
-    assert "latest_backtest = self._latest_auto_trade_backtest(result)" in source_segment
+    assert "actionable_side, actionable_zone, actionable_kind = self._actionable_signal(symbol, interval)" in source_segment
+    assert 'if actionable_kind == "favorable" and actionable_side and actionable_zone in {1, 2, 3}:' in source_segment
+    assert "latest_backtest = self._best_available_auto_trade_backtest_for_display(result)" in source_segment
     assert "resolve_favorable_auto_trade_zone(" in source_segment
-    assert "return result.best_backtest" not in source_segment
+    assert "return self.favorable_zone_cache.get(key) if key in self.favorable_refresh_pending else None" in source_segment
     assert "if latest_backtest is None:" in source_segment
 
 
@@ -363,10 +365,20 @@ def test_optimized_result_actionable_signal_can_compute_directly_from_shared_eva
         _window_method_node("_evaluated_actionable_signal"),
     ) or ""
 
-    assert "latest_backtest = self._latest_auto_trade_backtest(result)" in source_segment
+    assert "latest_backtest = self._best_available_auto_trade_backtest_for_display(result)" in source_segment
     assert "evaluate_auto_trade_candidate(" in source_segment
     assert "trigger_symbol=str(result.symbol)" in source_segment
     assert "trigger_interval=interval" in source_segment
+
+
+def test_best_available_auto_trade_backtest_for_display_falls_back_to_seed_backtest() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_best_available_auto_trade_backtest_for_display"),
+    ) or ""
+
+    assert "latest_backtest = self._latest_auto_trade_backtest(result)" in source_segment
+    assert "return self._favorable_backtest_seed(" in source_segment
 
 
 def test_optimized_result_actionable_signal_keeps_last_display_signal_during_async_refresh() -> None:
