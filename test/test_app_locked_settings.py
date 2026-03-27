@@ -96,6 +96,42 @@ def test_candidate_table_rows_store_one_minute_interval_payload() -> None:
     assert "item.setData(USER_ROLE, (candidate.symbol, CANDIDATE_DEFAULT_INTERVAL))" in source_segment
 
 
+def test_build_filter_group_exposes_configurable_surge_threshold_inputs() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_build_filter_group"),
+    ) or ""
+
+    assert "self.surge_rsi_min_spin = QDoubleSpinBox()" in source_segment
+    assert "self.surge_quote_volume_spin = QDoubleSpinBox()" in source_segment
+    assert "self.surge_price_change_spin = QDoubleSpinBox()" in source_segment
+    assert 'layout.addRow("급등 30m RSI >=", self.surge_rsi_min_spin)' in source_segment
+    assert 'layout.addRow("급등 24h 거래량 >=", self.surge_quote_volume_spin)' in source_segment
+    assert 'layout.addRow("급등 24h 등락율 % >=", self.surge_price_change_spin)' in source_segment
+
+
+def test_collect_settings_persists_surge_threshold_values() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("collect_settings"),
+    ) or ""
+
+    assert "surge_quote_volume_min=float(self.surge_quote_volume_spin.value())" in source_segment
+    assert "surge_price_change_min_pct=float(self.surge_price_change_spin.value())" in source_segment
+    assert "surge_rsi_30m_min=float(self.surge_rsi_min_spin.value())" in source_segment
+
+
+def test_scan_worker_uses_configurable_surge_thresholds() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _class_method_node("ScanWorker", "run"),
+    ) or ""
+
+    assert "self.settings.surge_quote_volume_min if self.settings.filter_preset == " in source_segment
+    assert "surge_price_change_min_pct=self.settings.surge_price_change_min_pct" in source_segment
+    assert "surge_rsi_30m_min=self.settings.surge_rsi_30m_min" in source_segment
+
+
 def test_engine_signal_event_auto_focuses_chart_when_favorable_price_toggle_is_off() -> None:
     source_segment = ast.get_source_segment(
         APP_PATH.read_text(encoding="utf-8"),

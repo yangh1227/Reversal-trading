@@ -720,7 +720,7 @@ class ScanWorker(QThread):
             client = BinanceFuturesClient()
             candidates = client.scan_alt_candidates(
                 daily_volatility_min=self.settings.daily_volatility_min,
-                quote_volume_min=(1_000_000.0 if self.settings.filter_preset == "급등종목"
+                quote_volume_min=(self.settings.surge_quote_volume_min if self.settings.filter_preset == "급등종목"
                                   else self.settings.quote_volume_min),
                 use_rsi_filter=self.settings.use_rsi_filter,
                 rsi_length=self.settings.rsi_length,
@@ -729,6 +729,8 @@ class ScanWorker(QThread):
                 use_atr_4h_filter=self.settings.use_atr_4h_filter,
                 atr_4h_min_pct=self.settings.atr_4h_min_pct,
                 use_surge_filter=(self.settings.filter_preset == "급등종목"),
+                surge_price_change_min_pct=self.settings.surge_price_change_min_pct,
+                surge_rsi_30m_min=self.settings.surge_rsi_30m_min,
                 workers=self.settings.scan_workers,
                 log_callback=self.progress.emit,
                 should_stop=self.isInterruptionRequested,
@@ -1931,6 +1933,29 @@ class AltReversalTraderWindow(QMainWindow):
         self.compound_order_widget.setVisible(not simple_mode)
         self.simple_order_widget.setVisible(simple_mode)
 
+    def _refresh_surge_info_label(self) -> None:
+        if not hasattr(self, "surge_info_label"):
+            return
+
+        def _format_threshold(value: float) -> str:
+            text = f"{float(value):,.1f}"
+            if text.endswith(".0"):
+                text = text[:-2]
+            return text
+
+        price_change_text = _format_threshold(float(self.surge_price_change_spin.value()))
+        if float(self.surge_price_change_spin.value()) >= 0.0:
+            price_change_text = f"+{price_change_text}"
+        self.surge_info_label.setText(
+            "30m RSI≥"
+            + _format_threshold(float(self.surge_rsi_min_spin.value()))
+            + " / 거래량≥"
+            + _format_threshold(float(self.surge_quote_volume_spin.value()))
+            + " / 24h≥"
+            + price_change_text
+            + "%"
+        )
+
     def _refresh_filter_controls(self) -> None:
         is_surge = (
             hasattr(self, "filter_preset_combo")
@@ -1946,9 +1971,18 @@ class AltReversalTraderWindow(QMainWindow):
             self.atr_4h_filter_check,
             self.atr_4h_spin,
         ]
+        surge_controls = [
+            getattr(self, "surge_rsi_min_spin", None),
+            getattr(self, "surge_quote_volume_spin", None),
+            getattr(self, "surge_price_change_spin", None),
+        ]
         for ctrl in volatility_controls:
             ctrl.setEnabled(not is_surge)
+        for ctrl in surge_controls:
+            if ctrl is not None:
+                ctrl.setEnabled(is_surge)
         if hasattr(self, "surge_info_label"):
+            self._refresh_surge_info_label()
             self.surge_info_label.setVisible(is_surge)
         if not is_surge:
             rsi_enabled = bool(self.rsi_filter_check.isChecked())
@@ -2104,7 +2138,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.filter_preset_combo = QComboBox()
         self.filter_preset_combo.addItem("변동성", "변동성")
         self.filter_preset_combo.addItem("급등종목", "급등종목")
-        self.surge_info_label = QLabel("30m RSI≥65 / 거래량≥1M / 24h≥+10%")
+        self.surge_info_label = QLabel("")
         self.surge_info_label.setStyleSheet("color: gray; font-size: 10px;")
         self.daily_vol_spin = QDoubleSpinBox()
         self.daily_vol_spin.setRange(0.0, 500.0)
@@ -2123,6 +2157,18 @@ class AltReversalTraderWindow(QMainWindow):
         self.rsi_upper_spin = QDoubleSpinBox()
         self.rsi_upper_spin.setRange(0.0, 100.0)
         self.rsi_upper_spin.setDecimals(1)
+        self.surge_rsi_min_spin = QDoubleSpinBox()
+        self.surge_rsi_min_spin.setRange(0.0, 100.0)
+        self.surge_rsi_min_spin.setDecimals(1)
+        self.surge_rsi_min_spin.setSingleStep(1.0)
+        self.surge_quote_volume_spin = QDoubleSpinBox()
+        self.surge_quote_volume_spin.setRange(0.0, 10_000_000_000.0)
+        self.surge_quote_volume_spin.setDecimals(0)
+        self.surge_quote_volume_spin.setSingleStep(100_000.0)
+        self.surge_price_change_spin = QDoubleSpinBox()
+        self.surge_price_change_spin.setRange(0.0, 500.0)
+        self.surge_price_change_spin.setDecimals(1)
+        self.surge_price_change_spin.setSingleStep(1.0)
         self.atr_4h_filter_check = QCheckBox("사용")
         self.atr_4h_spin = QDoubleSpinBox()
         self.atr_4h_spin.setRange(0.0, 500.0)
@@ -2143,6 +2189,9 @@ class AltReversalTraderWindow(QMainWindow):
         self.filter_preset_combo.currentIndexChanged.connect(lambda _: self._refresh_filter_controls())
         self.rsi_filter_check.toggled.connect(self._refresh_filter_controls)
         self.atr_4h_filter_check.toggled.connect(self._refresh_filter_controls)
+        self.surge_rsi_min_spin.valueChanged.connect(lambda *_: self._refresh_surge_info_label())
+        self.surge_quote_volume_spin.valueChanged.connect(lambda *_: self._refresh_surge_info_label())
+        self.surge_price_change_spin.valueChanged.connect(lambda *_: self._refresh_surge_info_label())
         layout.addRow("전략", self.strategy_type_combo)
         layout.addRow("필터 프리셋", self.filter_preset_combo)
         layout.addRow("", self.surge_info_label)
@@ -2152,6 +2201,9 @@ class AltReversalTraderWindow(QMainWindow):
         layout.addRow("1m RSI Length", self.rsi_length_spin)
         layout.addRow("1m RSI Lower <=", self.rsi_lower_spin)
         layout.addRow("1m RSI Upper >=", self.rsi_upper_spin)
+        layout.addRow("급등 30m RSI >=", self.surge_rsi_min_spin)
+        layout.addRow("급등 24h 거래량 >=", self.surge_quote_volume_spin)
+        layout.addRow("급등 24h 등락율 % >=", self.surge_price_change_spin)
         layout.addRow("4h ATR% 필터", self.atr_4h_filter_check)
         layout.addRow("4h ATR% >=", self.atr_4h_spin)
         layout.addRow("백테스트 봉", self.interval_combo)
@@ -2855,6 +2907,9 @@ class AltReversalTraderWindow(QMainWindow):
             self.filter_preset_combo.setCurrentIndex(preset_index)
         self.daily_vol_spin.setValue(settings.daily_volatility_min)
         self.quote_volume_spin.setValue(settings.quote_volume_min)
+        self.surge_quote_volume_spin.setValue(settings.surge_quote_volume_min)
+        self.surge_price_change_spin.setValue(settings.surge_price_change_min_pct)
+        self.surge_rsi_min_spin.setValue(settings.surge_rsi_30m_min)
         self.rsi_filter_check.setChecked(settings.use_rsi_filter)
         self.rsi_length_spin.setValue(settings.rsi_length)
         self.rsi_lower_spin.setValue(settings.rsi_lower)
@@ -2934,6 +2989,9 @@ class AltReversalTraderWindow(QMainWindow):
             filter_preset=str(self.filter_preset_combo.currentData() or "변동성"),
             daily_volatility_min=float(self.daily_vol_spin.value()),
             quote_volume_min=float(self.quote_volume_spin.value()),
+            surge_quote_volume_min=float(self.surge_quote_volume_spin.value()),
+            surge_price_change_min_pct=float(self.surge_price_change_spin.value()),
+            surge_rsi_30m_min=float(self.surge_rsi_min_spin.value()),
             use_rsi_filter=bool(self.rsi_filter_check.isChecked()),
             rsi_length=int(self.rsi_length_spin.value()),
             rsi_lower=float(self.rsi_lower_spin.value()),

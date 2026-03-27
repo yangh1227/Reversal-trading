@@ -54,6 +54,9 @@ class TestConfigPath(unittest.TestCase):
             self.assertEqual(loaded.auto_trade_focus_signal_mode, "preview")
             self.assertEqual(loaded.daily_volatility_min, 20.0)
             self.assertEqual(loaded.quote_volume_min, 10_000_000.0)
+            self.assertEqual(loaded.surge_quote_volume_min, 1_000_000.0)
+            self.assertEqual(loaded.surge_price_change_min_pct, 10.0)
+            self.assertEqual(loaded.surge_rsi_30m_min, 70.0)
             self.assertFalse(loaded.use_rsi_filter)
             self.assertFalse(loaded.use_atr_4h_filter)
             self.assertEqual(loaded.optimization_min_score, 70.0)
@@ -204,6 +207,24 @@ class TestConfigPath(unittest.TestCase):
             self.assertFalse(loaded.strategy.keltner_use_ema)
             self.assertEqual(loaded.strategy.keltner_band_style, "True Range")
             self.assertEqual(loaded.strategy.keltner_atr_length, 21)
+
+    def test_surge_filter_thresholds_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / self.config.APP_CONFIG_FILENAME
+            settings = self.config.AppSettings(
+                filter_preset="급등종목",
+                surge_quote_volume_min=2_500_000.0,
+                surge_price_change_min_pct=14.5,
+                surge_rsi_30m_min=74.0,
+            )
+
+            settings.save(config_path)
+            loaded = self.config.AppSettings.load(config_path)
+
+            self.assertEqual(loaded.filter_preset, "급등종목")
+            self.assertEqual(loaded.surge_quote_volume_min, 2_500_000.0)
+            self.assertEqual(loaded.surge_price_change_min_pct, 14.5)
+            self.assertEqual(loaded.surge_rsi_30m_min, 74.0)
 
     def test_legacy_chart_display_days_migrates_to_hours(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

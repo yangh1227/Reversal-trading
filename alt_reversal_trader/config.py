@@ -223,6 +223,9 @@ class AppSettings:
     filter_preset: str = "변동성"
     daily_volatility_min: float = 20.0
     quote_volume_min: float = 10_000_000.0
+    surge_quote_volume_min: float = 1_000_000.0
+    surge_price_change_min_pct: float = 10.0
+    surge_rsi_30m_min: float = 70.0
     use_rsi_filter: bool = False
     rsi_length: int = 14
     rsi_lower: float = 40.0
@@ -251,6 +254,11 @@ class AppSettings:
         if self.order_mode not in {"compound", "simple"}:
             self.order_mode = "compound"
         self.simple_order_amount = max(1.0, float(self.simple_order_amount))
+        self.daily_volatility_min = max(0.0, float(self.daily_volatility_min))
+        self.quote_volume_min = max(0.0, float(self.quote_volume_min))
+        self.surge_quote_volume_min = max(0.0, float(self.surge_quote_volume_min))
+        self.surge_price_change_min_pct = max(0.0, float(self.surge_price_change_min_pct))
+        self.surge_rsi_30m_min = max(0.0, min(100.0, float(self.surge_rsi_30m_min)))
         self.atr_4h_min_pct = max(0.0, float(self.atr_4h_min_pct))
         self.chart_display_hours = max(1, int(self.chart_display_hours))
         if self.optimization_rank_mode not in OPTIMIZATION_RANK_MODE_OPTIONS:
@@ -299,6 +307,9 @@ class AppSettings:
             "filter_preset": self.filter_preset,
             "daily_volatility_min": self.daily_volatility_min,
             "quote_volume_min": self.quote_volume_min,
+            "surge_quote_volume_min": self.surge_quote_volume_min,
+            "surge_price_change_min_pct": self.surge_price_change_min_pct,
+            "surge_rsi_30m_min": self.surge_rsi_30m_min,
             "use_rsi_filter": self.use_rsi_filter,
             "rsi_length": self.rsi_length,
             "rsi_lower": self.rsi_lower,

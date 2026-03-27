@@ -541,6 +541,8 @@ class BinanceFuturesClient:
         use_atr_4h_filter: bool,
         atr_4h_min_pct: float,
         use_surge_filter: bool = False,
+        surge_price_change_min_pct: float = 10.0,
+        surge_rsi_30m_min: float = 70.0,
         workers: int = 8,
         log_callback: Optional[Callable[[str], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
@@ -567,16 +569,16 @@ class BinanceFuturesClient:
             ticker = ticker_map[symbol]
 
             if use_surge_filter:
-                # 급등종목 모드: 24h 등락률 >= +10%, 30m RSI >= 65
+                # 급등종목 모드: 설정한 24h 등락률/30m RSI/거래량 기준 충족
                 price_change = float(ticker.get("priceChangePercent", 0.0) or 0.0)
-                if price_change < 10.0:
+                if price_change < float(surge_price_change_min_pct):
                     return None
                 rsi_30m_limit = min(max(14 * 3, 60), 99)
                 rsi_30m_df = _rows_to_ohlcv_frame(self.klines(symbol, "30m", limit=rsi_30m_limit, ttl_seconds=0.0))
                 if len(rsi_30m_df) < max(14 + 5, 30):
                     return None
                 rsi_30m_value = _rsi_with_pandas_ta(rsi_30m_df["close"], 14)
-                if not np.isfinite(rsi_30m_value) or rsi_30m_value < 65.0:
+                if not np.isfinite(rsi_30m_value) or rsi_30m_value < float(surge_rsi_30m_min):
                     return None
                 if should_stop and should_stop():
                     return None
@@ -654,8 +656,8 @@ class BinanceFuturesClient:
         if use_surge_filter:
             active_filters = [
                 f"24h 거래량 {quote_volume_min:,.0f}+",
-                "24h 등락률 +10%+",
-                "30m RSI >= 65",
+                f"24h 등락률 {float(surge_price_change_min_pct):.1f}%+",
+                f"30m RSI >= {float(surge_rsi_30m_min):.1f}",
             ]
         else:
             active_filters = [
