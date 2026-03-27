@@ -209,6 +209,15 @@ def _history_fetch_start_time_ms(settings: AppSettings, interval: Optional[str] 
     return _backtest_start_time_ms(settings) - warmup_bars * interval_ms
 
 
+def _candidate_interval_candidates(settings: AppSettings) -> List[str]:
+    strategy_type = str(getattr(settings.strategy, "strategy_type", STRATEGY_TYPE_OPTIONS[0]) or STRATEGY_TYPE_OPTIONS[0])
+    if strategy_type == "keltner_trend":
+        return [CANDIDATE_DEFAULT_INTERVAL]
+    if settings.optimize_timeframe:
+        return ["1m", "2m"]
+    return [CANDIDATE_DEFAULT_INTERVAL]
+
+
 def _optimization_result_interval(result: OptimizationResult) -> str:
     interval = str(getattr(result, "best_interval", "") or "").strip()
     return interval if interval in APP_INTERVAL_OPTIONS else CANDIDATE_DEFAULT_INTERVAL
@@ -759,9 +768,7 @@ class OptimizeWorker(QThread):
         self.candidates = candidates
 
     def _interval_candidates(self) -> List[str]:
-        if self.settings.optimize_timeframe:
-            return ["1m", "2m"]
-        return [CANDIDATE_DEFAULT_INTERVAL]
+        return _candidate_interval_candidates(self.settings)
 
     def _effective_optimize_flags(self) -> Dict[str, bool]:
         if self.settings.enable_parameter_optimization:
@@ -2115,6 +2122,9 @@ class AltReversalTraderWindow(QMainWindow):
             if widget is not None:
                 widget.setEnabled(enabled)
         strategy_type = self._selected_strategy_type()
+        timeframe_enabled = strategy_type != "keltner_trend"
+        if hasattr(self, "optimize_timeframe_check"):
+            self.optimize_timeframe_check.setEnabled(timeframe_enabled)
         for spec in PARAMETER_SPECS:
             optimize_box = self.parameter_opt_boxes.get(spec.key)
             if optimize_box is not None:
@@ -3376,10 +3386,20 @@ class AltReversalTraderWindow(QMainWindow):
         return (symbol, interval or self.current_interval or self.settings.kline_interval)
 
     def _optimization_results_for_symbol(self, symbol: str) -> List[OptimizationResult]:
+        allowed_intervals = set(_candidate_interval_candidates(self.settings))
+        current_strategy_type = str(
+            getattr(self.settings.strategy, "strategy_type", STRATEGY_TYPE_OPTIONS[0]) or STRATEGY_TYPE_OPTIONS[0]
+        )
         return [
             result
             for (result_symbol, _interval), result in self.optimized_results.items()
             if result_symbol == symbol
+            and str(
+                getattr(result.best_backtest.settings, "strategy_type", STRATEGY_TYPE_OPTIONS[0])
+                or STRATEGY_TYPE_OPTIONS[0]
+            )
+            == current_strategy_type
+            and _optimization_result_interval(result) in allowed_intervals
         ]
 
     def _optimization_result(self, symbol: str, interval: Optional[str] = None) -> Optional[OptimizationResult]:
@@ -6200,8 +6220,21 @@ class AltReversalTraderWindow(QMainWindow):
         rank_mode = self._optimization_rank_mode()
         minimum_score = float(self.opt_min_score_spin.value()) if hasattr(self, "opt_min_score_spin") else 0.0
         minimum_return = float(self.opt_min_return_spin.value()) if hasattr(self, "opt_min_return_spin") else 0.0
+        allowed_intervals = set(_candidate_interval_candidates(self.settings))
+        current_strategy_type = str(
+            getattr(self.settings.strategy, "strategy_type", STRATEGY_TYPE_OPTIONS[0]) or STRATEGY_TYPE_OPTIONS[0]
+        )
         ordered = sorted(
-            self.optimized_results.values(),
+            [
+                result
+                for result in self.optimized_results.values()
+                if str(
+                    getattr(result.best_backtest.settings, "strategy_type", STRATEGY_TYPE_OPTIONS[0])
+                    or STRATEGY_TYPE_OPTIONS[0]
+                )
+                == current_strategy_type
+                and _optimization_result_interval(result) in allowed_intervals
+            ],
             key=lambda result: optimization_sort_key(result.best_backtest.metrics, rank_mode),
             reverse=True,
         )

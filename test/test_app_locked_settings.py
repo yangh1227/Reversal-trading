@@ -83,8 +83,16 @@ def test_optimize_worker_defaults_candidate_backtests_to_one_minute() -> None:
         _class_method_node("OptimizeWorker", "_interval_candidates"),
     ) or ""
 
-    assert 'return ["1m", "2m"]' in source_segment
-    assert "return [CANDIDATE_DEFAULT_INTERVAL]" in source_segment
+    assert "return _candidate_interval_candidates(self.settings)" in source_segment
+
+
+def test_candidate_interval_candidates_lock_keltner_to_one_minute() -> None:
+    source = APP_PATH.read_text(encoding="utf-8")
+
+    assert "def _candidate_interval_candidates(settings: AppSettings) -> List[str]:" in source
+    assert 'if strategy_type == "keltner_trend":' in source
+    assert "return [CANDIDATE_DEFAULT_INTERVAL]" in source
+    assert 'return ["1m", "2m"]' in source
 
 
 def test_candidate_table_rows_store_one_minute_interval_payload() -> None:
@@ -114,10 +122,23 @@ def test_refresh_candidate_optimization_controls_hides_optimized_panel_when_disa
         _window_method_node("_refresh_candidate_optimization_controls"),
     ) or ""
 
+    assert 'timeframe_enabled = strategy_type != "keltner_trend"' in source_segment
+    assert "self.optimize_timeframe_check.setEnabled(timeframe_enabled)" in source_segment
     assert 'optimized_group.setVisible(enabled)' in source_segment
     assert 'optimized_group.setMaximumHeight(16_777_215 if enabled else 0)' in source_segment
     assert 'lower_split.setSizes(' in source_segment
     assert 'LOWER_SPLIT_SIZES_WITH_OPTIMIZATION if enabled else LOWER_SPLIT_SIZES_WITHOUT_OPTIMIZATION' in source_segment
+
+
+def test_ordered_optimized_results_filters_to_current_strategy_and_allowed_intervals() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_ordered_optimized_results"),
+    ) or ""
+
+    assert "allowed_intervals = set(_candidate_interval_candidates(self.settings))" in source_segment
+    assert 'getattr(self.settings.strategy, "strategy_type", STRATEGY_TYPE_OPTIONS[0])' in source_segment
+    assert "_optimization_result_interval(result) in allowed_intervals" in source_segment
 
 
 def test_build_filter_group_exposes_configurable_surge_threshold_inputs() -> None:
