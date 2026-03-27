@@ -15,7 +15,8 @@ let foregroundSyncTimer = null;
 let recoverUiTimer = null;
 let recoveryToastCooldownUntil = 0;
 let autoTradeTogglePending = false;
-let orderActionPending = false;
+let orderRequestPending = false;
+let serverOrderPending = false;
 
 const els = {
   loginView: document.getElementById("login-view"),
@@ -88,8 +89,12 @@ function showChartLoading(show) {
   }
 }
 
-function setOrderActionPending(pending) {
-  orderActionPending = !!pending;
+function isOrderActionPending() {
+  return !!orderRequestPending || !!serverOrderPending;
+}
+
+function syncOrderActionPending() {
+  const pending = isOrderActionPending();
   [
     els.closeAllButton,
     els.simpleLong,
@@ -97,9 +102,19 @@ function setOrderActionPending(pending) {
     ...document.querySelectorAll("[data-fraction]"),
   ].forEach((element) => {
     if (element) {
-      element.disabled = orderActionPending;
+      element.disabled = pending;
     }
   });
+}
+
+function setOrderRequestPending(pending) {
+  orderRequestPending = !!pending;
+  syncOrderActionPending();
+}
+
+function setServerOrderPending(pending) {
+  serverOrderPending = !!pending;
+  syncOrderActionPending();
 }
 
 function initChart() {
@@ -408,7 +423,7 @@ function renderOptimized(items) {
     const actionableBadge = item.actionable
       ? `<span class="side-badge ${item.actionableSide === "short" ? "short" : "long"}">${actionableSignalCode({ side: item.actionableSide, zone: item.actionableZone, kind: item.actionableKind })}</span>`
       : "";
-    row.className = `list-item${item.actionableKind === "favorable" ? " favorable" : ""}${item.actionableKind === "confirmed" ? " signal" : ""}${item.isCurrent ? " current-item" : ""}`;
+    row.className = `list-item${item.favorable ? " favorable" : ""}${!item.favorable && item.actionableKind === "confirmed" ? " signal" : ""}${item.isCurrent ? " current-item" : ""}`;
     row.innerHTML = `
       <div class="list-title">
         <strong>${item.symbol}</strong>
@@ -472,8 +487,8 @@ function renderPositions(items) {
     row.addEventListener("click", () => selectSymbol(item.symbol));
     const closeButton = row.querySelector("button");
     const autoCloseCheckbox = row.querySelector('input[type="checkbox"]');
-    closeButton.disabled = orderActionPending;
-    autoCloseCheckbox.disabled = orderActionPending;
+    closeButton.disabled = isOrderActionPending();
+    autoCloseCheckbox.disabled = isOrderActionPending();
     closeButton.onclick = (event) => {
       event.stopPropagation();
       runOrderAction(() => closePosition(item.symbol), "포지션 청산 접수", "포지션 청산 요청 실패").catch(() => {});
@@ -495,6 +510,7 @@ function renderPositions(items) {
 
 function applyDashboardState(state) {
   window.__dashboardState = state;
+  setServerOrderPending(!!state.orderPending);
   els.equityValue.textContent = state.balance.equity == null ? "-" : `${state.balance.equity.toFixed(2)} USDT`;
   els.availableValue.textContent = state.balance.available == null ? "-" : `${state.balance.available.toFixed(2)} USDT`;
   els.currentSymbol.textContent = state.current.symbol || "차트 로드 중";
@@ -521,12 +537,16 @@ async function refreshDashboard(forceChart = false) {
 async function runOrderAction(action, successMessage, fallbackErrorMessage, options = {}) {
   const syncDelayMs = Number(options.syncDelayMs ?? 600) || 0;
   const showQueuedToast = options.showQueuedToast !== false;
-  if (orderActionPending) {
+  if (isOrderActionPending()) {
+    showToast("이미 주문 처리 중입니다.", "info", 2200);
     return false;
   }
-  setOrderActionPending(true);
+  setOrderRequestPending(true);
   try {
     const payload = await action();
+    if (payload?.queued) {
+      setServerOrderPending(true);
+    }
     if (showQueuedToast) {
       showToast(successMessage || "요청 접수", "success");
     }
@@ -539,7 +559,7 @@ async function runOrderAction(action, successMessage, fallbackErrorMessage, opti
     throw error;
   } finally {
     setTimeout(() => {
-      setOrderActionPending(false);
+      setOrderRequestPending(false);
       refreshDashboard(false).catch(() => {});
     }, 250);
   }
@@ -609,6 +629,10 @@ function queueForegroundSync(delayMs = 0) {
 }
 
 function showLogin(show) {
+  if (show) {
+    setOrderRequestPending(false);
+    setServerOrderPending(false);
+  }
   els.loginView.classList.toggle("hidden", !show);
   els.appView.classList.toggle("hidden", show);
 }
@@ -672,6 +696,8 @@ function stopPolling() {
   foregroundSyncTimer = null;
   recoverUiTimer = null;
   liveSocket = null;
+  setOrderRequestPending(false);
+  setServerOrderPending(false);
 }
 
 async function logout() {

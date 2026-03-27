@@ -326,8 +326,8 @@ def test_optimized_table_marks_favorable_rows_light_green() -> None:
     ) or ""
 
     assert "OPTIMIZED_TABLE_FAVORABLE_ROW_COLOR" in APP_PATH.read_text(encoding="utf-8")
-    assert "_optimized_result_actionable_signal(result)" in source_segment
-    assert 'actionable_signal[2] == "favorable"' in source_segment
+    assert "_optimized_result_favorable_zone(result, current_price)" in source_segment
+    assert "favorable_entry = favorable_zone is not None" in source_segment
     assert "item.setBackground(favorable_row_brush)" in source_segment
 
 
@@ -338,9 +338,10 @@ def test_optimized_table_marks_confirmed_signal_rows_light_red() -> None:
     ) or ""
 
     assert "OPTIMIZED_TABLE_SIGNAL_ROW_COLOR" in APP_PATH.read_text(encoding="utf-8")
-    assert "_optimized_result_actionable_signal(result)" in source_segment
+    assert "_optimized_result_actionable_signal(result, current_price)" in source_segment
     assert 'actionable_signal[2] == "confirmed"' in source_segment
     assert "item.setBackground(signal_row_brush)" in source_segment
+    assert "elif entry_signal:" in source_segment
 
 
 def test_optimized_table_favorable_highlight_avoids_stale_optimization_backtests() -> None:
@@ -355,6 +356,30 @@ def test_optimized_table_favorable_highlight_avoids_stale_optimization_backtests
     assert "if latest_backtest is None:" in source_segment
 
 
+def test_optimized_result_actionable_signal_can_compute_directly_from_shared_evaluator() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_evaluated_actionable_signal"),
+    ) or ""
+
+    assert "latest_backtest = self._latest_auto_trade_backtest(result)" in source_segment
+    assert "evaluate_auto_trade_candidate(" in source_segment
+    assert "trigger_symbol=str(result.symbol)" in source_segment
+    assert "trigger_interval=interval" in source_segment
+
+
+def test_optimized_result_actionable_signal_keeps_last_display_signal_during_async_refresh() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_optimized_result_actionable_signal"),
+    ) or ""
+
+    assert "self.optimized_actionable_signal_cache" in source_segment
+    assert "self._actionable_signal(result.symbol, interval)" in source_segment
+    assert "if key in self.favorable_refresh_pending or current_price is None or current_price <= 0:" in source_segment
+    assert "cached_signal = self.optimized_actionable_signal_cache.get(key)" in source_segment
+
+
 def test_window_init_starts_optimized_table_highlight_timer() -> None:
     source_segment = ast.get_source_segment(
         APP_PATH.read_text(encoding="utf-8"),
@@ -366,6 +391,7 @@ def test_window_init_starts_optimized_table_highlight_timer() -> None:
     assert "self.optimized_table_highlight_timer.timeout.connect(self._refresh_optimized_table_highlights)" in source_segment
     assert "self.optimized_table_highlight_timer.start()" in source_segment
     assert "self.favorable_backtest_poll_timer = QTimer(self)" in source_segment
+    assert "self.optimized_actionable_signal_cache" in source_segment
     assert "self.favorable_backtest_poll_timer.timeout.connect(self._poll_favorable_backtest_results)" in source_segment
     assert "self.favorable_backtest_poll_timer.start()" in source_segment
 
@@ -390,6 +416,17 @@ def test_close_event_stops_favorable_backtest_process() -> None:
 
     assert "self.favorable_backtest_poll_timer.stop()" in source_segment
     assert "self.favorable_backtest_process.stop()" in source_segment
+
+
+def test_prune_caches_keeps_optimized_actionable_display_cache_in_sync() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_prune_caches"),
+    ) or ""
+
+    assert "self.optimized_actionable_signal_cache = {" in source_segment
+    assert "self.favorable_refresh_pending = {" in source_segment
+    assert "self.resolved_auto_trade_backtest_cache = {" in source_segment
 
 
 def test_optimized_table_highlight_refresh_restores_palette_base_for_non_favorable_rows() -> None:
@@ -525,6 +562,48 @@ def test_fallback_auto_trade_cycle_uses_shared_runtime_evaluator() -> None:
     assert "self._pick_auto_trade_candidate(" not in source_segment
 
 
+def test_submit_open_order_returns_result_for_mobile_api_validation() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_submit_open_order"),
+    ) or ""
+
+    assert "-> Tuple[bool, str]" in source_segment
+    assert "return False, message" in source_segment
+    assert 'return True, f"{target_symbol} 주문 요청이 접수되었습니다."' in source_segment
+
+
+def test_account_refresh_recovers_stale_auto_trade_pending_state() -> None:
+    helper_source = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_recover_stale_auto_trade_pending_state"),
+    ) or ""
+    completed_source = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_on_account_info_completed"),
+    ) or ""
+
+    assert "self.engine_order_pending" in helper_source
+    assert "self.order_worker_is_auto_trade" in helper_source
+    assert "pending_symbol in open_symbols" in helper_source
+    assert "pending_interval = str(self.pending_open_order_interval or \"\").strip()" in helper_source
+    assert "self._remember_position_interval(pending_symbol, pending_interval, persist=False)" in helper_source
+    assert "self._set_order_buttons_enabled(True)" in helper_source
+    assert "self._recover_stale_auto_trade_pending_state(open_symbols)" in completed_source
+
+
+def test_account_refresh_prefers_pending_auto_trade_interval_over_stale_saved_interval() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_remember_missing_open_position_intervals"),
+    ) or ""
+
+    assert "pending_symbol = str(self.auto_trade_entry_pending_symbol or self.order_worker_symbol or \"\").strip().upper()" in source_segment
+    assert "pending_interval = str(self.pending_open_order_interval or \"\").strip()" in source_segment
+    assert "if symbol == pending_symbol and pending_interval in APP_INTERVAL_OPTIONS:" in source_segment
+    assert "self.settings.position_intervals[symbol] = interval" in source_segment
+
+
 def test_trade_engine_sync_includes_favorable_price_toggle() -> None:
     source_segment = ast.get_source_segment(
         APP_PATH.read_text(encoding="utf-8"),
@@ -645,12 +724,24 @@ def test_optimized_entry_badge_uses_red_chip_style() -> None:
 def test_mobile_dashboard_state_exports_actionable_signal_entries() -> None:
     source = WEB_MOBILE_PATH.read_text(encoding="utf-8")
 
-    assert "_optimized_result_actionable_signal(result)" in source
+    assert "_optimized_result_favorable_zone(result, current_price)" in source
+    assert "_optimized_result_actionable_signal(result, current_price)" in source
+    assert '"orderPending": bool(self.window._is_order_pending())' in source
     assert '"signalEntries": signal_entries' in source
     assert '"actionable": actionable' in source
     assert '"actionableSide": actionable_side' in source
     assert '"actionableKind": actionable_kind' in source
+    assert '"kind": "favorable"' in source
     assert "auto_trade_focus_signal_mode" not in source
+
+
+def test_mobile_order_endpoints_wait_for_ui_validation() -> None:
+    source = WEB_MOBILE_PATH.read_text(encoding="utf-8")
+
+    assert 'return JSONResponse(self.invoker.call(lambda: self._submit_fractional_order(symbol, interval, side, fraction)))' in source
+    assert 'return JSONResponse(self.invoker.call(lambda: self._submit_simple_order(symbol, interval, side, amount)))' in source
+    assert "ok, message = self.window._submit_open_order(" in source
+    assert "raise HTTPException(status_code=self._submission_error_status(message), detail=message)" in source
 
 
 def test_mobile_frontend_renders_actionable_signal_entries_and_red_cards() -> None:
@@ -659,7 +750,20 @@ def test_mobile_frontend_renders_actionable_signal_entries_and_red_cards() -> No
     assert "renderFavorable(state.favorableEntries || [], state.signalEntries || [])" in source
     assert "actionableSignalCode(entry)" in source
     assert 'return suffix;' in source
-    assert 'item.actionableKind === "confirmed" ? " signal" : ""' in source
+    assert 'item.favorable ? " favorable" : ""' in source
+    assert '!item.favorable && item.actionableKind === "confirmed" ? " signal" : ""' in source
+
+
+def test_mobile_frontend_blocks_duplicate_manual_orders_while_server_order_is_pending() -> None:
+    source = MOBILE_JS_PATH.read_text(encoding="utf-8")
+
+    assert "let orderRequestPending = false;" in source
+    assert "let serverOrderPending = false;" in source
+    assert "function isOrderActionPending()" in source
+    assert "setServerOrderPending(!!state.orderPending);" in source
+    assert "if (isOrderActionPending()) {" in source
+    assert 'showToast("이미 주문 처리 중입니다.", "info", 2200);' in source
+    assert "if (payload?.queued) {" in source
 
 
 def test_status_strip_uses_uniform_spacing_and_label_heights() -> None:

@@ -1600,6 +1600,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.trade_engine_poll_timer = QTimer(self)
         self.favorable_refresh_pending: Dict[Tuple[str, str], Tuple[Tuple[object, ...], str]] = {}
         self.favorable_zone_cache: Dict[Tuple[str, str], Optional[int]] = {}
+        self.optimized_actionable_signal_cache: Dict[Tuple[str, str], Tuple[str, int, str]] = {}
         self.telegram_notifier = TelegramNotifier(log=self._log_telegram_failure)
         self.telegram_favorable_symbols: set[str] = set()
         self.backtest_summary_text = ""
@@ -2884,7 +2885,12 @@ class AltReversalTraderWindow(QMainWindow):
             self.price_precision_cache.clear()
         if previous != self.settings:
             self.backtest_cache.clear()
+            self.resolved_auto_trade_backtest_cache.clear()
+            self.resolved_auto_trade_backtest_meta.clear()
             self.chart_indicator_cache.clear()
+            self.favorable_refresh_pending.clear()
+            self.favorable_zone_cache.clear()
+            self.optimized_actionable_signal_cache.clear()
         if previous.chart_display_hours != self.settings.chart_display_hours and self.current_symbol and self.current_backtest is not None:
             self.render_chart(
                 self.current_symbol,
@@ -3924,8 +3930,15 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _remember_missing_open_position_intervals(self, open_symbols: set[str]) -> None:
         changed = False
+        pending_symbol = str(self.auto_trade_entry_pending_symbol or self.order_worker_symbol or "").strip().upper()
+        pending_interval = str(self.pending_open_order_interval or "").strip()
         for symbol in sorted(open_symbols):
-            if self.settings.position_intervals.get(symbol) in APP_INTERVAL_OPTIONS:
+            if symbol == pending_symbol and pending_interval in APP_INTERVAL_OPTIONS:
+                interval = pending_interval
+                if self.settings.position_intervals.get(symbol) != interval:
+                    self.settings.position_intervals[symbol] = interval
+                    changed = True
+            elif self.settings.position_intervals.get(symbol) in APP_INTERVAL_OPTIONS:
                 interval = self.settings.position_intervals[symbol]
             else:
                 optimization = self._optimization_result(symbol)
@@ -4959,6 +4972,16 @@ class AltReversalTraderWindow(QMainWindow):
             for key, value in self.backtest_cache.items()
             if key[0] in keep_symbols
         }
+        self.resolved_auto_trade_backtest_cache = {
+            key: value
+            for key, value in self.resolved_auto_trade_backtest_cache.items()
+            if key[0] in keep_symbols
+        }
+        self.resolved_auto_trade_backtest_meta = {
+            key: value
+            for key, value in self.resolved_auto_trade_backtest_meta.items()
+            if key[0] in keep_symbols
+        }
         self.chart_indicator_cache = {
             key: value
             for key, value in self.chart_indicator_cache.items()
@@ -4972,6 +4995,21 @@ class AltReversalTraderWindow(QMainWindow):
         self.chart_history_exhausted = {
             key: value
             for key, value in self.chart_history_exhausted.items()
+            if key[0] in keep_symbols
+        }
+        self.favorable_refresh_pending = {
+            key: value
+            for key, value in self.favorable_refresh_pending.items()
+            if key[0] in keep_symbols
+        }
+        self.favorable_zone_cache = {
+            key: value
+            for key, value in self.favorable_zone_cache.items()
+            if key[0] in keep_symbols
+        }
+        self.optimized_actionable_signal_cache = {
+            key: value
+            for key, value in self.optimized_actionable_signal_cache.items()
             if key[0] in keep_symbols
         }
 
@@ -6158,12 +6196,89 @@ class AltReversalTraderWindow(QMainWindow):
         side, zone, kind = cache.get(key, ("", 0, ""))
         return self._normalize_actionable_signal(side, zone, kind)
 
-    def _optimized_result_actionable_signal(self, result: OptimizationResult) -> Optional[Tuple[str, int, str]]:
+    def _evaluated_actionable_signal(
+        self,
+        result: OptimizationResult,
+        current_price: Optional[float],
+    ) -> Optional[Tuple[str, int, str]]:
         interval = str(result.best_interval or self.settings.kline_interval)
-        side, zone, kind = self._actionable_signal(result.symbol, interval)
-        if not side or zone <= 0 or not kind:
+        latest_backtest = self._latest_auto_trade_backtest(result)
+        if latest_backtest is None:
             return None
-        return side, zone, kind
+        trigger_bar_time: Optional[pd.Timestamp] = None
+        history = self._get_history_frame(result.symbol, interval)
+        if history is not None and not history.empty and "time" in history.columns:
+            trigger_bar_time = pd.Timestamp(history["time"].iloc[-1]).tz_localize(None)
+        elif not latest_backtest.indicators.empty and "time" in latest_backtest.indicators.columns:
+            trigger_bar_time = pd.Timestamp(latest_backtest.indicators["time"].iloc[-1]).tz_localize(None)
+        open_position = self._find_open_position(result.symbol)
+        evaluation = evaluate_auto_trade_candidate(
+            symbol=str(result.symbol),
+            interval=interval,
+            score=float(result.score),
+            strategy_settings=result.best_backtest.settings,
+            latest_backtest=latest_backtest,
+            current_price=None if current_price is None or current_price <= 0 else float(current_price),
+            open_position=open_position,
+            remembered_interval=self.settings.position_intervals.get(result.symbol),
+            filled_fraction=self.auto_trade_filled_fraction_by_symbol.get(
+                result.symbol,
+                _inferred_auto_trade_fraction(latest_backtest, open_position)
+                if open_position is not None
+                else 0.0,
+            ),
+            remembered_cursor_entry_time=self.auto_trade_cursor_entry_time_by_symbol.get(result.symbol),
+            allow_favorable_price_entries=bool(self.settings.auto_trade_use_favorable_price),
+            trigger_symbol=str(result.symbol),
+            trigger_interval=interval,
+            trigger_bar_time=trigger_bar_time,
+        )
+        actionable_signal = self._actionable_signal_from_evaluation(evaluation)
+        if not actionable_signal[0]:
+            return None
+        return actionable_signal
+
+    def _optimized_result_actionable_signal(
+        self,
+        result: OptimizationResult,
+        current_price: Optional[float] = None,
+    ) -> Optional[Tuple[str, int, str]]:
+        interval = str(result.best_interval or self.settings.kline_interval)
+        key = self._symbol_interval_key(result.symbol, interval)
+        side, zone, kind = self._actionable_signal(result.symbol, interval)
+        if side and zone > 0 and kind:
+            return self._set_actionable_signal_cache(
+                self.optimized_actionable_signal_cache,
+                result.symbol,
+                interval,
+                side,
+                zone,
+                kind,
+            )
+        evaluated_signal = self._evaluated_actionable_signal(result, current_price)
+        if evaluated_signal is not None:
+            return self._set_actionable_signal_cache(
+                self.optimized_actionable_signal_cache,
+                result.symbol,
+                interval,
+                evaluated_signal[0],
+                int(evaluated_signal[1]),
+                evaluated_signal[2],
+            )
+        cached_signal = self.optimized_actionable_signal_cache.get(key)
+        if key in self.favorable_refresh_pending or current_price is None or current_price <= 0:
+            if cached_signal is None:
+                return None
+            side, zone, kind = self._normalize_actionable_signal(
+                str(cached_signal[0]),
+                int(cached_signal[1]),
+                str(cached_signal[2]),
+            )
+            if side and zone > 0 and kind:
+                return side, zone, kind
+            return None
+        self.optimized_actionable_signal_cache.pop(key, None)
+        return None
 
     def _optimized_result_preview_signal(self, result: OptimizationResult) -> Optional[Tuple[str, int]]:
         interval = str(result.best_interval or self.settings.kline_interval)
@@ -6260,8 +6375,10 @@ class AltReversalTraderWindow(QMainWindow):
         favorable_rows: List[Tuple[str, str, Optional[float], Optional[int]]] = []
         for row, result in enumerate(ordered):
             result_interval = result.best_interval or self.settings.kline_interval
-            actionable_signal = self._optimized_result_actionable_signal(result)
-            favorable_entry = actionable_signal is not None and actionable_signal[2] == "favorable"
+            current_price = price_map.get(result.symbol)
+            favorable_zone = self._optimized_result_favorable_zone(result, current_price)
+            actionable_signal = self._optimized_result_actionable_signal(result, current_price)
+            favorable_entry = favorable_zone is not None
             entry_signal = actionable_signal is not None and actionable_signal[2] == "confirmed"
             if favorable_entry:
                 favorable_count += 1
@@ -6269,13 +6386,13 @@ class AltReversalTraderWindow(QMainWindow):
                     (
                         result.symbol,
                         result_interval,
-                        price_map.get(result.symbol),
-                        None if actionable_signal is None else int(actionable_signal[1]),
+                        current_price,
+                        int(favorable_zone) if favorable_zone is not None else None,
                     )
                 )
             if entry_signal:
                 entry_count += 1
-            brush = signal_row_brush if entry_signal else favorable_row_brush if favorable_entry else default_row_brush
+            brush = favorable_row_brush if favorable_entry else signal_row_brush if entry_signal else default_row_brush
             for col in range(self.optimized_table.columnCount()):
                 item = self.optimized_table.item(row, col)
                 if item is not None:
@@ -6296,8 +6413,10 @@ class AltReversalTraderWindow(QMainWindow):
         for row, result in enumerate(ordered):
             metrics = result.best_backtest.metrics
             result_interval = result.best_interval or self.settings.kline_interval
-            actionable_signal = self._optimized_result_actionable_signal(result)
-            favorable_entry = actionable_signal is not None and actionable_signal[2] == "favorable"
+            current_price = price_map.get(result.symbol)
+            favorable_zone = self._optimized_result_favorable_zone(result, current_price)
+            actionable_signal = self._optimized_result_actionable_signal(result, current_price)
+            favorable_entry = favorable_zone is not None
             entry_signal = actionable_signal is not None and actionable_signal[2] == "confirmed"
             if favorable_entry:
                 favorable_count += 1
@@ -6305,8 +6424,8 @@ class AltReversalTraderWindow(QMainWindow):
                     (
                         result.symbol,
                         result_interval,
-                        price_map.get(result.symbol),
-                        None if actionable_signal is None else int(actionable_signal[1]),
+                        current_price,
+                        int(favorable_zone) if favorable_zone is not None else None,
                     )
                 )
             if entry_signal:
@@ -6325,10 +6444,10 @@ class AltReversalTraderWindow(QMainWindow):
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setData(USER_ROLE, (result.symbol, result_interval))
-                if entry_signal:
-                    item.setBackground(signal_row_brush)
-                elif favorable_entry:
+                if favorable_entry:
                     item.setBackground(favorable_row_brush)
+                elif entry_signal:
+                    item.setBackground(signal_row_brush)
                 self.optimized_table.setItem(row, col, item)
         self.optimized_table.setUpdatesEnabled(True)
         self._update_favorable_telegram_alerts(favorable_rows)
@@ -7398,6 +7517,28 @@ class AltReversalTraderWindow(QMainWindow):
             float(snapshot.available_balance) + unrealized_delta,
         )
 
+    def _recover_stale_auto_trade_pending_state(self, open_symbols: set[str]) -> None:
+        pending_symbol = str(self.order_worker_symbol or "").strip().upper()
+        pending_interval = str(self.pending_open_order_interval or "").strip()
+        if (
+            self.engine_order_pending
+            and self.order_worker_is_auto_trade
+            and pending_symbol
+            and pending_symbol in open_symbols
+        ):
+            if pending_interval in APP_INTERVAL_OPTIONS:
+                self._remember_position_interval(pending_symbol, pending_interval, persist=False)
+            self.engine_order_pending = False
+            self.order_worker_symbol = None
+            self.order_worker_is_auto_close = False
+            self.order_worker_is_auto_trade = False
+            self.pending_open_order_interval = None
+            self.auto_trade_entry_pending_symbol = None
+            self.auto_trade_entry_pending_fraction = 0.0
+            self.auto_trade_entry_pending_cursor_time = None
+            self._set_order_buttons_enabled(True)
+            self.log(f"{pending_symbol} 자동매매 pending 상태를 계좌 동기화로 복구했습니다.")
+
     def refresh_account_info(self) -> None:
         self._sync_settings()
         if not self.settings.api_key or not self.settings.api_secret:
@@ -7453,6 +7594,7 @@ class AltReversalTraderWindow(QMainWindow):
         position = result["position"]
         self.open_positions = list(result.get("positions", []))
         open_symbols = {entry.symbol for entry in self.open_positions}
+        self._recover_stale_auto_trade_pending_state(open_symbols)
         self.position_strategy_by_symbol = {
             symbol: strategy_settings
             for symbol, strategy_settings in self.position_strategy_by_symbol.items()
@@ -7561,34 +7703,42 @@ class AltReversalTraderWindow(QMainWindow):
         symbol: Optional[str] = None,
         interval: Optional[str] = None,
         auto_trade: bool = False,
-    ) -> None:
+    ) -> Tuple[bool, str]:
         self._sync_settings()
         target_symbol = str(symbol or self.current_symbol or "").strip()
         target_interval = str(interval or self.current_interval or self.settings.kline_interval).strip()
         if not target_symbol:
-            self.show_warning("주문할 종목을 먼저 선택하세요.")
-            return
+            message = "주문할 종목을 먼저 선택하세요."
+            self.show_warning(message)
+            return False, message
         if not self.settings.api_key or not self.settings.api_secret:
             if auto_trade:
-                self.log("자동매매 진입 실패: API Key / Secret이 없습니다.")
+                message = "자동매매 진입 실패: API Key / Secret이 없습니다."
+                self.log(message)
             else:
-                self.show_warning("API Key / Secret을 입력해야 실제 주문할 수 있습니다.")
-            return
+                message = "API Key / Secret을 입력해야 실제 주문할 수 있습니다."
+                self.show_warning(message)
+            return False, message
         if self._is_order_pending():
             if auto_trade:
-                self.log(f"{target_symbol} 자동매매 진입 대기: 기존 주문 처리 중")
+                message = f"{target_symbol} 자동매매 진입 대기: 기존 주문 처리 중"
+                self.log(message)
             else:
-                self.show_warning("이미 주문 처리 중입니다.")
-            return
+                message = "이미 주문 처리 중입니다."
+                self.show_warning(message)
+            return False, message
         if margin is not None and margin <= 0:
             if auto_trade:
-                self.log(f"{target_symbol} 자동매매 진입 실패: 주문금액은 0보다 커야 합니다.")
+                message = f"{target_symbol} 자동매매 진입 실패: 주문금액은 0보다 커야 합니다."
+                self.log(message)
             else:
-                self.show_warning("주문금액은 0보다 커야 합니다.")
-            return
+                message = "주문금액은 0보다 커야 합니다."
+                self.show_warning(message)
+            return False, message
         if not self._ensure_trade_engine_available():
-            self.show_error("Trade engine is not available.")
-            return
+            message = "Trade engine is not available."
+            self.show_error(message)
+            return False, message
         optimization = self._optimization_result(target_symbol, target_interval)
         strategy_settings = optimization.best_backtest.settings if optimization else self.settings.strategy
         self.order_worker_symbol = target_symbol
@@ -7628,7 +7778,10 @@ class AltReversalTraderWindow(QMainWindow):
         except Exception as exc:
             self.engine_order_pending = False
             self._set_order_buttons_enabled(True)
-            self._on_order_failed(f"Trade engine open order failed: {exc}")
+            message = f"Trade engine open order failed: {exc}"
+            self._on_order_failed(message)
+            return False, message
+        return True, f"{target_symbol} 주문 요청이 접수되었습니다."
 
     def close_selected_position(self) -> None:
         if not self.current_symbol:

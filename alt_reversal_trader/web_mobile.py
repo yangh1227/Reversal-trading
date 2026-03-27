@@ -373,8 +373,7 @@ class MobileWebServer:
             fraction = float(payload.get("fraction", 0.0) or 0.0)
             if side not in {"BUY", "SELL"}:
                 raise HTTPException(status_code=400, detail="BUY 또는 SELL만 가능합니다.")
-            self.invoker.post(lambda: self._submit_fractional_order(symbol, interval, side, fraction))
-            return JSONResponse({"ok": True, "queued": True})
+            return JSONResponse(self.invoker.call(lambda: self._submit_fractional_order(symbol, interval, side, fraction)))
 
         @app.post("/api/order/simple")
         async def api_order_simple(request: Request) -> JSONResponse:
@@ -386,8 +385,7 @@ class MobileWebServer:
             amount = float(payload.get("amount", 0.0) or 0.0)
             if side not in {"BUY", "SELL"}:
                 raise HTTPException(status_code=400, detail="BUY 또는 SELL만 가능합니다.")
-            self.invoker.post(lambda: self._submit_simple_order(symbol, interval, side, amount))
-            return JSONResponse({"ok": True, "queued": True})
+            return JSONResponse(self.invoker.call(lambda: self._submit_simple_order(symbol, interval, side, amount)))
 
         @app.post("/api/positions/close-all")
         async def api_close_all(request: Request) -> JSONResponse:
@@ -584,12 +582,14 @@ class MobileWebServer:
         for result in ordered_results:
             metrics = result.best_backtest.metrics
             result_interval = result.best_interval or self.window.settings.kline_interval
-            actionable_signal = self.window._optimized_result_actionable_signal(result)
+            current_price = price_map.get(result.symbol)
+            favorable_zone = self.window._optimized_result_favorable_zone(result, current_price)
+            actionable_signal = self.window._optimized_result_actionable_signal(result, current_price)
             actionable = actionable_signal is not None
             actionable_side = "" if actionable_signal is None else str(actionable_signal[0])
             actionable_zone = 0 if actionable_signal is None else int(actionable_signal[1])
             actionable_kind = "" if actionable_signal is None else str(actionable_signal[2])
-            favorable = actionable_kind == "favorable"
+            favorable = favorable_zone is not None
             signal = actionable_kind == "confirmed"
             if favorable:
                 favorable_entries.append(
@@ -597,8 +597,8 @@ class MobileWebServer:
                         "symbol": result.symbol,
                         "interval": result_interval,
                         "side": actionable_side,
-                        "zone": actionable_zone,
-                        "kind": actionable_kind,
+                        "zone": 0 if favorable_zone is None else int(favorable_zone),
+                        "kind": "favorable",
                     }
                 )
             if signal:
@@ -664,6 +664,9 @@ class MobileWebServer:
             },
             "balance": {"equity": equity, "available": available},
             "autoTradeEnabled": bool(self.window.auto_trade_enabled or self.window.auto_trade_requested),
+            "orderPending": bool(self.window._is_order_pending()),
+            "orderPendingSymbol": str(getattr(self.window, "order_worker_symbol", "") or ""),
+            "orderPendingInterval": str(getattr(self.window, "pending_open_order_interval", "") or ""),
             "simpleOrderAmount": float(self.window.simple_order_amount_spin.value()),
             "optimized": optimized_rows,
             "favorableSymbols": [entry["symbol"] for entry in favorable_entries],
@@ -758,17 +761,39 @@ class MobileWebServer:
         self.window._request_symbol_load(symbol, chosen_interval, prefer_locked_position_settings=True)
         return {"ok": True, "symbol": symbol, "interval": chosen_interval}
 
+    def _submission_error_status(self, message: str) -> int:
+        text = str(message or "").lower()
+        if "pending" in text or "이미 주문 처리 중" in message:
+            return 409
+        if "trade engine is not available" in text:
+            return 503
+        return 400
+
     def _submit_fractional_order(self, symbol: str, interval: str, side: str, fraction: float) -> dict[str, object]:
         if fraction <= 0:
             raise HTTPException(status_code=400, detail="비율은 0보다 커야 합니다.")
-        self.window._submit_open_order(side, fraction=float(fraction), symbol=symbol or None, interval=interval or None)
-        return {"ok": True}
+        ok, message = self.window._submit_open_order(
+            side,
+            fraction=float(fraction),
+            symbol=symbol or None,
+            interval=interval or None,
+        )
+        if not ok:
+            raise HTTPException(status_code=self._submission_error_status(message), detail=message)
+        return {"ok": True, "queued": True, "message": message}
 
     def _submit_simple_order(self, symbol: str, interval: str, side: str, amount: float) -> dict[str, object]:
         if amount <= 0:
             raise HTTPException(status_code=400, detail="주문 금액은 0보다 커야 합니다.")
-        self.window._submit_open_order(side, margin=float(amount), symbol=symbol or None, interval=interval or None)
-        return {"ok": True}
+        ok, message = self.window._submit_open_order(
+            side,
+            margin=float(amount),
+            symbol=symbol or None,
+            interval=interval or None,
+        )
+        if not ok:
+            raise HTTPException(status_code=self._submission_error_status(message), detail=message)
+        return {"ok": True, "queued": True, "message": message}
 
     def _close_all_positions(self) -> dict[str, object]:
         self.window.close_all_positions()
