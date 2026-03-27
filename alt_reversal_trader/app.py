@@ -144,6 +144,8 @@ OPTIMIZED_TABLE_HIGHLIGHT_REFRESH_MS = 1_000
 HISTORY_CACHE_SYMBOL_LIMIT = 10
 RECENT_SYMBOL_CACHE_LIMIT = 8
 CANDIDATE_DEFAULT_INTERVAL = "1m"
+LOWER_SPLIT_SIZES_WITH_OPTIMIZATION = [240, 240, 160]
+LOWER_SPLIT_SIZES_WITHOUT_OPTIMIZATION = [480, 0, 160]
 FULL_HISTORY_REFRESH_COOLDOWN_SECONDS = 300.0
 PERFORMANCE_LOG_THRESHOLD_MS = 100.0
 AUTO_TRADE_INTERVAL_MS = 1_000
@@ -1742,12 +1744,14 @@ class AltReversalTraderWindow(QMainWindow):
         actions_row.addWidget(self.auto_trade_button)
         left_layout.addLayout(actions_row)
 
-        lower_split = QSplitter(VERTICAL)
-        lower_split.addWidget(self._build_candidate_group())
-        lower_split.addWidget(self._build_optimized_group())
-        lower_split.addWidget(self._build_log_group())
-        lower_split.setSizes([240, 240, 160])
-        left_layout.addWidget(lower_split, 4)
+        self.lower_split = QSplitter(VERTICAL)
+        self.candidate_group = self._build_candidate_group()
+        self.log_group = self._build_log_group()
+        self.lower_split.addWidget(self.candidate_group)
+        self.lower_split.addWidget(self._build_optimized_group())
+        self.lower_split.addWidget(self.log_group)
+        self.lower_split.setSizes(LOWER_SPLIT_SIZES_WITH_OPTIMIZATION)
+        left_layout.addWidget(self.lower_split, 4)
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
@@ -2115,6 +2119,21 @@ class AltReversalTraderWindow(QMainWindow):
             optimize_box = self.parameter_opt_boxes.get(spec.key)
             if optimize_box is not None:
                 optimize_box.setEnabled(enabled and parameter_spec_applies(spec, strategy_type))
+        optimized_group = getattr(self, "optimized_group", None)
+        if optimized_group is not None:
+            optimized_group.setVisible(enabled)
+            optimized_group.setMaximumHeight(16_777_215 if enabled else 0)
+            for label in (
+                getattr(self, "optimized_favorable_label", None),
+                getattr(self, "optimized_entry_label", None),
+            ):
+                if label is not None and not enabled:
+                    label.hide()
+        lower_split = getattr(self, "lower_split", None)
+        if lower_split is not None:
+            lower_split.setSizes(
+                LOWER_SPLIT_SIZES_WITH_OPTIMIZATION if enabled else LOWER_SPLIT_SIZES_WITHOUT_OPTIMIZATION
+            )
 
     def _build_api_group(self) -> QGroupBox:
         group = QGroupBox("Binance API")

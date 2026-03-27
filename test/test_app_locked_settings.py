@@ -96,6 +96,30 @@ def test_candidate_table_rows_store_one_minute_interval_payload() -> None:
     assert "item.setData(USER_ROLE, (candidate.symbol, CANDIDATE_DEFAULT_INTERVAL))" in source_segment
 
 
+def test_build_ui_keeps_references_for_resizable_candidate_panels() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_build_ui"),
+    ) or ""
+
+    assert "self.lower_split = QSplitter(VERTICAL)" in source_segment
+    assert "self.candidate_group = self._build_candidate_group()" in source_segment
+    assert "self.log_group = self._build_log_group()" in source_segment
+    assert "self.lower_split.setSizes(LOWER_SPLIT_SIZES_WITH_OPTIMIZATION)" in source_segment
+
+
+def test_refresh_candidate_optimization_controls_hides_optimized_panel_when_disabled() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("_refresh_candidate_optimization_controls"),
+    ) or ""
+
+    assert 'optimized_group.setVisible(enabled)' in source_segment
+    assert 'optimized_group.setMaximumHeight(16_777_215 if enabled else 0)' in source_segment
+    assert 'lower_split.setSizes(' in source_segment
+    assert 'LOWER_SPLIT_SIZES_WITH_OPTIMIZATION if enabled else LOWER_SPLIT_SIZES_WITHOUT_OPTIMIZATION' in source_segment
+
+
 def test_build_filter_group_exposes_configurable_surge_threshold_inputs() -> None:
     source_segment = ast.get_source_segment(
         APP_PATH.read_text(encoding="utf-8"),
