@@ -17,7 +17,9 @@ from alt_reversal_trader.optimizer import (
 )
 from alt_reversal_trader.strategy import StrategyMetrics
 from alt_reversal_trader.strategy import (
+    _ema_series,
     _preview_entry_signal,
+    _rma_series,
     active_auto_trade_signal,
     active_entry_price_by_zone,
     BacktestCursor,
@@ -879,3 +881,25 @@ def test_keltner_active_signal_uses_entry_size_fraction() -> None:
     assert signal["target_fraction"] == 0.1
     assert signal["allow_additional_entries"] is False
     assert signal["supports_favorable_entries"] is False
+
+
+def test_pine_ema_matches_recursive_reference() -> None:
+    series = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0], dtype=float)
+
+    result = _ema_series(series, 3)
+
+    expected = [1.0, 1.5, 2.25, 3.125, 4.0625]
+    for actual, target in zip(result.tolist(), expected):
+        assert abs(float(actual) - target) < 1e-12
+
+
+def test_pine_rma_uses_sma_seed_before_recursive_updates() -> None:
+    series = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0], dtype=float)
+
+    result = _rma_series(series, 3)
+
+    assert pd.isna(result.iloc[0])
+    assert pd.isna(result.iloc[1])
+    assert abs(float(result.iloc[2]) - 2.0) < 1e-12
+    assert abs(float(result.iloc[3]) - (8.0 / 3.0)) < 1e-12
+    assert abs(float(result.iloc[4]) - (31.0 / 9.0)) < 1e-12

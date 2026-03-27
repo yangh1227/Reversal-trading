@@ -571,7 +571,7 @@ class MobileWebServer:
         if self.window.current_symbol is None:
             first = next(iter(self.window._ordered_optimized_results()), None)
             if first is not None:
-                self.window._request_symbol_load(first.symbol, first.best_interval or self.window.settings.kline_interval)
+                self.window._request_symbol_load(first.symbol, first.best_interval or "1m")
         ordered_results = self.window._ordered_optimized_results()
         price_map = self._uncached_price_map()
         if not price_map and ordered_results:
@@ -581,7 +581,7 @@ class MobileWebServer:
         optimized_rows: list[dict[str, object]] = []
         for result in ordered_results:
             metrics = result.best_backtest.metrics
-            result_interval = result.best_interval or self.window.settings.kline_interval
+            result_interval = result.best_interval or "1m"
             current_price = price_map.get(result.symbol)
             favorable_zone = self.window._optimized_result_favorable_zone(result, current_price)
             actionable_signal = self.window._optimized_result_actionable_signal(result, current_price)
@@ -756,7 +756,7 @@ class MobileWebServer:
         chosen_interval = interval or (
             self.window._position_interval_for_symbol(symbol)
             or (optimization.best_interval if optimization else None)
-            or self.window.settings.kline_interval
+            or "1m"
         )
         self.window._request_symbol_load(symbol, chosen_interval, prefer_locked_position_settings=True)
         return {"ok": True, "symbol": symbol, "interval": chosen_interval}

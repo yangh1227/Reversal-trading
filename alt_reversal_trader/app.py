@@ -143,6 +143,7 @@ OPTIMIZED_TABLE_REFRESH_MS = 250
 OPTIMIZED_TABLE_HIGHLIGHT_REFRESH_MS = 1_000
 HISTORY_CACHE_SYMBOL_LIMIT = 10
 RECENT_SYMBOL_CACHE_LIMIT = 8
+CANDIDATE_DEFAULT_INTERVAL = "1m"
 FULL_HISTORY_REFRESH_COOLDOWN_SECONDS = 300.0
 PERFORMANCE_LOG_THRESHOLD_MS = 100.0
 AUTO_TRADE_INTERVAL_MS = 1_000
@@ -204,6 +205,11 @@ def _history_fetch_start_time_ms(settings: AppSettings, interval: Optional[str] 
     interval_ms = _interval_to_ms(interval or settings.kline_interval)
     warmup_bars = max(estimate_warmup_bars(settings.strategy), BACKTEST_WARMUP_BAR_FLOOR)
     return _backtest_start_time_ms(settings) - warmup_bars * interval_ms
+
+
+def _optimization_result_interval(result: OptimizationResult) -> str:
+    interval = str(getattr(result, "best_interval", "") or "").strip()
+    return interval if interval in APP_INTERVAL_OPTIONS else CANDIDATE_DEFAULT_INTERVAL
 
 
 def _ws_kline_timestamp(time_ms: int) -> pd.Timestamp:
@@ -751,7 +757,7 @@ class OptimizeWorker(QThread):
     def _interval_candidates(self) -> List[str]:
         if self.settings.optimize_timeframe:
             return ["1m", "2m"]
-        return [self.settings.kline_interval]
+        return [CANDIDATE_DEFAULT_INTERVAL]
 
     def _effective_optimize_flags(self) -> Dict[str, bool]:
         if self.settings.enable_parameter_optimization:
@@ -804,7 +810,7 @@ class OptimizeWorker(QThread):
         optimize_flags = self._effective_optimize_flags()
         history_fetch_start_time_ms = _history_fetch_start_time_ms(
             self.settings,
-            interval="1m" if "2m" in interval_candidates else self.settings.kline_interval,
+            interval="1m" if "2m" in interval_candidates else CANDIDATE_DEFAULT_INTERVAL,
         )
         for index, candidate in enumerate(self.candidates, start=1):
             if self.isInterruptionRequested():
@@ -877,7 +883,7 @@ class OptimizeWorker(QThread):
         optimize_flags = self._effective_optimize_flags()
         history_fetch_start_time_ms = _history_fetch_start_time_ms(
             self.settings,
-            interval="1m" if "2m" in interval_candidates else self.settings.kline_interval,
+            interval="1m" if "2m" in interval_candidates else CANDIDATE_DEFAULT_INTERVAL,
         )
         pending_candidates = deque(self.candidates)
         active_jobs: List[tuple[CandidateSymbol, object]] = []
@@ -2775,7 +2781,7 @@ class AltReversalTraderWindow(QMainWindow):
         optimization = self._optimization_result(target_symbol, target_interval)
         if optimization is None:
             return False
-        optimized_interval = optimization.best_interval or self.settings.kline_interval
+        optimized_interval = _optimization_result_interval(optimization)
         if optimized_interval != target_interval:
             return False
         return self.current_backtest.settings == optimization.best_backtest.settings
@@ -3108,7 +3114,7 @@ class AltReversalTraderWindow(QMainWindow):
     def _trade_engine_watchlist_items(self) -> Tuple[EngineWatchlistItem, ...]:
         items: List[EngineWatchlistItem] = []
         for result in self._ordered_optimized_results():
-            interval = result.best_interval or self.settings.kline_interval
+            interval = _optimization_result_interval(result)
             items.append(
                 EngineWatchlistItem(
                     symbol=result.symbol,
@@ -3378,7 +3384,7 @@ class AltReversalTraderWindow(QMainWindow):
     ) -> None:
         if history is None or history.empty:
             return
-        interval = result.best_interval or self.settings.kline_interval
+        interval = _optimization_result_interval(result)
         key = self._symbol_interval_key(result.symbol, interval)
         history_signature = _history_frame_signature(history)
         settings_signature = self._strategy_settings_signature(target_settings)
@@ -3442,7 +3448,7 @@ class AltReversalTraderWindow(QMainWindow):
             self._refresh_optimized_table_highlights()
 
     def _latest_auto_trade_backtest(self, result: OptimizationResult) -> Optional[BacktestResult]:
-        interval = result.best_interval or self.settings.kline_interval
+        interval = _optimization_result_interval(result)
         target_settings = result.best_backtest.settings
         history = self._get_history_frame(result.symbol, interval)
         key = self._symbol_interval_key(result.symbol, interval)
@@ -3481,7 +3487,7 @@ class AltReversalTraderWindow(QMainWindow):
         latest_backtest = self._latest_auto_trade_backtest(result)
         if latest_backtest is not None:
             return latest_backtest
-        interval = str(result.best_interval or self.settings.kline_interval)
+        interval = _optimization_result_interval(result)
         return self._favorable_backtest_seed(
             result,
             interval,
@@ -3492,7 +3498,7 @@ class AltReversalTraderWindow(QMainWindow):
         items: List[Dict[str, object]] = []
         existing_keys: set[Tuple[str, str]] = set()
         for result in self._eligible_auto_trade_results():
-            interval = result.best_interval or self.settings.kline_interval
+            interval = _optimization_result_interval(result)
             existing_keys.add((result.symbol, interval))
             items.append(
                 {
@@ -4054,7 +4060,7 @@ class AltReversalTraderWindow(QMainWindow):
                 interval = self.settings.position_intervals[symbol]
             else:
                 optimization = self._optimization_result(symbol)
-                interval = (optimization.best_interval or self.settings.kline_interval) if optimization else self.settings.kline_interval
+                interval = _optimization_result_interval(optimization) if optimization else self.settings.kline_interval
                 if interval in APP_INTERVAL_OPTIONS:
                     self.settings.position_intervals[symbol] = interval
                     changed = True
@@ -4080,7 +4086,7 @@ class AltReversalTraderWindow(QMainWindow):
         if remembered in APP_INTERVAL_OPTIONS and self._find_open_position(symbol) is not None:
             return remembered
         optimization = self._optimization_result(symbol)
-        return (optimization.best_interval or self.settings.kline_interval) if optimization else self.settings.kline_interval
+        return _optimization_result_interval(optimization) if optimization else self.settings.kline_interval
 
     def _locked_position_strategy_settings(
         self,
@@ -4990,7 +4996,7 @@ class AltReversalTraderWindow(QMainWindow):
         if locked_settings is not None:
             return locked_settings
         candidate = optimization or self._optimization_result(symbol, interval)
-        if candidate is not None and (candidate.best_interval or self.settings.kline_interval) == interval:
+        if candidate is not None and _optimization_result_interval(candidate) == interval:
             return candidate.best_backtest.settings
         return self.settings.strategy
 
@@ -6109,7 +6115,7 @@ class AltReversalTraderWindow(QMainWindow):
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                item.setData(USER_ROLE, candidate.symbol)
+                item.setData(USER_ROLE, (candidate.symbol, CANDIDATE_DEFAULT_INTERVAL))
                 self.candidate_table.setItem(row, col, item)
         self.candidate_table.setUpdatesEnabled(True)
 
@@ -6152,7 +6158,7 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _optimized_result_favorable_zone(self, result: OptimizationResult, current_price: Optional[float]) -> Optional[int]:
         symbol = str(result.symbol)
-        interval = str(result.best_interval or self.settings.kline_interval)
+        interval = _optimization_result_interval(result)
         key = self._symbol_interval_key(symbol, interval)
         actionable_side, actionable_zone, actionable_kind = self._actionable_signal(symbol, interval)
         if actionable_kind == "favorable" and actionable_side and actionable_zone in {1, 2, 3}:
@@ -6317,7 +6323,7 @@ class AltReversalTraderWindow(QMainWindow):
         result: OptimizationResult,
         current_price: Optional[float],
     ) -> Optional[Tuple[str, int, str]]:
-        interval = str(result.best_interval or self.settings.kline_interval)
+        interval = _optimization_result_interval(result)
         latest_backtest = self._best_available_auto_trade_backtest_for_display(result)
         if latest_backtest is None:
             return None
@@ -6359,7 +6365,7 @@ class AltReversalTraderWindow(QMainWindow):
         result: OptimizationResult,
         current_price: Optional[float] = None,
     ) -> Optional[Tuple[str, int, str]]:
-        interval = str(result.best_interval or self.settings.kline_interval)
+        interval = _optimization_result_interval(result)
         key = self._symbol_interval_key(result.symbol, interval)
         side, zone, kind = self._actionable_signal(result.symbol, interval)
         if side and zone > 0 and kind:
@@ -6397,7 +6403,7 @@ class AltReversalTraderWindow(QMainWindow):
         return None
 
     def _optimized_result_preview_signal(self, result: OptimizationResult) -> Optional[Tuple[str, int]]:
-        interval = str(result.best_interval or self.settings.kline_interval)
+        interval = _optimization_result_interval(result)
         side, zone = self._engine_entry_signal(result.symbol, interval, mode="preview")
         if not side or zone <= 0:
             return None
@@ -6490,7 +6496,7 @@ class AltReversalTraderWindow(QMainWindow):
         entry_count = 0
         favorable_rows: List[Tuple[str, str, Optional[float], Optional[int]]] = []
         for row, result in enumerate(ordered):
-            result_interval = result.best_interval or self.settings.kline_interval
+            result_interval = _optimization_result_interval(result)
             current_price = price_map.get(result.symbol)
             favorable_zone = self._optimized_result_favorable_zone(result, current_price)
             actionable_signal = self._optimized_result_actionable_signal(result, current_price)
@@ -6528,7 +6534,7 @@ class AltReversalTraderWindow(QMainWindow):
         favorable_rows: List[Tuple[str, str, Optional[float], Optional[int]]] = []
         for row, result in enumerate(ordered):
             metrics = result.best_backtest.metrics
-            result_interval = result.best_interval or self.settings.kline_interval
+            result_interval = _optimization_result_interval(result)
             current_price = price_map.get(result.symbol)
             favorable_zone = self._optimized_result_favorable_zone(result, current_price)
             actionable_signal = self._optimized_result_actionable_signal(result, current_price)
@@ -6787,20 +6793,20 @@ class AltReversalTraderWindow(QMainWindow):
         candidate: CandidateSymbol = result["candidate"]
         optimization: OptimizationResult = result["optimization"]
         history: pd.DataFrame = result["history"]
-        interval = optimization.best_interval or self.settings.kline_interval
+        interval = _optimization_result_interval(optimization)
         self._advance_backtest_progress(candidate.symbol, interval)
-        cache_key = self._symbol_interval_key(candidate.symbol, optimization.best_interval or self.settings.kline_interval)
+        cache_key = self._symbol_interval_key(candidate.symbol, interval)
         if self.preserve_lists_during_refresh:
             self.pending_optimized_results[cache_key] = optimization
-            self._set_pending_history_frame(candidate.symbol, history, optimization.best_interval or self.settings.kline_interval)
+            self._set_pending_history_frame(candidate.symbol, history, interval)
             self.pending_backtest_cache[cache_key] = optimization.best_backtest
             self.pending_chart_indicator_cache[cache_key] = _chart_indicators_from_backtest(optimization.best_backtest)
             return
         self.backtest_cache[cache_key] = optimization.best_backtest
         self.chart_indicator_cache[cache_key] = _chart_indicators_from_backtest(optimization.best_backtest)
         self.optimized_results[cache_key] = optimization
-        self._set_history_frame(candidate.symbol, history, optimization.best_interval or self.settings.kline_interval)
-        self._mark_history_refreshed(candidate.symbol, time.time(), optimization.best_interval or self.settings.kline_interval)
+        self._set_history_frame(candidate.symbol, history, interval)
+        self._mark_history_refreshed(candidate.symbol, time.time(), interval)
         self._prune_caches()
         self._schedule_optimized_table_refresh()
         if candidate.symbol in self.auto_close_enabled_symbols:
@@ -7536,7 +7542,7 @@ class AltReversalTraderWindow(QMainWindow):
         if optimization:
             lines.append("")
             lines.append(
-                f"Best Interval: {optimization.best_interval or self.current_interval}"
+                f"Best Interval: {_optimization_result_interval(optimization)}"
             )
             lines.append(
                 f"Optimization: {optimization.combinations_tested} combos"

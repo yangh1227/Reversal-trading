@@ -1346,7 +1346,42 @@ def _stream_indicator_frame(
 
 def _rma_series(series: pd.Series, length: int) -> pd.Series:
     adjusted_length = max(1, int(length))
-    return series.astype(float).ewm(alpha=1.0 / adjusted_length, adjust=False, min_periods=adjusted_length).mean()
+    values = series.astype(float).to_numpy(dtype=float, copy=False)
+    result = np.full(len(values), np.nan, dtype=float)
+    if not len(values):
+        return pd.Series(result, index=series.index, dtype=float)
+    alpha = 1.0 / adjusted_length
+    rolling_sum = 0.0
+    previous = float("nan")
+    for index, value in enumerate(values):
+        if not np.isfinite(value):
+            continue
+        rolling_sum += value
+        if index + 1 < adjusted_length:
+            continue
+        if not math.isfinite(previous):
+            previous = rolling_sum / adjusted_length
+        else:
+            previous = (alpha * value) + ((1.0 - alpha) * previous)
+        result[index] = previous
+        rolling_sum -= values[index + 1 - adjusted_length]
+    return pd.Series(result, index=series.index, dtype=float)
+
+
+def _ema_series(series: pd.Series, length: int) -> pd.Series:
+    adjusted_length = max(1, int(length))
+    values = series.astype(float).to_numpy(dtype=float, copy=False)
+    result = np.full(len(values), np.nan, dtype=float)
+    if not len(values):
+        return pd.Series(result, index=series.index, dtype=float)
+    alpha = 2.0 / (adjusted_length + 1.0)
+    previous = float("nan")
+    for index, value in enumerate(values):
+        if not np.isfinite(value):
+            continue
+        previous = value if not math.isfinite(previous) else (alpha * value) + ((1.0 - alpha) * previous)
+        result[index] = previous
+    return pd.Series(result, index=series.index, dtype=float)
 
 
 def _compute_keltner_indicators(
@@ -1360,7 +1395,7 @@ def _compute_keltner_indicators(
     length = max(1, int(settings.keltner_length))
     atr_length = max(1, int(settings.keltner_atr_length))
     if bool(settings.keltner_use_ema):
-        basis = src.ewm(span=length, adjust=False, min_periods=length).mean()
+        basis = _ema_series(src, length)
     else:
         basis = src.rolling(length, min_periods=length).mean()
     prev_close = src.shift(1)

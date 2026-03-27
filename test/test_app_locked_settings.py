@@ -21,6 +21,16 @@ def _window_method_node(method_name: str) -> ast.FunctionDef:
     raise AssertionError(f"AltReversalTraderWindow.{method_name} not found")
 
 
+def _class_method_node(class_name: str, method_name: str) -> ast.FunctionDef:
+    module = _load_app_module_ast()
+    for node in module.body:
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == method_name:
+                    return item
+    raise AssertionError(f"{class_name}.{method_name} not found")
+
+
 def _call_has_locked_settings_keyword(call: ast.Call) -> bool:
     for keyword in call.keywords:
         if keyword.arg != "prefer_locked_position_settings":
@@ -65,6 +75,25 @@ def test_handle_trade_engine_event_reloads_auto_trade_with_locked_settings() -> 
 
     assert matching_calls, "_handle_trade_engine_event should call _request_symbol_load"
     assert any(_call_has_locked_settings_keyword(call) for call in matching_calls)
+
+
+def test_optimize_worker_defaults_candidate_backtests_to_one_minute() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _class_method_node("OptimizeWorker", "_interval_candidates"),
+    ) or ""
+
+    assert 'return ["1m", "2m"]' in source_segment
+    assert "return [CANDIDATE_DEFAULT_INTERVAL]" in source_segment
+
+
+def test_candidate_table_rows_store_one_minute_interval_payload() -> None:
+    source_segment = ast.get_source_segment(
+        APP_PATH.read_text(encoding="utf-8"),
+        _window_method_node("update_candidate_table"),
+    ) or ""
+
+    assert "item.setData(USER_ROLE, (candidate.symbol, CANDIDATE_DEFAULT_INTERVAL))" in source_segment
 
 
 def test_engine_signal_event_auto_focuses_chart_when_favorable_price_toggle_is_off() -> None:
