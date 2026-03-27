@@ -18,6 +18,7 @@ from alt_reversal_trader.binance_futures import PositionSnapshot
 from alt_reversal_trader.config import DEFAULT_HISTORY_DAYS, StrategySettings
 from alt_reversal_trader.strategy import BacktestCursor, BacktestResult, StrategyMetrics, TradeRecord, run_backtest
 from alt_reversal_trader.trade_engine import (
+    EngineOrderFailedEvent,
     EngineSignalEvent,
     EngineSyncCommand,
     EngineWatchlistItem,
@@ -184,6 +185,39 @@ def test_evaluate_auto_trade_candidate_reports_favorable_actionable_signal() -> 
     assert result.signal_zone == 2
     assert result.signal_kind == "favorable"
     assert result.candidate["signal_kind"] == "favorable"
+
+
+def test_evaluate_auto_trade_candidate_keeps_favorable_additional_entry_alive_without_real_exit_trade() -> None:
+    backtest = make_signal_backtest(
+        zone=2,
+        signal_time="2026-01-01 00:15:00",
+        latest_time="2026-01-01 00:16:00",
+        position_qty=1.0,
+    )
+    backtest = replace(
+        backtest,
+        latest_state={
+            "trend_to_short": True,
+            "final_bear": True,
+        },
+    )
+    result = evaluate_auto_trade_candidate(
+        symbol="TESTUSDT",
+        interval="1m",
+        score=7.0,
+        strategy_settings=StrategySettings(),
+        latest_backtest=backtest,
+        current_price=95.0,
+        open_position=make_position(),
+        remembered_interval="1m",
+        filled_fraction=0.0,
+        remembered_cursor_entry_time=None,
+    )
+
+    assert result.candidate is not None
+    assert result.signal_side == "long"
+    assert result.signal_zone == 2
+    assert result.signal_kind == "favorable"
 
 
 def test_trade_engine_emits_actionable_signal_event_for_favorable_entry() -> None:
@@ -874,6 +908,31 @@ def test_trade_engine_drops_symbol_after_auto_close_reports_no_open_position() -
     assert "TESTUSDT" not in engine.auto_close_last_attempt_at
 
 
+def test_trade_engine_emits_failed_event_when_pending_order_times_out() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    events: list[object] = []
+    engine.emit = lambda event: events.append(event)
+    engine.pending_order_symbols["TESTUSDT"] = trade_engine_module._PendingOrderState(
+        started_at=100.0,
+        interval="1m",
+        auto_close=False,
+        auto_trade=False,
+    )
+    original_time = trade_engine_module.time.time
+    trade_engine_module.time.time = lambda: 100.0 + trade_engine_module.PENDING_ORDER_TIMEOUT_SECONDS + 1.0
+    try:
+        engine._expire_stale_pending_orders()
+    finally:
+        trade_engine_module.time.time = original_time
+
+    failed_events = [event for event in events if isinstance(event, EngineOrderFailedEvent)]
+    assert len(failed_events) == 1
+    assert failed_events[0].symbol == "TESTUSDT"
+    assert failed_events[0].interval == "1m"
+    assert "timed out" in failed_events[0].message
+    assert "TESTUSDT" not in engine.pending_order_symbols
+
+
 def test_trade_engine_uses_rest_price_when_stream_price_is_stale() -> None:
     engine = _TradeEngine(mp.Queue(), mp.Queue())
     engine.auto_trade_enabled = True
@@ -1267,7 +1326,7 @@ def test_trade_engine_skips_stale_confirmed_signal_without_matching_trigger_bar(
     assert submitted == []
 
 
-def test_trade_engine_skips_favorable_reentry_after_latest_state_exit_signal() -> None:
+def test_trade_engine_keeps_favorable_entry_alive_without_real_exit_trade_even_if_latest_state_flips() -> None:
     engine = _TradeEngine(mp.Queue(), mp.Queue())
     engine.auto_trade_enabled = True
     engine.client = FakeTickerClient({"TESTUSDT": 110.0})
@@ -1291,7 +1350,9 @@ def test_trade_engine_skips_favorable_reentry_after_latest_state_exit_signal() -
 
     engine._evaluate_auto_trade()
 
-    assert submitted == []
+    assert len(submitted) == 1
+    assert submitted[0]["side"] == "SELL"
+    assert round(float(submitted[0]["fraction"]), 2) == 0.50
 
 
 def test_order_executor_formats_insufficient_margin_errors_for_logs() -> None:
@@ -1488,7 +1549,7 @@ def test_trade_engine_skips_stale_signal_after_exit_until_new_entry_signal() -> 
     assert submitted == []
 
 
-def test_trade_engine_skips_new_short_entry_after_opposite_exit_flags_are_set() -> None:
+def test_trade_engine_keeps_new_short_entry_alive_without_real_exit_trade_even_if_opposite_flags_are_set() -> None:
     engine = _TradeEngine(mp.Queue(), mp.Queue())
     engine.auto_trade_enabled = True
     engine.client = FakeTickerClient({"TESTUSDT": 110.0})
@@ -1525,7 +1586,9 @@ def test_trade_engine_skips_new_short_entry_after_opposite_exit_flags_are_set() 
 
     engine._evaluate_auto_trade()
 
-    assert submitted == []
+    assert len(submitted) == 1
+    assert submitted[0]["side"] == "SELL"
+    assert round(float(submitted[0]["fraction"]), 2) == 0.50
 
 
 def test_trade_engine_limits_stale_short_entry_to_s2_when_price_is_between_s2_and_s3() -> None:

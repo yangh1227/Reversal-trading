@@ -142,6 +142,7 @@ def test_close_all_positions_sends_engine_close_all_command() -> None:
     source_segment = ast.get_source_segment(APP_PATH.read_text(encoding="utf-8"), method) or ""
 
     assert "EngineCloseAllPositionsCommand()" in source_segment
+    assert "self.order_pending_started_at = time.time()" in source_segment
     assert 'self.statusBar().showMessage("전체 포지션 청산 처리 중...", 3000)' in source_segment
     assert 'self.show_warning("청산할 포지션이 없습니다.")' in source_segment
 
@@ -587,7 +588,10 @@ def test_account_refresh_recovers_stale_auto_trade_pending_state() -> None:
     assert "self.order_worker_is_auto_trade" in helper_source
     assert "pending_symbol in open_symbols" in helper_source
     assert "pending_interval = str(self.pending_open_order_interval or \"\").strip()" in helper_source
+    assert "pending_age = (" in helper_source
     assert "self._remember_position_interval(pending_symbol, pending_interval, persist=False)" in helper_source
+    assert 'if pending_symbol == "*" and not open_symbols:' in helper_source
+    assert "if pending_age >= ORDER_PENDING_RECOVERY_SECONDS:" in helper_source
     assert "self._set_order_buttons_enabled(True)" in helper_source
     assert "self._recover_stale_auto_trade_pending_state(open_symbols)" in completed_source
 

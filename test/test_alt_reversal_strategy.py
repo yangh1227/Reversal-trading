@@ -499,20 +499,24 @@ def test_active_auto_trade_signal_clears_stale_entry_after_exit_signal() -> None
     assert signal is None
 
 
-def test_active_auto_trade_signal_clears_stale_entry_after_latest_state_exit() -> None:
+def test_active_auto_trade_signal_keeps_entry_alive_without_real_exit_trade_even_if_latest_state_flips() -> None:
     backtest = make_flat_signal_backtest_with_latest_state_exit()
 
     signal = active_auto_trade_signal(backtest)
 
-    assert signal is None
+    assert signal is not None
+    assert signal["side"] == "short"
+    assert signal["zone"] == 2
 
 
-def test_active_auto_trade_signal_clears_stale_entry_after_historical_indicator_exit() -> None:
+def test_active_auto_trade_signal_keeps_entry_alive_without_real_exit_trade_even_if_indicator_exit_appears() -> None:
     backtest = make_flat_signal_backtest_with_historical_indicator_exit()
 
     signal = active_auto_trade_signal(backtest)
 
-    assert signal is None
+    assert signal is not None
+    assert signal["side"] == "short"
+    assert signal["zone"] == 2
 
 
 def test_parameter_grid_filters_invalid_combinations() -> None:

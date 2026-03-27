@@ -328,12 +328,6 @@ def evaluate_auto_trade_candidate(
         return AutoTradeEvaluationResult()
     if not has_fresh_confirmed_entry and (current_price is None or current_price <= 0):
         return AutoTradeEvaluationResult()
-    latest_state = latest_backtest.latest_state
-    if latest_state and open_position is not None:
-        if side == "long" and (bool(latest_state.get("trend_to_short")) or bool(latest_state.get("final_bear"))):
-            return AutoTradeEvaluationResult()
-        if side == "short" and (bool(latest_state.get("trend_to_long")) or bool(latest_state.get("final_bull"))):
-            return AutoTradeEvaluationResult()
     if open_position is not None:
         position_side = "long" if float(open_position.amount) > 0 else "short"
         if side != position_side:

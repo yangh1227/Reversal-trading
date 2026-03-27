@@ -140,6 +140,7 @@ PERFORMANCE_LOG_THRESHOLD_MS = 100.0
 AUTO_TRADE_INTERVAL_MS = 1_000
 AUTO_CLOSE_RETRY_INTERVAL_MS = 10_000
 TRADE_ENGINE_POLL_INTERVAL_MS = 100
+ORDER_PENDING_RECOVERY_SECONDS = 35.0
 _SNAPSHOT_KEEP = object()
 OPTIMIZED_TABLE_FAVORABLE_ROW_COLOR = "#d8f0de"
 OPTIMIZED_TABLE_SIGNAL_ROW_COLOR = "#f7dddd"
@@ -1570,6 +1571,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_trade_requested = False
         self.auto_close_retry_timer = QTimer(self)
         self.auto_trade_timer = QTimer(self)
+        self.order_pending_started_at = 0.0
         self.auto_trade_entry_pending_symbol: Optional[str] = None
         self.auto_trade_entry_pending_at: float = 0.0
         self.auto_trade_entry_pending_fraction = 0.0
@@ -3068,6 +3070,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_trade_enabled = False
         self.auto_trade_requested = requested_auto_trade
         self.engine_order_pending = False
+        self.order_pending_started_at = 0.0
         self.trade_engine_poll_timer.stop()
         if self.trade_engine is not None:
             self.trade_engine.stop()
@@ -3092,6 +3095,7 @@ class AltReversalTraderWindow(QMainWindow):
             return
         if isinstance(event, EngineOrderSubmittedEvent):
             self.engine_order_pending = True
+            self.order_pending_started_at = time.time()
             self.order_worker_symbol = event.symbol
             self.order_worker_is_auto_close = bool(event.auto_close)
             self.order_worker_is_auto_trade = bool(event.auto_trade)
@@ -3147,6 +3151,7 @@ class AltReversalTraderWindow(QMainWindow):
             return
         if isinstance(event, EngineOrderCompletedEvent):
             self.engine_order_pending = False
+            self.order_pending_started_at = 0.0
             self.order_worker_symbol = event.symbol
             self.order_worker_is_auto_close = bool(event.auto_close)
             self.order_worker_is_auto_trade = bool(event.auto_trade)
@@ -3175,6 +3180,7 @@ class AltReversalTraderWindow(QMainWindow):
             return
         if isinstance(event, EngineOrderFailedEvent):
             self.engine_order_pending = False
+            self.order_pending_started_at = 0.0
             self.order_worker_symbol = event.symbol
             self.order_worker_is_auto_close = bool(event.auto_close)
             self.order_worker_is_auto_trade = bool(event.auto_trade)
@@ -7520,6 +7526,11 @@ class AltReversalTraderWindow(QMainWindow):
     def _recover_stale_auto_trade_pending_state(self, open_symbols: set[str]) -> None:
         pending_symbol = str(self.order_worker_symbol or "").strip().upper()
         pending_interval = str(self.pending_open_order_interval or "").strip()
+        pending_age = (
+            max(0.0, time.time() - float(self.order_pending_started_at))
+            if self.order_pending_started_at > 0
+            else 0.0
+        )
         if (
             self.engine_order_pending
             and self.order_worker_is_auto_trade
@@ -7533,11 +7544,63 @@ class AltReversalTraderWindow(QMainWindow):
             self.order_worker_is_auto_close = False
             self.order_worker_is_auto_trade = False
             self.pending_open_order_interval = None
+            self.order_pending_started_at = 0.0
             self.auto_trade_entry_pending_symbol = None
             self.auto_trade_entry_pending_fraction = 0.0
             self.auto_trade_entry_pending_cursor_time = None
             self._set_order_buttons_enabled(True)
             self.log(f"{pending_symbol} 자동매매 pending 상태를 계좌 동기화로 복구했습니다.")
+            return
+        if not self.engine_order_pending or not pending_symbol:
+            return
+        if pending_symbol == "*" and not open_symbols:
+            self.engine_order_pending = False
+            self.order_worker_symbol = None
+            self.order_worker_is_auto_close = False
+            self.order_worker_is_auto_trade = False
+            self.pending_open_order_interval = None
+            self.order_pending_started_at = 0.0
+            self._set_order_buttons_enabled(True)
+            self.log("전체청산 pending 상태를 계좌 동기화로 복구했습니다.")
+            return
+        if (
+            not self.order_worker_is_auto_close
+            and not self.order_worker_is_auto_trade
+            and pending_interval in APP_INTERVAL_OPTIONS
+            and pending_symbol in open_symbols
+        ):
+            self._remember_position_interval(pending_symbol, pending_interval, persist=False)
+            self.engine_order_pending = False
+            self.order_worker_symbol = None
+            self.order_worker_is_auto_close = False
+            self.order_worker_is_auto_trade = False
+            self.pending_open_order_interval = None
+            self.order_pending_started_at = 0.0
+            self._set_order_buttons_enabled(True)
+            self.log(f"{pending_symbol} 수동주문 pending 상태를 계좌 동기화로 복구했습니다.")
+            return
+        if pending_symbol != "*" and pending_interval not in APP_INTERVAL_OPTIONS and pending_symbol not in open_symbols:
+            self.engine_order_pending = False
+            self.order_worker_symbol = None
+            self.order_worker_is_auto_close = False
+            self.order_worker_is_auto_trade = False
+            self.pending_open_order_interval = None
+            self.order_pending_started_at = 0.0
+            self._set_order_buttons_enabled(True)
+            self.log(f"{pending_symbol} 청산 pending 상태를 계좌 동기화로 복구했습니다.")
+            return
+        if pending_age >= ORDER_PENDING_RECOVERY_SECONDS:
+            self.engine_order_pending = False
+            self.order_worker_symbol = None
+            self.order_worker_is_auto_close = False
+            self.order_worker_is_auto_trade = False
+            self.pending_open_order_interval = None
+            self.order_pending_started_at = 0.0
+            self.auto_trade_entry_pending_symbol = None
+            self.auto_trade_entry_pending_fraction = 0.0
+            self.auto_trade_entry_pending_cursor_time = None
+            self._set_order_buttons_enabled(True)
+            self.log(f"{pending_symbol} 주문 pending timeout을 복구했습니다.")
 
     def refresh_account_info(self) -> None:
         self._sync_settings()
@@ -7745,6 +7808,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.order_worker_is_auto_close = False
         self.order_worker_is_auto_trade = auto_trade
         self.engine_order_pending = True
+        self.order_pending_started_at = time.time()
         self.pending_open_order_interval = target_interval
         if auto_trade:
             self.auto_trade_entry_pending_symbol = target_symbol
@@ -7777,6 +7841,7 @@ class AltReversalTraderWindow(QMainWindow):
             )
         except Exception as exc:
             self.engine_order_pending = False
+            self.order_pending_started_at = 0.0
             self._set_order_buttons_enabled(True)
             message = f"Trade engine open order failed: {exc}"
             self._on_order_failed(message)
@@ -7826,6 +7891,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.order_worker_is_auto_close = False
         self.order_worker_is_auto_trade = False
         self.engine_order_pending = True
+        self.order_pending_started_at = time.time()
         self.pending_open_order_interval = None
         self._set_order_buttons_enabled(False)
         self.statusBar().showMessage("전체 포지션 청산 처리 중...", 3000)
@@ -7833,6 +7899,7 @@ class AltReversalTraderWindow(QMainWindow):
             self.trade_engine.send(EngineCloseAllPositionsCommand())
         except Exception as exc:
             self.engine_order_pending = False
+            self.order_pending_started_at = 0.0
             self._set_order_buttons_enabled(True)
             self._on_order_failed(f"Trade engine close-all failed: {exc}")
 
@@ -7858,6 +7925,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.order_worker_is_auto_close = auto_close_reason is not None
         self.order_worker_is_auto_trade = False
         self.engine_order_pending = True
+        self.order_pending_started_at = time.time()
         self.pending_open_order_interval = None
         self._set_order_buttons_enabled(False)
         if auto_close_reason is None:
@@ -7875,6 +7943,7 @@ class AltReversalTraderWindow(QMainWindow):
             )
         except Exception as exc:
             self.engine_order_pending = False
+            self.order_pending_started_at = 0.0
             self._set_order_buttons_enabled(True)
             self._on_order_failed(f"Trade engine close order failed: {exc}")
             return False
@@ -7885,6 +7954,7 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _on_order_completed(self, payload: object) -> None:
         self.engine_order_pending = False
+        self.order_pending_started_at = 0.0
         self._set_order_buttons_enabled(True)
         result = dict(payload)
         message_text = str(result.get("message", ""))
@@ -7931,6 +8001,7 @@ class AltReversalTraderWindow(QMainWindow):
 
     def _on_order_failed(self, message: str) -> None:
         self.engine_order_pending = False
+        self.order_pending_started_at = 0.0
         order_symbol = self.order_worker_symbol
         was_auto_close = self.order_worker_is_auto_close
         was_auto_trade = self.order_worker_is_auto_trade

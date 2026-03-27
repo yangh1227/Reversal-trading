@@ -227,6 +227,14 @@ class _OrderExecutionResult:
     no_open_position: bool = False
 
 
+@dataclass(frozen=True)
+class _PendingOrderState:
+    started_at: float
+    interval: Optional[str]
+    auto_close: bool
+    auto_trade: bool
+
+
 def _fractional_order_margin(balance: BalanceSnapshot, fraction: float, auto_trade: bool) -> float:
     base_balance = float(balance.equity) if auto_trade else float(balance.available_balance)
     return base_balance * float(fraction)
@@ -695,7 +703,7 @@ class _TradeEngine:
         self.auto_trade_cursor_entry_time: Dict[str, pd.Timestamp] = {}
         self.position_strategy_by_symbol: Dict[str, StrategySettings] = {}
         self.applied_leverage_by_symbol: Dict[str, int] = {}
-        self.pending_order_symbols: Dict[str, float] = {}
+        self.pending_order_symbols: Dict[str, _PendingOrderState] = {}
         self.auto_trade_reentry_cooldown_until: Dict[Tuple[str, str], float] = {}
         self.auto_close_last_trigger_time: Dict[str, pd.Timestamp] = {}
         self.auto_close_last_attempt_at: Dict[str, float] = {}
@@ -846,10 +854,21 @@ class _TradeEngine:
 
     def _expire_stale_pending_orders(self) -> None:
         now = time.time()
-        for symbol in list(self.pending_order_symbols):
-            if now - self.pending_order_symbols[symbol] > PENDING_ORDER_TIMEOUT_SECONDS:
+        for symbol, pending_state in list(self.pending_order_symbols.items()):
+            if now - float(pending_state.started_at) > PENDING_ORDER_TIMEOUT_SECONDS:
                 self.pending_order_symbols.pop(symbol, None)
-                self.log(f"{symbol} pending order timed out after {PENDING_ORDER_TIMEOUT_SECONDS}s")
+                action_name = "close" if pending_state.auto_close else "order"
+                message = f"{symbol} {action_name} timed out after {PENDING_ORDER_TIMEOUT_SECONDS:.0f}s"
+                self.log(message)
+                self.emit(
+                    EngineOrderFailedEvent(
+                        symbol=symbol,
+                        message=message,
+                        auto_close=bool(pending_state.auto_close),
+                        auto_trade=bool(pending_state.auto_trade),
+                        interval=pending_state.interval,
+                    )
+                )
         for key, cooldown_until in list(self.auto_trade_reentry_cooldown_until.items()):
             if now >= cooldown_until:
                 self.auto_trade_reentry_cooldown_until.pop(key, None)
@@ -1890,7 +1909,12 @@ class _TradeEngine:
                 )
             )
             return
-        self.pending_order_symbols[symbol] = time.time()
+        self.pending_order_symbols[symbol] = _PendingOrderState(
+            started_at=time.time(),
+            interval=interval,
+            auto_close=False,
+            auto_trade=auto_trade,
+        )
         self.emit(
             EngineOrderSubmittedEvent(
                 symbol=symbol,
@@ -1953,7 +1977,12 @@ class _TradeEngine:
                 )
             )
             return
-        self.pending_order_symbols[symbol] = time.time()
+        self.pending_order_symbols[symbol] = _PendingOrderState(
+            started_at=time.time(),
+            interval=self.position_intervals.get(symbol),
+            auto_close=auto_close,
+            auto_trade=False,
+        )
         self.emit(
             EngineOrderSubmittedEvent(
                 symbol=symbol,
