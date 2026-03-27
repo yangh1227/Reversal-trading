@@ -16,6 +16,16 @@ AUTO_TRADE_FOCUS_SIGNAL_MODE_OPTIONS = ("preview", "confirmed")
 DEFAULT_HISTORY_DAYS = 3
 DEFAULT_CHART_DISPLAY_HOURS = 24
 DEFAULT_OPTIMIZATION_PROFILE_SCALE = 20.0
+STRATEGY_TYPE_OPTIONS = ("mean_reversion", "keltner_trend")
+STRATEGY_TYPE_LABELS = {
+    "mean_reversion": "역추세",
+    "keltner_trend": "켈트너채널(추세)",
+}
+KELTNER_BAND_STYLE_OPTIONS = (
+    "Average True Range",
+    "True Range",
+    "Range",
+)
 QIP_SENSITIVITY_OPTIONS = (
     "1-Ultra Fine Max",
     "2-Ultra Fine",
@@ -69,6 +79,7 @@ def default_optimize_process_count() -> int:
 
 @dataclass(frozen=True)
 class StrategySettings:
+    strategy_type: str = "mean_reversion"
     atr_period: int = 10
     factor: float = 17.0
     zone_sensitivity: float = 8.0
@@ -105,6 +116,25 @@ class StrategySettings:
     use_qtp: bool = True
     beast_mode: bool = True
     entry_size_pct: float = 10.0
+    keltner_length: int = 20
+    keltner_multiplier: float = 2.0
+    keltner_use_ema: bool = True
+    keltner_band_style: str = "Average True Range"
+    keltner_atr_length: int = 10
+
+    def __post_init__(self) -> None:
+        strategy_type = str(self.strategy_type or STRATEGY_TYPE_OPTIONS[0]).strip()
+        if strategy_type not in STRATEGY_TYPE_OPTIONS:
+            strategy_type = STRATEGY_TYPE_OPTIONS[0]
+        object.__setattr__(self, "strategy_type", strategy_type)
+        band_style = str(self.keltner_band_style or KELTNER_BAND_STYLE_OPTIONS[0]).strip()
+        if band_style not in KELTNER_BAND_STYLE_OPTIONS:
+            band_style = KELTNER_BAND_STYLE_OPTIONS[0]
+        object.__setattr__(self, "keltner_band_style", band_style)
+        object.__setattr__(self, "keltner_length", max(1, int(self.keltner_length)))
+        object.__setattr__(self, "keltner_multiplier", max(0.1, float(self.keltner_multiplier)))
+        object.__setattr__(self, "keltner_use_ema", bool(self.keltner_use_ema))
+        object.__setattr__(self, "keltner_atr_length", max(1, int(self.keltner_atr_length)))
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -205,6 +235,7 @@ class AppSettings:
     optimization_min_score: float = 70.0
     optimization_min_return_pct: float = 0.0
     max_grid_combinations: int = 300
+    enable_parameter_optimization: bool = True
     scan_workers: int = 4
     optimize_processes: int = field(default_factory=default_optimize_process_count)
     optimize_timeframe: bool = True
@@ -226,6 +257,7 @@ class AppSettings:
             self.optimization_rank_mode = OPTIMIZATION_RANK_MODE_OPTIONS[0]
         self.optimization_min_score = max(0.0, float(self.optimization_min_score))
         self.optimization_min_return_pct = float(self.optimization_min_return_pct)
+        self.enable_parameter_optimization = bool(self.enable_parameter_optimization)
         self.scan_workers = max(1, int(self.scan_workers))
         self.optimize_processes = max(1, int(self.optimize_processes))
         self.auto_refresh_minutes = max(1, int(self.auto_refresh_minutes))
@@ -279,6 +311,7 @@ class AppSettings:
             "optimization_min_score": self.optimization_min_score,
             "optimization_min_return_pct": self.optimization_min_return_pct,
             "max_grid_combinations": self.max_grid_combinations,
+            "enable_parameter_optimization": self.enable_parameter_optimization,
             "scan_workers": self.scan_workers,
             "optimize_processes": self.optimize_processes,
             "optimize_timeframe": self.optimize_timeframe,
@@ -389,45 +422,57 @@ class ParameterSpec:
     optimize_step: Any = None
     optimize_priority: int = 5
     optimize_choice_radius: int = 1
+    strategies: Sequence[str] = ()
+
+
+def parameter_spec_applies(spec: ParameterSpec, strategy_type: str) -> bool:
+    if not spec.strategies:
+        return True
+    return str(strategy_type or STRATEGY_TYPE_OPTIONS[0]) in tuple(spec.strategies)
 
 
 PARAMETER_SPECS: List[ParameterSpec] = [
-    ParameterSpec("atr_period", "ATR Length", "core", "int", 2, 100, 1, optimize_default=True, optimize_span=4, optimize_step=1, optimize_priority=3),
-    ParameterSpec("factor", "Factor", "core", "float", 0.5, 20.0, 0.1, optimize_default=True, optimize_span=2.0, optimize_step=0.1, optimize_priority=1),
-    ParameterSpec("zone_sensitivity", "Zone Sensitivity", "core", "float", 0.1, 10.0, 0.1, optimize_default=True, optimize_span=1.5, optimize_step=0.1, optimize_priority=1),
-    ParameterSpec("entry_size_pct", "Entry Size %", "core", "float", 1.0, 100.0, 1.0, optimize_span=6.0, optimize_step=2.0, optimize_priority=8),
-    ParameterSpec("sensitivity_mode", "QIP Sensitivity Mode", "qip", "choice", choices=QIP_SENSITIVITY_OPTIONS, optimize_choice_radius=2, optimize_priority=7),
-    ParameterSpec("zz_len_raw", "QIP Pivot Length", "qip", "int", 2, 50, 1, optimize_default=True, optimize_span=2, optimize_step=1, optimize_priority=2),
-    ParameterSpec("atr_mult_raw", "QIP ATR Multiplier", "qip", "float", 0.1, 5.0, 0.1, optimize_default=True, optimize_span=0.5, optimize_step=0.1, optimize_priority=2),
-    ParameterSpec("use_volume", "QIP Volume Filter", "qip", "bool", optimize_priority=9),
-    ParameterSpec("use_rsi_div", "QIP RSI Divergence", "qip", "bool", optimize_priority=9),
-    ParameterSpec("use_macd_div", "QIP MACD Divergence", "qip", "bool", optimize_priority=9),
-    ParameterSpec("use_ema_conf", "QIP EMA Confirm", "qip", "bool", optimize_priority=9),
-    ParameterSpec("min_score", "QIP Min Score", "qip", "int", 1, 5, 1, optimize_default=True, optimize_span=1, optimize_step=1, optimize_priority=9),
-    ParameterSpec("qip_rsi_len", "QIP RSI Length", "qip", "int", 2, 50, 1, optimize_span=4, optimize_step=1, optimize_priority=7),
-    ParameterSpec("vol_ma_len", "QIP Volume MA", "qip", "int", 2, 100, 1, optimize_span=8, optimize_step=2, optimize_priority=7),
-    ParameterSpec("qip_ema_fast", "QIP EMA Fast", "qip", "int", 2, 200, 1, optimize_span=8, optimize_step=2, optimize_priority=6),
-    ParameterSpec("qip_ema_slow", "QIP EMA Slow", "qip", "int", 3, 400, 1, optimize_span=16, optimize_step=4, optimize_priority=7),
-    ParameterSpec("qip_use_rsi_zone", "QIP RSI Zone", "qip", "bool", optimize_priority=9),
-    ParameterSpec("qip_rsi_bull_max", "QIP RSI Bull Max", "qip", "int", 10, 60, 1, optimize_span=6, optimize_step=2, optimize_priority=8),
-    ParameterSpec("qip_rsi_bear_min", "QIP RSI Bear Min", "qip", "int", 40, 90, 1, optimize_span=6, optimize_step=2, optimize_priority=8),
-    ParameterSpec("qtp_sensitivity", "QTP Sensitivity", "qtp", "int", 1, 100, 1, optimize_default=True, optimize_span=15, optimize_step=5, optimize_priority=4),
-    ParameterSpec("qtp_ema_fast_len", "QTP EMA Fast", "qtp", "int", 1, 100, 1, optimize_span=8, optimize_step=2, optimize_priority=7),
-    ParameterSpec("qtp_ema_slow_len", "QTP EMA Slow", "qtp", "int", 2, 200, 1, optimize_span=16, optimize_step=4, optimize_priority=7),
-    ParameterSpec("qtp_use_trend", "QTP Trend Filter", "qtp", "bool", optimize_priority=9),
-    ParameterSpec("qtp_rsi_len", "QTP RSI Length", "qtp", "int", 2, 50, 1, optimize_span=4, optimize_step=1, optimize_priority=8),
-    ParameterSpec("qtp_stoch_len", "QTP Stoch Length", "qtp", "int", 2, 50, 1, optimize_span=4, optimize_step=1, optimize_priority=8),
-    ParameterSpec("qtp_atr_len", "QTP ATR Length", "qtp", "int", 1, 100, 1, optimize_span=4, optimize_step=1, optimize_priority=8),
-    ParameterSpec("qtp_dev_lookback", "QTP Deviation Lookback", "qtp", "int", 10, 200, 1, optimize_span=15, optimize_step=5, optimize_priority=8),
-    ParameterSpec("qtp_vol_len", "QTP Volume SMA", "qtp", "int", 2, 100, 1, optimize_span=8, optimize_step=2, optimize_priority=8),
-    ParameterSpec("qtp_min_pvt_left", "QTP Min Pivot Left", "qtp", "int", 1, 20, 1, optimize_span=2, optimize_step=1, optimize_priority=9),
-    ParameterSpec("qtp_max_pvt_left", "QTP Max Pivot Left", "qtp", "int", 1, 30, 1, optimize_span=3, optimize_step=1, optimize_priority=9),
-    ParameterSpec("qtp_use_rsi_zone", "QTP RSI Zone", "qtp", "bool", optimize_priority=9),
-    ParameterSpec("qtp_rsi_bull_max", "QTP RSI Bull Max", "qtp", "int", 10, 50, 1, optimize_span=5, optimize_step=1, optimize_priority=8),
-    ParameterSpec("qtp_rsi_bear_min", "QTP RSI Bear Min", "qtp", "int", 50, 90, 1, optimize_span=5, optimize_step=1, optimize_priority=8),
-    ParameterSpec("use_qip", "Enable QIP", "switches", "bool", optimize_priority=10),
-    ParameterSpec("use_qtp", "Enable QTP", "switches", "bool", optimize_priority=10),
-    ParameterSpec("beast_mode", "Beast Mode", "switches", "bool", optimize_priority=10),
+    ParameterSpec("atr_period", "ATR Length", "core", "int", 2, 100, 1, optimize_default=True, optimize_span=4, optimize_step=1, optimize_priority=3, strategies=("mean_reversion",)),
+    ParameterSpec("factor", "Factor", "core", "float", 0.5, 20.0, 0.1, optimize_default=True, optimize_span=2.0, optimize_step=0.1, optimize_priority=1, strategies=("mean_reversion",)),
+    ParameterSpec("zone_sensitivity", "Zone Sensitivity", "core", "float", 0.1, 10.0, 0.1, optimize_default=True, optimize_span=1.5, optimize_step=0.1, optimize_priority=1, strategies=("mean_reversion",)),
+    ParameterSpec("entry_size_pct", "Entry Size %", "core", "float", 1.0, 100.0, 1.0, optimize_span=6.0, optimize_step=2.0, optimize_priority=8, strategies=STRATEGY_TYPE_OPTIONS),
+    ParameterSpec("sensitivity_mode", "QIP Sensitivity Mode", "qip", "choice", choices=QIP_SENSITIVITY_OPTIONS, optimize_choice_radius=2, optimize_priority=7, strategies=("mean_reversion",)),
+    ParameterSpec("zz_len_raw", "QIP Pivot Length", "qip", "int", 2, 50, 1, optimize_default=True, optimize_span=2, optimize_step=1, optimize_priority=2, strategies=("mean_reversion",)),
+    ParameterSpec("atr_mult_raw", "QIP ATR Multiplier", "qip", "float", 0.1, 5.0, 0.1, optimize_default=True, optimize_span=0.5, optimize_step=0.1, optimize_priority=2, strategies=("mean_reversion",)),
+    ParameterSpec("use_volume", "QIP Volume Filter", "qip", "bool", optimize_priority=9, strategies=("mean_reversion",)),
+    ParameterSpec("use_rsi_div", "QIP RSI Divergence", "qip", "bool", optimize_priority=9, strategies=("mean_reversion",)),
+    ParameterSpec("use_macd_div", "QIP MACD Divergence", "qip", "bool", optimize_priority=9, strategies=("mean_reversion",)),
+    ParameterSpec("use_ema_conf", "QIP EMA Confirm", "qip", "bool", optimize_priority=9, strategies=("mean_reversion",)),
+    ParameterSpec("min_score", "QIP Min Score", "qip", "int", 1, 5, 1, optimize_default=True, optimize_span=1, optimize_step=1, optimize_priority=9, strategies=("mean_reversion",)),
+    ParameterSpec("qip_rsi_len", "QIP RSI Length", "qip", "int", 2, 50, 1, optimize_span=4, optimize_step=1, optimize_priority=7, strategies=("mean_reversion",)),
+    ParameterSpec("vol_ma_len", "QIP Volume MA", "qip", "int", 2, 100, 1, optimize_span=8, optimize_step=2, optimize_priority=7, strategies=("mean_reversion",)),
+    ParameterSpec("qip_ema_fast", "QIP EMA Fast", "qip", "int", 2, 200, 1, optimize_span=8, optimize_step=2, optimize_priority=6, strategies=("mean_reversion",)),
+    ParameterSpec("qip_ema_slow", "QIP EMA Slow", "qip", "int", 3, 400, 1, optimize_span=16, optimize_step=4, optimize_priority=7, strategies=("mean_reversion",)),
+    ParameterSpec("qip_use_rsi_zone", "QIP RSI Zone", "qip", "bool", optimize_priority=9, strategies=("mean_reversion",)),
+    ParameterSpec("qip_rsi_bull_max", "QIP RSI Bull Max", "qip", "int", 10, 60, 1, optimize_span=6, optimize_step=2, optimize_priority=8, strategies=("mean_reversion",)),
+    ParameterSpec("qip_rsi_bear_min", "QIP RSI Bear Min", "qip", "int", 40, 90, 1, optimize_span=6, optimize_step=2, optimize_priority=8, strategies=("mean_reversion",)),
+    ParameterSpec("qtp_sensitivity", "QTP Sensitivity", "qtp", "int", 1, 100, 1, optimize_default=True, optimize_span=15, optimize_step=5, optimize_priority=4, strategies=("mean_reversion",)),
+    ParameterSpec("qtp_ema_fast_len", "QTP EMA Fast", "qtp", "int", 1, 100, 1, optimize_span=8, optimize_step=2, optimize_priority=7, strategies=("mean_reversion",)),
+    ParameterSpec("qtp_ema_slow_len", "QTP EMA Slow", "qtp", "int", 2, 200, 1, optimize_span=16, optimize_step=4, optimize_priority=7, strategies=("mean_reversion",)),
+    ParameterSpec("qtp_use_trend", "QTP Trend Filter", "qtp", "bool", optimize_priority=9, strategies=("mean_reversion",)),
+    ParameterSpec("qtp_rsi_len", "QTP RSI Length", "qtp", "int", 2, 50, 1, optimize_span=4, optimize_step=1, optimize_priority=8, strategies=("mean_reversion",)),
+    ParameterSpec("qtp_stoch_len", "QTP Stoch Length", "qtp", "int", 2, 50, 1, optimize_span=4, optimize_step=1, optimize_priority=8, strategies=("mean_reversion",)),
+    ParameterSpec("qtp_atr_len", "QTP ATR Length", "qtp", "int", 1, 100, 1, optimize_span=4, optimize_step=1, optimize_priority=8, strategies=("mean_reversion",)),
+    ParameterSpec("qtp_dev_lookback", "QTP Deviation Lookback", "qtp", "int", 10, 200, 1, optimize_span=15, optimize_step=5, optimize_priority=8, strategies=("mean_reversion",)),
+    ParameterSpec("qtp_vol_len", "QTP Volume SMA", "qtp", "int", 2, 100, 1, optimize_span=8, optimize_step=2, optimize_priority=8, strategies=("mean_reversion",)),
+    ParameterSpec("qtp_min_pvt_left", "QTP Min Pivot Left", "qtp", "int", 1, 20, 1, optimize_span=2, optimize_step=1, optimize_priority=9, strategies=("mean_reversion",)),
+    ParameterSpec("qtp_max_pvt_left", "QTP Max Pivot Left", "qtp", "int", 1, 30, 1, optimize_span=3, optimize_step=1, optimize_priority=9, strategies=("mean_reversion",)),
+    ParameterSpec("qtp_use_rsi_zone", "QTP RSI Zone", "qtp", "bool", optimize_priority=9, strategies=("mean_reversion",)),
+    ParameterSpec("qtp_rsi_bull_max", "QTP RSI Bull Max", "qtp", "int", 10, 50, 1, optimize_span=5, optimize_step=1, optimize_priority=8, strategies=("mean_reversion",)),
+    ParameterSpec("qtp_rsi_bear_min", "QTP RSI Bear Min", "qtp", "int", 50, 90, 1, optimize_span=5, optimize_step=1, optimize_priority=8, strategies=("mean_reversion",)),
+    ParameterSpec("keltner_length", "KC Length", "keltner", "int", 1, 200, 1, optimize_default=True, optimize_span=10, optimize_step=2, optimize_priority=3, strategies=("keltner_trend",)),
+    ParameterSpec("keltner_multiplier", "KC Multiplier", "keltner", "float", 0.5, 10.0, 0.1, optimize_default=True, optimize_span=1.0, optimize_step=0.1, optimize_priority=2, strategies=("keltner_trend",)),
+    ParameterSpec("keltner_use_ema", "KC Use EMA", "keltner", "bool", optimize_priority=8, strategies=("keltner_trend",)),
+    ParameterSpec("keltner_band_style", "KC Band Style", "keltner", "choice", choices=KELTNER_BAND_STYLE_OPTIONS, optimize_choice_radius=1, optimize_priority=5, strategies=("keltner_trend",)),
+    ParameterSpec("keltner_atr_length", "KC ATR Length", "keltner", "int", 1, 200, 1, optimize_span=6, optimize_step=2, optimize_priority=4, strategies=("keltner_trend",)),
+    ParameterSpec("use_qip", "Enable QIP", "switches", "bool", optimize_priority=10, strategies=("mean_reversion",)),
+    ParameterSpec("use_qtp", "Enable QTP", "switches", "bool", optimize_priority=10, strategies=("mean_reversion",)),
+    ParameterSpec("beast_mode", "Beast Mode", "switches", "bool", optimize_priority=10, strategies=("mean_reversion",)),
 ]
 
 DEFAULT_OPTIMIZE_FLAGS: Dict[str, bool] = {
@@ -464,6 +509,11 @@ DEFAULT_OPTIMIZE_FLAGS: Dict[str, bool] = {
     "qtp_use_rsi_zone": True,
     "qtp_rsi_bull_max": True,
     "qtp_rsi_bear_min": True,
+    "keltner_length": True,
+    "keltner_multiplier": True,
+    "keltner_use_ema": True,
+    "keltner_band_style": True,
+    "keltner_atr_length": True,
     "use_qip": True,
     "use_qtp": True,
     "beast_mode": True,

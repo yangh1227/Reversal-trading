@@ -51,6 +51,24 @@ def make_sample_ohlcv(rows: int = 500) -> pd.DataFrame:
     )
 
 
+def make_keltner_ohlcv() -> pd.DataFrame:
+    rows = [
+        (100.0, 101.0, 99.0, 100.0),
+        (100.0, 101.0, 99.0, 100.0),
+        (100.0, 101.0, 99.0, 100.0),
+        (100.0, 101.0, 99.0, 100.0),
+        (100.0, 102.0, 99.0, 101.0),
+        (101.0, 110.0, 100.0, 109.0),
+        (109.0, 113.0, 108.0, 112.0),
+        (112.0, 113.0, 90.0, 91.0),
+        (91.0, 92.0, 89.0, 90.0),
+    ]
+    frame = pd.DataFrame(rows, columns=["open", "high", "low", "close"])
+    frame["time"] = pd.date_range("2026-01-01", periods=len(frame), freq="min")
+    frame["volume"] = 1000.0
+    return frame[["time", "open", "high", "low", "close", "volume"]]
+
+
 def make_position(symbol: str = "TESTUSDT") -> PositionSnapshot:
     return PositionSnapshot(
         symbol=symbol,
@@ -185,6 +203,72 @@ def test_evaluate_auto_trade_candidate_reports_favorable_actionable_signal() -> 
     assert result.signal_zone == 2
     assert result.signal_kind == "favorable"
     assert result.candidate["signal_kind"] == "favorable"
+
+
+def test_evaluate_auto_trade_candidate_supports_confirmed_keltner_entry() -> None:
+    history = make_keltner_ohlcv().iloc[:7].reset_index(drop=True)
+    settings = StrategySettings(
+        strategy_type="keltner_trend",
+        keltner_length=2,
+        keltner_atr_length=2,
+        keltner_multiplier=0.5,
+        keltner_use_ema=False,
+        keltner_band_style="Average True Range",
+        entry_size_pct=10.0,
+    )
+    backtest = run_backtest(history, settings=settings)
+    signal_time = pd.Timestamp(history["time"].iloc[-1])
+
+    result = evaluate_auto_trade_candidate(
+        symbol="TESTUSDT",
+        interval="1m",
+        score=7.0,
+        strategy_settings=settings,
+        latest_backtest=backtest,
+        current_price=None,
+        open_position=None,
+        remembered_interval=None,
+        filled_fraction=0.0,
+        remembered_cursor_entry_time=None,
+        trigger_symbol="TESTUSDT",
+        trigger_interval="1m",
+        trigger_bar_time=signal_time,
+    )
+
+    assert result.candidate is not None
+    assert result.signal_side == "long"
+    assert result.signal_zone == 1
+    assert result.signal_kind == "confirmed"
+    assert result.candidate["fraction"] == 0.1
+
+
+def test_evaluate_auto_trade_candidate_does_not_offer_favorable_keltner_entry() -> None:
+    history = make_keltner_ohlcv().iloc[:7].reset_index(drop=True)
+    settings = StrategySettings(
+        strategy_type="keltner_trend",
+        keltner_length=2,
+        keltner_atr_length=2,
+        keltner_multiplier=0.5,
+        keltner_use_ema=False,
+        keltner_band_style="Average True Range",
+        entry_size_pct=10.0,
+    )
+    backtest = run_backtest(history, settings=settings)
+
+    result = evaluate_auto_trade_candidate(
+        symbol="TESTUSDT",
+        interval="1m",
+        score=7.0,
+        strategy_settings=settings,
+        latest_backtest=backtest,
+        current_price=109.0,
+        open_position=None,
+        remembered_interval=None,
+        filled_fraction=0.0,
+        remembered_cursor_entry_time=None,
+    )
+
+    assert result.candidate is None
 
 
 def test_evaluate_auto_trade_candidate_keeps_favorable_additional_entry_alive_without_real_exit_trade() -> None:

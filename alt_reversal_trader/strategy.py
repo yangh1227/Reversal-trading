@@ -14,7 +14,7 @@ except Exception:  # pragma: no cover - optional accelerator
     njit = None
     NUMBA_AVAILABLE = False
 
-from .config import StrategySettings
+from .config import KELTNER_BAND_STYLE_OPTIONS, StrategySettings
 
 RESULT_INDICATOR_COLUMNS = [
     "time",
@@ -86,6 +86,23 @@ def incremental_signal_fraction_for_entry(zone: int, previous_zone: int) -> floa
     return max(0.0, target_fraction - previous_fraction)
 
 
+def _strategy_type(settings: StrategySettings) -> str:
+    return str(getattr(settings, "strategy_type", "mean_reversion") or "mean_reversion")
+
+
+def _is_keltner_strategy(settings: StrategySettings) -> bool:
+    return _strategy_type(settings) == "keltner_trend"
+
+
+def _normalized_entry_fraction(settings: StrategySettings) -> float:
+    return max(0.0, min(signal_fraction_for_zone(3), float(settings.entry_size_pct) / 100.0))
+
+
+def _tick_buffer(price: float) -> float:
+    base = abs(float(price))
+    return max(base * 1e-9, 1e-9)
+
+
 @dataclass(frozen=True)
 class TradeRecord:
     side: str
@@ -136,6 +153,10 @@ class BacktestCursor:
     last_entry_signal_side: str
     last_entry_signal_zone: int
     last_equity_value: float
+    last_entry_signal_fraction: float = 0.0
+    pending_long_entry_active: bool = False
+    pending_long_entry_price: float = 0.0
+    pending_long_entry_signal_time: Optional[pd.Timestamp] = None
     indicator_cursor: Optional["IndicatorCursor"] = None
 
 
@@ -282,6 +303,13 @@ def active_entry_price_by_zone(backtest: Optional["BacktestResult"]) -> Dict[int
     cursor = backtest.cursor
     if cursor is None:
         return {}
+    if _is_keltner_strategy(backtest.settings):
+        signal_side = str(getattr(cursor, "last_entry_signal_side", "") or "").lower()
+        signal_zone = int(getattr(cursor, "last_entry_signal_zone", 0) or 0)
+        signal_price = float(getattr(cursor, "last_entry_signal_price", 0.0) or 0.0)
+        if signal_side == "long" and signal_zone == 1 and signal_price > 0:
+            return {1: signal_price}
+        return {}
     active_side = ""
     for event_time, event_label in reversed(list(getattr(backtest, "open_entry_events", ()) or ())):
         event = _entry_event_from_label(event_label, event_time)
@@ -354,6 +382,7 @@ def active_auto_trade_signal(backtest: Optional["BacktestResult"]) -> Optional[D
     latest_exit_time = _latest_effective_exit_time(backtest)
     if latest_exit_time is not None and latest_signal_time is not None and latest_exit_time >= latest_signal_time:
         return None
+    target_fraction = float(getattr(cursor, "last_entry_signal_fraction", 0.0) or 0.0)
     if latest_event is not None:
         zone = int(latest_event["zone"])
         price = float(zone_prices.get(zone, 0.0) or 0.0)
@@ -370,13 +399,18 @@ def active_auto_trade_signal(backtest: Optional["BacktestResult"]) -> Optional[D
             ):
                 price = signal_price
         if price > 0:
+            if target_fraction <= 0.0:
+                target_fraction = signal_fraction_for_zone(zone)
             return {
                 "side": str(latest_event["side"]),
                 "zone": zone,
                 "price": price,
                 "zone_prices": zone_prices,
                 "time": pd.Timestamp(latest_event["bar_time"]),
-                "fraction": signal_fraction_for_zone(zone),
+                "fraction": target_fraction,
+                "target_fraction": target_fraction,
+                "allow_additional_entries": not _is_keltner_strategy(backtest.settings),
+                "supports_favorable_entries": not _is_keltner_strategy(backtest.settings),
                 "cursor_entry_time": pd.Timestamp(cursor.entry_time) if cursor.entry_time is not None else None,
             }
     side = str(getattr(cursor, "last_entry_signal_side", "") or "").lower()
@@ -385,13 +419,18 @@ def active_auto_trade_signal(backtest: Optional["BacktestResult"]) -> Optional[D
     signal_time = _normalize_event_timestamp(getattr(cursor, "last_entry_signal_time", None))
     if side not in {"long", "short"} or zone not in {1, 2, 3} or price <= 0 or signal_time is None:
         return None
+    if target_fraction <= 0.0:
+        target_fraction = signal_fraction_for_zone(zone)
     return {
         "side": side,
         "zone": zone,
         "price": price,
         "zone_prices": zone_prices,
         "time": pd.Timestamp(signal_time),
-        "fraction": signal_fraction_for_zone(zone),
+        "fraction": target_fraction,
+        "target_fraction": target_fraction,
+        "allow_additional_entries": not _is_keltner_strategy(backtest.settings),
+        "supports_favorable_entries": not _is_keltner_strategy(backtest.settings),
         "cursor_entry_time": pd.Timestamp(cursor.entry_time) if cursor.entry_time is not None else None,
     }
 
@@ -898,6 +937,9 @@ def _previous_occurrence(condition: np.ndarray, values: np.ndarray) -> np.ndarra
 
 
 def estimate_warmup_bars(settings: StrategySettings) -> int:
+    if _is_keltner_strategy(settings):
+        lookback = max(int(settings.keltner_length), int(settings.keltner_atr_length)) + 5
+        return max(lookback * 4, 120)
     sensitivity_mult = SENSITIVITY_MULTIPLIERS.get(settings.sensitivity_mode, 1.0)
     zz_left = max(2, int(round(settings.zz_len_raw * sensitivity_mult)))
     lookbacks = [
@@ -1231,6 +1273,11 @@ def evaluate_latest_state(
     settings: StrategySettings,
     cursor: Optional[IndicatorCursor] = None,
 ) -> Tuple[Dict[str, object], Optional[IndicatorCursor]]:
+    if _is_keltner_strategy(settings):
+        indicators = _compute_keltner_indicators(df, settings)
+        if indicators.empty:
+            return {}, None
+        return _build_keltner_latest_state(indicators.iloc[-1]), None
     rows, latest_row, latest_cursor = _stream_indicator_rows(df, settings, cursor=cursor)
     if latest_row is None:
         return {}, latest_cursor
@@ -1297,19 +1344,124 @@ def _stream_indicator_frame(
     return indicators, indicator_cursor
 
 
+def _rma_series(series: pd.Series, length: int) -> pd.Series:
+    adjusted_length = max(1, int(length))
+    return series.astype(float).ewm(alpha=1.0 / adjusted_length, adjust=False, min_periods=adjusted_length).mean()
+
+
+def _compute_keltner_indicators(
+    df: pd.DataFrame,
+    settings: StrategySettings,
+) -> pd.DataFrame:
+    frame = _ensure_ohlcv(df)
+    if frame.empty:
+        return _empty_indicator_frame(frame)
+    src = frame["close"].astype(float)
+    length = max(1, int(settings.keltner_length))
+    atr_length = max(1, int(settings.keltner_atr_length))
+    if bool(settings.keltner_use_ema):
+        basis = src.ewm(span=length, adjust=False, min_periods=length).mean()
+    else:
+        basis = src.rolling(length, min_periods=length).mean()
+    prev_close = src.shift(1)
+    high = frame["high"].astype(float)
+    low = frame["low"].astype(float)
+    tr_components = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    )
+    true_range = tr_components.max(axis=1)
+    band_style = str(settings.keltner_band_style or KELTNER_BAND_STYLE_OPTIONS[0])
+    if band_style == "True Range":
+        range_ma = true_range
+    elif band_style == "Range":
+        range_ma = _rma_series(high - low, length)
+    else:
+        range_ma = _rma_series(true_range, atr_length)
+    upper = basis + (range_ma * float(settings.keltner_multiplier))
+    lower = basis - (range_ma * float(settings.keltner_multiplier))
+    cross_upper = (src > upper) & (src.shift(1) <= upper.shift(1))
+    cross_lower = (src < lower) & (src.shift(1) >= lower.shift(1))
+    distance = np.divide(
+        src.to_numpy(dtype=float, copy=False) - basis.to_numpy(dtype=float, copy=False),
+        range_ma.to_numpy(dtype=float, copy=False),
+        out=np.full(len(frame), np.nan, dtype=float),
+        where=range_ma.to_numpy(dtype=float, copy=False) != 0.0,
+    )
+    indicators = frame.copy()
+    indicators["supertrend"] = upper.astype(float)
+    indicators["zone2_line"] = basis.astype(float)
+    indicators["zone3_line"] = lower.astype(float)
+    indicators["ema_fast"] = pd.Series(np.nan, index=indicators.index, dtype=float)
+    indicators["ema_slow"] = pd.Series(np.nan, index=indicators.index, dtype=float)
+    indicators["rsi"] = pd.Series(np.nan, index=indicators.index, dtype=float)
+    indicators["direction"] = pd.Series(np.where(src >= basis, -1.0, 1.0), index=indicators.index, dtype=float)
+    indicators["dist_atr"] = pd.Series(distance, index=indicators.index, dtype=float)
+    indicators["lev_zone"] = pd.Series(np.where(cross_upper, 1, 0), index=indicators.index, dtype=int)
+    indicators["is_long_trend"] = (src >= basis).astype(bool)
+    indicators["is_short_trend"] = (src < basis).astype(bool)
+    indicators["trend_to_long"] = cross_upper.fillna(False).astype(bool)
+    indicators["trend_to_short"] = cross_lower.fillna(False).astype(bool)
+    indicators["qip_final_bull"] = pd.Series(False, index=indicators.index, dtype=bool)
+    indicators["qip_final_bear"] = pd.Series(False, index=indicators.index, dtype=bool)
+    indicators["qtp_final_bull"] = pd.Series(False, index=indicators.index, dtype=bool)
+    indicators["qtp_final_bear"] = pd.Series(False, index=indicators.index, dtype=bool)
+    indicators["final_bull"] = cross_upper.fillna(False).astype(bool)
+    indicators["final_bear"] = cross_lower.fillna(False).astype(bool)
+    indicators["bull_score"] = pd.Series(np.where(indicators["final_bull"], 100.0, 0.0), index=indicators.index, dtype=float)
+    indicators["bear_score"] = pd.Series(np.where(indicators["final_bear"], 100.0, 0.0), index=indicators.index, dtype=float)
+    indicators["qtp_bot_score"] = pd.Series(0.0, index=indicators.index, dtype=float)
+    indicators["qtp_top_score"] = pd.Series(0.0, index=indicators.index, dtype=float)
+    indicators.attrs[PREPARED_OHLCV_ATTR] = True
+    indicators.attrs["indicator_cursor"] = None
+    return indicators
+
+
+def _build_keltner_latest_state(latest: pd.Series) -> Dict[str, object]:
+    close_value = float(latest["close"]) if pd.notna(latest.get("close")) else float("nan")
+    basis_value = float(latest["zone2_line"]) if pd.notna(latest.get("zone2_line")) else float("nan")
+    upper_value = float(latest["supertrend"]) if pd.notna(latest.get("supertrend")) else float("nan")
+    lower_value = float(latest["zone3_line"]) if pd.notna(latest.get("zone3_line")) else float("nan")
+    return {
+        "strategy_type": "keltner_trend",
+        "trend": "LONG" if math.isfinite(close_value) and math.isfinite(basis_value) and close_value >= basis_value else "SHORT",
+        "zone": 1 if bool(latest.get("final_bull")) else 0,
+        "trend_to_long": bool(latest.get("trend_to_long")),
+        "trend_to_short": bool(latest.get("trend_to_short")),
+        "final_bull": bool(latest.get("final_bull")),
+        "final_bear": bool(latest.get("final_bear")),
+        "qip_bull": False,
+        "qip_bear": False,
+        "qtp_bull": False,
+        "qtp_bear": False,
+        "rsi": float("nan"),
+        "dist_atr": float(latest["dist_atr"]) if pd.notna(latest.get("dist_atr")) else float("nan"),
+        "basis": basis_value,
+        "upper": upper_value,
+        "lower": lower_value,
+    }
+
+
 def compute_indicators(
     df: pd.DataFrame,
     settings: StrategySettings,
     cache: Optional[Dict[Tuple[object, ...], object]] = None,
 ) -> pd.DataFrame:
     frame = _ensure_ohlcv(df)
-    cache_key = ("stream_indicators", id(frame), settings)
+    cache_key = ("indicators", _strategy_type(settings), id(frame), settings)
     if cache is not None and cache_key in cache:
         cached = cache[cache_key]
         if isinstance(cached, pd.DataFrame):
             return cached.copy()
-    indicators, indicator_cursor = _stream_indicator_frame(frame, settings)
-    indicators.attrs["indicator_cursor"] = indicator_cursor
+    if _is_keltner_strategy(settings):
+        indicators = _compute_keltner_indicators(frame, settings)
+    else:
+        indicators, indicator_cursor = _stream_indicator_frame(frame, settings)
+        indicators.attrs["indicator_cursor"] = indicator_cursor
     if cache is not None:
         cache[cache_key] = indicators.copy()
     return indicators
@@ -1343,6 +1495,7 @@ def _build_latest_state(latest: pd.Series) -> Dict[str, object]:
     lev_zone_raw = latest.get("lev_zone", 0)
     lev_zone = int(lev_zone_raw) if pd.notna(lev_zone_raw) else 0
     return {
+        "strategy_type": "mean_reversion",
         "trend": "LONG" if bool(latest["is_long_trend"]) else "SHORT",
         "zone": lev_zone,
         "trend_to_long": bool(latest["trend_to_long"]),
@@ -1983,6 +2136,230 @@ def _run_backtest_metrics_fast(
     )
 
 
+def _keltner_latest_state_with_cursor(latest: pd.Series, cursor: Optional[BacktestCursor]) -> Dict[str, object]:
+    latest_state = _build_keltner_latest_state(latest)
+    if cursor is None:
+        latest_state["pending_entry"] = False
+        latest_state["pending_entry_price"] = float("nan")
+        latest_state["position_open"] = False
+        return latest_state
+    latest_state["pending_entry"] = bool(cursor.pending_long_entry_active)
+    latest_state["pending_entry_price"] = (
+        float(cursor.pending_long_entry_price)
+        if bool(cursor.pending_long_entry_active) and float(cursor.pending_long_entry_price) > 0.0
+        else float("nan")
+    )
+    latest_state["position_open"] = abs(float(cursor.position_qty)) > POSITION_EPSILON
+    return latest_state
+
+
+def _run_backtest_keltner_core(
+    indicators: pd.DataFrame,
+    settings: StrategySettings,
+    fee_rate: float,
+    starting_equity: float,
+    backtest_start_time: Optional[pd.Timestamp | str],
+    include_details: bool,
+) -> Tuple[StrategyMetrics, List[TradeRecord], pd.Series, pd.DataFrame, Dict[str, object], Optional[BacktestCursor]]:
+    latest = indicators.iloc[-1]
+    active_indicators, result_indicators = _select_active_indicators(indicators, backtest_start_time)
+    active_count = len(active_indicators)
+    close_values = active_indicators["close"].to_numpy(dtype=float, copy=False)
+    high_values = active_indicators["high"].to_numpy(dtype=float, copy=False)
+    basis_values = active_indicators["zone2_line"].to_numpy(dtype=float, copy=False)
+    cross_upper_values = active_indicators["final_bull"].to_numpy(dtype=bool, copy=False)
+    cross_lower_values = active_indicators["final_bear"].to_numpy(dtype=bool, copy=False)
+    time_values = active_indicators["time"].to_numpy(copy=False)
+
+    default_entry_time = pd.Timestamp(result_indicators["time"].iloc[0]) if not result_indicators.empty else pd.Timestamp("1970-01-01")
+    equity = float(starting_equity)
+    position_qty = 0.0
+    avg_entry_price = 0.0
+    entry_side = ""
+    entry_time = default_entry_time
+    entry_price = 0.0
+    zone_events: List[str] = []
+    zone_event_times: List[Tuple[pd.Timestamp, str]] = []
+    trades: List[TradeRecord] = []
+    gross_profit = 0.0
+    gross_loss = 0.0
+    trade_count = 0
+    win_count = 0
+    last_entry_signal_time: Optional[pd.Timestamp] = None
+    last_entry_signal_price = 0.0
+    last_entry_signal_side = ""
+    last_entry_signal_zone = 0
+    last_entry_signal_fraction = 0.0
+    pending_long_entry_active = False
+    pending_long_entry_price = 0.0
+    pending_long_entry_signal_time: Optional[pd.Timestamp] = None
+    equity_curve_values = np.empty(active_count, dtype=float) if active_count else np.empty(0, dtype=float)
+
+    def add_position(price: float, time_value: pd.Timestamp) -> None:
+        nonlocal equity, position_qty, avg_entry_price, entry_side, entry_time, entry_price
+        nonlocal last_entry_signal_time, last_entry_signal_price, last_entry_signal_side, last_entry_signal_zone
+        nonlocal last_entry_signal_fraction
+        allocation_fraction = _normalized_entry_fraction(settings)
+        if allocation_fraction <= 0.0 or abs(position_qty) > POSITION_EPSILON:
+            return
+        qty = (equity * allocation_fraction) / max(price, 1e-9)
+        equity -= qty * price * fee_rate
+        position_qty = qty
+        avg_entry_price = price
+        entry_side = "long"
+        entry_time = time_value
+        entry_price = price
+        if include_details:
+            zone_events[:] = ["L1"]
+            zone_event_times[:] = [(pd.Timestamp(time_value), "L1")]
+        last_entry_signal_time = pd.Timestamp(time_value)
+        last_entry_signal_price = float(price)
+        last_entry_signal_side = "long"
+        last_entry_signal_zone = 1
+        last_entry_signal_fraction = allocation_fraction
+
+    def close_position(price: float, time_value: pd.Timestamp, reason: str) -> None:
+        nonlocal equity, position_qty, avg_entry_price, entry_side, entry_time, entry_price
+        nonlocal gross_profit, gross_loss, trade_count, win_count
+        if abs(position_qty) < POSITION_EPSILON or not entry_side:
+            return
+        pnl = position_qty * (price - avg_entry_price)
+        fee = abs(position_qty) * price * fee_rate
+        net_pnl = pnl - fee
+        equity += net_pnl
+        trade_count += 1
+        if net_pnl > 0:
+            gross_profit += net_pnl
+            win_count += 1
+        else:
+            gross_loss += abs(net_pnl)
+        if include_details:
+            gross_cost = abs(position_qty) * avg_entry_price
+            return_pct = (pnl / gross_cost * 100.0) if gross_cost else 0.0
+            trades.append(
+                TradeRecord(
+                    side="long",
+                    entry_time=entry_time,
+                    exit_time=time_value,
+                    entry_price=float(entry_price),
+                    exit_price=float(price),
+                    quantity=float(abs(position_qty)),
+                    pnl=float(net_pnl),
+                    return_pct=float(return_pct),
+                    reason=reason,
+                    zones=",".join(zone_events),
+                    entry_events=tuple(zone_event_times),
+                )
+            )
+            zone_events.clear()
+            zone_event_times.clear()
+        position_qty = 0.0
+        avg_entry_price = 0.0
+        entry_side = ""
+        entry_price = 0.0
+
+    for index in range(active_count):
+        current_time = pd.Timestamp(time_values[index])
+        current_close = float(close_values[index])
+        current_high = float(high_values[index])
+        current_basis = float(basis_values[index]) if np.isfinite(basis_values[index]) else float("nan")
+
+        if position_qty > POSITION_EPSILON and cross_lower_values[index]:
+            close_position(current_close, current_time, "cross_lower")
+
+        if abs(position_qty) < POSITION_EPSILON:
+            if pending_long_entry_active and current_high >= pending_long_entry_price > 0.0:
+                add_position(pending_long_entry_price, current_time)
+                pending_long_entry_active = False
+                pending_long_entry_price = 0.0
+                pending_long_entry_signal_time = None
+                if position_qty > POSITION_EPSILON and cross_lower_values[index]:
+                    close_position(current_close, current_time, "cross_lower")
+            elif pending_long_entry_active and math.isfinite(current_basis) and current_close < current_basis:
+                pending_long_entry_active = False
+                pending_long_entry_price = 0.0
+                pending_long_entry_signal_time = None
+
+            if abs(position_qty) < POSITION_EPSILON and cross_upper_values[index]:
+                pending_long_entry_active = True
+                pending_long_entry_price = current_high + _tick_buffer(current_high)
+                pending_long_entry_signal_time = current_time
+
+        unrealized = position_qty * (current_close - avg_entry_price) if abs(position_qty) > POSITION_EPSILON else 0.0
+        equity_curve_values[index] = equity + unrealized
+
+    cursor: Optional[BacktestCursor] = None
+    if active_count:
+        cursor = BacktestCursor(
+            processed_bars=active_count,
+            last_time=pd.Timestamp(time_values[active_count - 1]),
+            equity=float(equity),
+            position_qty=float(position_qty),
+            avg_entry_price=float(avg_entry_price),
+            entry_side=str(entry_side),
+            entry_time=pd.Timestamp(entry_time),
+            entry_price=float(entry_price),
+            zone_events=tuple(zone_events),
+            zone_event_times=tuple(zone_event_times),
+            gross_profit=float(gross_profit),
+            gross_loss=float(gross_loss),
+            trade_count=int(trade_count),
+            win_count=int(win_count),
+            long_zone_used=(abs(position_qty) > POSITION_EPSILON, False, False),
+            short_zone_used=(False, False, False),
+            last_long_zone=1 if abs(position_qty) > POSITION_EPSILON else 0,
+            last_short_zone=0,
+            last_entry_signal_time=last_entry_signal_time,
+            last_entry_signal_price=float(last_entry_signal_price),
+            last_entry_signal_side=str(last_entry_signal_side),
+            last_entry_signal_zone=int(last_entry_signal_zone),
+            last_equity_value=float(equity_curve_values[active_count - 1]),
+            last_entry_signal_fraction=float(last_entry_signal_fraction),
+            pending_long_entry_active=bool(pending_long_entry_active),
+            pending_long_entry_price=float(pending_long_entry_price),
+            pending_long_entry_signal_time=pending_long_entry_signal_time,
+            indicator_cursor=None,
+        )
+
+    if abs(position_qty) > POSITION_EPSILON and active_count:
+        close_position(close_values[-1], pd.Timestamp(time_values[-1]), "end_of_test")
+        equity_curve_values[-1] = equity
+
+    if equity_curve_values.size:
+        peaks = np.maximum.accumulate(equity_curve_values)
+        drawdown_pct = np.divide(
+            equity_curve_values - peaks,
+            peaks,
+            out=np.zeros_like(equity_curve_values),
+            where=peaks != 0.0,
+        ) * 100.0
+        max_drawdown_pct = abs(float(drawdown_pct.min()))
+    else:
+        max_drawdown_pct = 0.0
+
+    win_rate = (win_count / trade_count * 100.0) if trade_count else 0.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss else float("inf" if gross_profit > 0 else 0.0)
+    if include_details:
+        if equity_curve_values.size:
+            curve = pd.Series(equity_curve_values, index=active_indicators["time"].iloc[: len(equity_curve_values)], dtype=float)
+        else:
+            curve = pd.Series([starting_equity], index=[default_entry_time], dtype=float)
+    else:
+        curve = pd.Series(dtype=float)
+
+    metrics = StrategyMetrics(
+        total_return_pct=((equity - starting_equity) / starting_equity) * 100.0,
+        net_profit=equity - starting_equity,
+        max_drawdown_pct=max_drawdown_pct,
+        trade_count=trade_count,
+        win_rate_pct=win_rate,
+        profit_factor=float(profit_factor if math.isfinite(profit_factor) else 999.0),
+    )
+    latest_state = _keltner_latest_state_with_cursor(latest, cursor) if include_details else {}
+    indicator_frame = compact_indicator_frame(result_indicators, RESULT_INDICATOR_COLUMNS) if include_details else result_indicators.tail(1)
+    return metrics, trades, curve, indicator_frame, latest_state, cursor
+
+
 def run_backtest_metrics(
     df: pd.DataFrame,
     settings: StrategySettings,
@@ -1992,6 +2369,16 @@ def run_backtest_metrics(
     indicator_cache: Optional[Dict[Tuple[object, ...], object]] = None,
 ) -> StrategyMetrics:
     indicators = compute_indicators(df, settings, cache=indicator_cache)
+    if _is_keltner_strategy(settings):
+        metrics, _, _, _, _, _ = _run_backtest_keltner_core(
+            indicators,
+            settings=settings,
+            fee_rate=fee_rate,
+            starting_equity=starting_equity,
+            backtest_start_time=backtest_start_time,
+            include_details=False,
+        )
+        return metrics
     return _run_backtest_metrics_fast(
         indicators,
         settings=settings,
@@ -2010,6 +2397,26 @@ def run_backtest(
     indicator_cache: Optional[Dict[Tuple[object, ...], object]] = None,
 ) -> BacktestResult:
     indicators = compute_indicators(df, settings, cache=indicator_cache)
+    if _is_keltner_strategy(settings):
+        metrics, trades, curve, result_indicators, latest_state, cursor = _run_backtest_keltner_core(
+            indicators,
+            settings=settings,
+            fee_rate=fee_rate,
+            starting_equity=starting_equity,
+            backtest_start_time=backtest_start_time,
+            include_details=True,
+        )
+        return BacktestResult(
+            settings=settings,
+            metrics=metrics,
+            trades=trades,
+            open_entry_events=_open_entry_events_from_cursor(cursor),
+            indicators=result_indicators,
+            latest_state=latest_state,
+            equity_curve=curve,
+            cursor=cursor,
+            history_signature=_indicator_history_signature(result_indicators),
+        )
     indicator_cursor = indicators.attrs.get("indicator_cursor")
     metrics, trades, curve, result_indicators, latest_state, cursor = _run_backtest_core(
         indicators,
@@ -2042,6 +2449,15 @@ def resume_backtest(
     backtest_start_time: Optional[pd.Timestamp | str] = None,
     indicator_cache: Optional[Dict[Tuple[object, ...], object]] = None,
 ) -> BacktestResult:
+    if _is_keltner_strategy(settings):
+        return run_backtest(
+            df,
+            settings=settings,
+            fee_rate=fee_rate,
+            starting_equity=starting_equity,
+            backtest_start_time=backtest_start_time,
+            indicator_cache=indicator_cache,
+        )
     if previous_result is None or previous_result.cursor is None or previous_result.settings != settings:
         return run_backtest(
             df,
@@ -2133,6 +2549,10 @@ def resume_backtest(
 
 
 def _preview_exit_reason(position_qty: float, latest_state: Dict[str, object]) -> Optional[str]:
+    if bool(latest_state.get("strategy_type") == "keltner_trend"):
+        if position_qty > 0 and bool(latest_state.get("final_bear")):
+            return "cross_lower"
+        return None
     if position_qty > 0:
         if bool(latest_state.get("trend_to_short")):
             return "trend_to_short"
@@ -2153,6 +2573,12 @@ def _preview_entry_signal(
     settings: StrategySettings,
 ) -> Optional[Tuple[str, int]]:
     if cursor is None:
+        return None
+    if _is_keltner_strategy(settings):
+        if abs(float(getattr(cursor, "position_qty", 0.0))) > POSITION_EPSILON:
+            return None
+        if bool(getattr(cursor, "pending_long_entry_active", False)):
+            return ("long", 1)
         return None
     position_qty = float(getattr(cursor, "position_qty", 0.0))
     long_zone_used = list(getattr(cursor, "long_zone_used", (False, False, False)))

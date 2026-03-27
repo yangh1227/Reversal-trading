@@ -17,10 +17,12 @@ from alt_reversal_trader.optimizer import (
 )
 from alt_reversal_trader.strategy import StrategyMetrics
 from alt_reversal_trader.strategy import (
+    _preview_entry_signal,
     active_auto_trade_signal,
     active_entry_price_by_zone,
     BacktestCursor,
     BacktestResult,
+    evaluate_latest_state,
     fresh_entry_trigger_time,
     latest_confirmed_entry_event,
     incremental_signal_fraction_for_entry,
@@ -50,6 +52,24 @@ def make_sample_ohlcv(rows: int = 500) -> pd.DataFrame:
             "volume": volume,
         }
     )
+
+
+def make_keltner_ohlcv() -> pd.DataFrame:
+    rows = [
+        (100.0, 101.0, 99.0, 100.0),
+        (100.0, 101.0, 99.0, 100.0),
+        (100.0, 101.0, 99.0, 100.0),
+        (100.0, 101.0, 99.0, 100.0),
+        (100.0, 102.0, 99.0, 101.0),
+        (101.0, 110.0, 100.0, 109.0),
+        (109.0, 113.0, 108.0, 112.0),
+        (112.0, 113.0, 90.0, 91.0),
+        (91.0, 92.0, 89.0, 90.0),
+    ]
+    frame = pd.DataFrame(rows, columns=["open", "high", "low", "close"])
+    frame["time"] = pd.date_range("2026-01-01", periods=len(frame), freq="min")
+    frame["volume"] = 1000.0
+    return frame[["time", "open", "high", "low", "close", "volume"]]
 
 
 def make_confirmed_entry_backtest(
@@ -789,3 +809,73 @@ def test_seed_two_minute_aggregate_uses_only_first_minute_seed() -> None:
     second_minute.loc[1, "time"] = pd.Timestamp("2026-01-01 00:03:00")
     no_seed = seed_two_minute_aggregate(second_minute, "TESTUSDT", "2m")
     assert no_seed is None
+
+
+def test_keltner_backtest_places_stop_entry_and_closes_on_lower_cross() -> None:
+    history = make_keltner_ohlcv()
+    settings = StrategySettings(
+        strategy_type="keltner_trend",
+        keltner_length=2,
+        keltner_atr_length=2,
+        keltner_multiplier=0.5,
+        keltner_use_ema=False,
+        keltner_band_style="Average True Range",
+        entry_size_pct=10.0,
+    )
+
+    result = run_backtest(history, settings=settings)
+
+    assert result.metrics.trade_count == 1
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.side == "long"
+    assert trade.reason == "cross_lower"
+    assert trade.entry_time == pd.Timestamp("2026-01-01 00:06:00")
+    assert trade.exit_time == pd.Timestamp("2026-01-01 00:07:00")
+    assert trade.entry_price > 110.0
+    assert trade.exit_price == 91.0
+
+
+def test_keltner_pending_breakout_exposes_preview_signal() -> None:
+    history = make_keltner_ohlcv().iloc[:6].reset_index(drop=True)
+    settings = StrategySettings(
+        strategy_type="keltner_trend",
+        keltner_length=2,
+        keltner_atr_length=2,
+        keltner_multiplier=0.5,
+        keltner_use_ema=False,
+        keltner_band_style="Average True Range",
+        entry_size_pct=10.0,
+    )
+
+    result = run_backtest(history, settings=settings)
+    latest_state, _ = evaluate_latest_state(history, settings)
+
+    assert result.cursor is not None
+    assert result.latest_state["pending_entry"] is True
+    assert result.latest_state["pending_entry_price"] > float(history["high"].iloc[-1])
+    assert _preview_entry_signal(result.cursor, latest_state, settings) == ("long", 1)
+
+
+def test_keltner_active_signal_uses_entry_size_fraction() -> None:
+    history = make_keltner_ohlcv().iloc[:7].reset_index(drop=True)
+    settings = StrategySettings(
+        strategy_type="keltner_trend",
+        keltner_length=2,
+        keltner_atr_length=2,
+        keltner_multiplier=0.5,
+        keltner_use_ema=False,
+        keltner_band_style="Average True Range",
+        entry_size_pct=10.0,
+    )
+
+    result = run_backtest(history, settings=settings)
+    signal = active_auto_trade_signal(result)
+
+    assert signal is not None
+    assert signal["side"] == "long"
+    assert signal["zone"] == 1
+    assert signal["fraction"] == 0.1
+    assert signal["target_fraction"] == 0.1
+    assert signal["allow_additional_entries"] is False
+    assert signal["supports_favorable_entries"] is False

@@ -330,6 +330,17 @@ def _confirmed_exit_event_from_position_backtest(
     latest_state = dict(backtest.latest_state or {})
     reason: Optional[str] = None
     side = "long" if amount > 0 else "short"
+    if str(latest_state.get("strategy_type") or "") == "keltner_trend":
+        if amount > 0 and bool(latest_state.get("final_bear")):
+            reason = "cross_lower"
+        if reason is None:
+            return None
+        latest_time = pd.Timestamp(backtest.indicators["time"].iloc[-1])
+        return {
+            "side": side,
+            "reason": reason,
+            "bar_time": latest_time,
+        }
     if amount > 0:
         if bool(latest_state.get("trend_to_short")):
             reason = "trend_to_short"

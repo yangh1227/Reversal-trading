@@ -30,7 +30,15 @@ from .binance_futures import (
     resample_ohlcv,
     resolve_base_interval,
 )
-from .config import APP_INTERVAL_OPTIONS, PARAMETER_SPECS, AppSettings, StrategySettings
+from .config import (
+    APP_INTERVAL_OPTIONS,
+    PARAMETER_SPECS,
+    STRATEGY_TYPE_LABELS,
+    STRATEGY_TYPE_OPTIONS,
+    AppSettings,
+    StrategySettings,
+    parameter_spec_applies,
+)
 from .crash_logger import log_runtime_event
 from .favorable_backtest_process import (
     FavorableBacktestJob,
@@ -516,6 +524,7 @@ def _auto_close_reason_text(reason: str) -> str:
         "trend_to_long": "추세 전환 LONG",
         "trend_to_short": "추세 전환 SHORT",
         "opposite_signal": "청산신호",
+        "cross_lower": "켈트너 하단 이탈",
     }
     return labels.get(reason, reason)
 
@@ -744,6 +753,11 @@ class OptimizeWorker(QThread):
             return ["1m", "2m"]
         return [self.settings.kline_interval]
 
+    def _effective_optimize_flags(self) -> Dict[str, bool]:
+        if self.settings.enable_parameter_optimization:
+            return dict(self.settings.optimize_flags)
+        return {key: False for key in self.settings.optimize_flags}
+
     def _load_histories(
         self,
         client: BinanceFuturesClient,
@@ -764,6 +778,7 @@ class OptimizeWorker(QThread):
     def run(self) -> None:
         try:
             process_count = max(1, min(int(self.settings.optimize_processes), len(self.candidates) or 1))
+            phase_name = "최적화" if self.settings.enable_parameter_optimization else "기본값 백테스트"
             self.phase_update.emit(
                 {
                     "phase": "optimize_start",
@@ -771,7 +786,7 @@ class OptimizeWorker(QThread):
                     "process_count": process_count,
                 }
             )
-            self.progress.emit(f"최적화 워커 시작: 종목 {len(self.candidates)}개, 프로세스 {process_count}개")
+            self.progress.emit(f"{phase_name} 워커 시작: 종목 {len(self.candidates)}개, 프로세스 {process_count}개")
             if process_count <= 1 or len(self.candidates) <= 1:
                 self._run_sequential()
             else:
@@ -786,6 +801,7 @@ class OptimizeWorker(QThread):
         client = BinanceFuturesClient()
         backtest_start_time = pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms")
         interval_candidates = self._interval_candidates()
+        optimize_flags = self._effective_optimize_flags()
         history_fetch_start_time_ms = _history_fetch_start_time_ms(
             self.settings,
             interval="1m" if "2m" in interval_candidates else self.settings.kline_interval,
@@ -833,7 +849,7 @@ class OptimizeWorker(QThread):
                 symbol=candidate.symbol,
                 histories_by_interval=histories,
                 base_settings=self.settings.strategy,
-                optimize_flags=self.settings.optimize_flags,
+                optimize_flags=optimize_flags,
                 interval_candidates=interval_candidates,
                 span_pct=self.settings.optimization_span_pct,
                 steps=self.settings.optimization_steps,
@@ -858,6 +874,7 @@ class OptimizeWorker(QThread):
         client = BinanceFuturesClient()
         backtest_start_time = pd.to_datetime(_backtest_start_time_ms(self.settings), unit="ms")
         interval_candidates = self._interval_candidates()
+        optimize_flags = self._effective_optimize_flags()
         history_fetch_start_time_ms = _history_fetch_start_time_ms(
             self.settings,
             interval="1m" if "2m" in interval_candidates else self.settings.kline_interval,
@@ -918,7 +935,7 @@ class OptimizeWorker(QThread):
                         "symbol": candidate.symbol,
                         "histories_by_interval": histories,
                         "base_settings": self.settings.strategy,
-                    "optimize_flags": self.settings.optimize_flags,
+                    "optimize_flags": optimize_flags,
                     "interval_candidates": interval_candidates,
                     "span_pct": self.settings.optimization_span_pct,
                     "steps": self.settings.optimization_steps,
@@ -1935,6 +1952,20 @@ class AltReversalTraderWindow(QMainWindow):
             atr_enabled = bool(self.atr_4h_filter_check.isChecked())
             self.atr_4h_spin.setEnabled(atr_enabled)
 
+    def _selected_strategy_type(self) -> str:
+        if hasattr(self, "strategy_type_combo"):
+            return str(self.strategy_type_combo.currentData() or self.settings.strategy.strategy_type)
+        return str(self.settings.strategy.strategy_type)
+
+    def _refresh_strategy_controls(self) -> None:
+        strategy_type = self._selected_strategy_type()
+        for spec in PARAMETER_SPECS:
+            editor = self.parameter_editors.get(spec.key)
+            if editor is not None:
+                editor.setEnabled(parameter_spec_applies(spec, strategy_type))
+        self._refresh_candidate_optimization_controls()
+        self._refresh_parameter_optimization_hints()
+
     def _optimization_rank_mode(self) -> str:
         if not hasattr(self, "opt_rank_mode_combo"):
             return self.settings.optimization_rank_mode
@@ -1975,6 +2006,10 @@ class AltReversalTraderWindow(QMainWindow):
         return str(value)
 
     def _parameter_opt_hint_text(self, spec) -> str:
+        if not parameter_spec_applies(spec, self._selected_strategy_type()):
+            return "현재 전략 미사용"
+        if hasattr(self, "parameter_optimization_check") and not self.parameter_optimization_check.isChecked():
+            return "후보종목 기본값 사용"
         span_pct = float(self.opt_span_spin.value()) if hasattr(self, "opt_span_spin") else self.settings.optimization_span_pct
         steps = int(self.opt_steps_spin.value()) if hasattr(self, "opt_steps_spin") else self.settings.optimization_steps
         values = parameter_value_range(spec, self._parameter_editor_current_value(spec), span_pct, steps, True)
@@ -2001,7 +2036,19 @@ class AltReversalTraderWindow(QMainWindow):
         label = self.parameter_opt_hint_labels.get(spec.key)
         if label is None:
             return
-        enabled = bool(self.parameter_opt_boxes.get(spec.key).isChecked()) if spec.key in self.parameter_opt_boxes else False
+        strategy_applies = parameter_spec_applies(spec, self._selected_strategy_type())
+        parameter_optimization_enabled = (
+            bool(self.parameter_optimization_check.isChecked())
+            if hasattr(self, "parameter_optimization_check")
+            else self.settings.enable_parameter_optimization
+        )
+        enabled = (
+            strategy_applies
+            and parameter_optimization_enabled
+            and bool(self.parameter_opt_boxes.get(spec.key).isChecked())
+            if spec.key in self.parameter_opt_boxes
+            else False
+        )
         color = "#6b7280" if enabled else "#8a8f98"
         label.setStyleSheet(f"color: {color}; font-size: 10px;")
         label.setText(self._parameter_opt_hint_text(spec))
@@ -2009,6 +2056,25 @@ class AltReversalTraderWindow(QMainWindow):
     def _refresh_parameter_optimization_hints(self) -> None:
         for spec in PARAMETER_SPECS:
             self._refresh_parameter_opt_hint(spec)
+
+    def _refresh_candidate_optimization_controls(self) -> None:
+        enabled = (
+            bool(self.parameter_optimization_check.isChecked())
+            if hasattr(self, "parameter_optimization_check")
+            else self.settings.enable_parameter_optimization
+        )
+        for widget in (
+            getattr(self, "opt_span_spin", None),
+            getattr(self, "opt_steps_spin", None),
+            getattr(self, "max_combo_spin", None),
+        ):
+            if widget is not None:
+                widget.setEnabled(enabled)
+        strategy_type = self._selected_strategy_type()
+        for spec in PARAMETER_SPECS:
+            optimize_box = self.parameter_opt_boxes.get(spec.key)
+            if optimize_box is not None:
+                optimize_box.setEnabled(enabled and parameter_spec_applies(spec, strategy_type))
 
     def _build_api_group(self) -> QGroupBox:
         group = QGroupBox("Binance API")
@@ -2026,6 +2092,9 @@ class AltReversalTraderWindow(QMainWindow):
     def _build_filter_group(self) -> QGroupBox:
         group = QGroupBox("Market Filters")
         layout = QFormLayout(group)
+        self.strategy_type_combo = QComboBox()
+        for strategy_type in STRATEGY_TYPE_OPTIONS:
+            self.strategy_type_combo.addItem(STRATEGY_TYPE_LABELS.get(strategy_type, strategy_type), strategy_type)
         self.filter_preset_combo = QComboBox()
         self.filter_preset_combo.addItem("변동성", "변동성")
         self.filter_preset_combo.addItem("급등종목", "급등종목")
@@ -2064,9 +2133,11 @@ class AltReversalTraderWindow(QMainWindow):
         self.auto_refresh_minutes_spin = QSpinBox()
         self.auto_refresh_minutes_spin.setRange(1, 1_440)
         self.auto_refresh_minutes_spin.setSuffix(" 분")
+        self.strategy_type_combo.currentIndexChanged.connect(lambda _: self._refresh_strategy_controls())
         self.filter_preset_combo.currentIndexChanged.connect(lambda _: self._refresh_filter_controls())
         self.rsi_filter_check.toggled.connect(self._refresh_filter_controls)
         self.atr_4h_filter_check.toggled.connect(self._refresh_filter_controls)
+        layout.addRow("전략", self.strategy_type_combo)
         layout.addRow("필터 프리셋", self.filter_preset_combo)
         layout.addRow("", self.surge_info_label)
         layout.addRow("1일 변동성 % >=", self.daily_vol_spin)
@@ -2086,6 +2157,7 @@ class AltReversalTraderWindow(QMainWindow):
     def _build_optimization_group(self) -> QGroupBox:
         group = QGroupBox("Optimization")
         layout = QFormLayout(group)
+        self.parameter_optimization_check = QCheckBox("후보종목 파라미터 최적화")
         self.opt_span_spin = QDoubleSpinBox()
         self.opt_span_spin.setRange(1.0, 100.0)
         self.opt_span_spin.setDecimals(1)
@@ -2113,6 +2185,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.fee_spin.setRange(0.0, 5.0)
         self.fee_spin.setDecimals(4)
         self.fee_spin.setSingleStep(0.01)
+        self.parameter_optimization_check.toggled.connect(lambda _checked: self._refresh_candidate_optimization_controls())
+        self.parameter_optimization_check.toggled.connect(lambda _checked: self._refresh_parameter_optimization_hints())
         self.opt_rank_mode_combo.currentIndexChanged.connect(lambda _index: self._refresh_optimization_rank_controls())
         self.opt_min_score_spin.valueChanged.connect(lambda _value: self.update_optimized_table())
         self.opt_min_return_spin.valueChanged.connect(lambda _value: self.update_optimized_table())
@@ -2122,8 +2196,10 @@ class AltReversalTraderWindow(QMainWindow):
             field_label = layout.labelForField(editor)
             if field_label is not None:
                 field_label.setText(label)
+        self.parameter_optimization_check.setChecked(bool(self.settings.enable_parameter_optimization))
         self.optimize_timeframe_check.setText("1m / 2m 최적화")
         self.auto_trade_favorable_check.setChecked(bool(self.settings.auto_trade_use_favorable_price))
+        layout.addRow("파라미터", self.parameter_optimization_check)
         layout.addRow("범위 ±%", self.opt_span_spin)
         layout.addRow("격자 단계수", self.opt_steps_spin)
         layout.addRow("정렬 기준", self.opt_rank_mode_combo)
@@ -2144,14 +2220,15 @@ class AltReversalTraderWindow(QMainWindow):
         _set_row_label(self.auto_trade_favorable_check, "자동매매 유리한 가격")
         _set_row_label(self.fee_spin, "수수료 %")
         self._refresh_optimization_rank_controls()
+        self._refresh_candidate_optimization_controls()
         return group
 
     def _build_parameter_tabs(self) -> QGroupBox:
         group = QGroupBox("Strategy Parameters")
         outer_layout = QVBoxLayout(group)
         help_label = QLabel(
-            "Opt를 체크한 항목만 최적화합니다. 각 항목은 퍼센트 일괄 범위가 아니라 "
-            "옵션별 기본 프로필로 탐색하고, 범위 스케일은 그 폭을 전체적으로 조절합니다."
+            "선택한 전략에서 사용되는 항목만 반영됩니다. Opt를 체크한 항목만 최적화하고, "
+            "범위 스케일은 옵션별 기본 프로필 폭을 전체적으로 조절합니다."
         )
         help_label.setWordWrap(True)
         outer_layout.addWidget(help_label)
@@ -2159,7 +2236,13 @@ class AltReversalTraderWindow(QMainWindow):
         outer_layout.addWidget(tabs)
 
         forms: Dict[str, QFormLayout] = {}
-        for key, title in (("core", "Core"), ("qip", "QIP"), ("qtp", "QTP"), ("switches", "Switches")):
+        for key, title in (
+            ("core", "Core"),
+            ("qip", "QIP"),
+            ("qtp", "QTP"),
+            ("keltner", "Keltner"),
+            ("switches", "Switches"),
+        ):
             page = QWidget()
             form = QFormLayout(page)
             forms[key] = form
@@ -2758,6 +2841,9 @@ class AltReversalTraderWindow(QMainWindow):
         self.api_key_edit.setText(settings.api_key)
         self.api_secret_edit.setText(settings.api_secret)
         self.leverage_spin.setValue(settings.leverage)
+        strategy_index = self.strategy_type_combo.findData(settings.strategy.strategy_type)
+        if strategy_index >= 0:
+            self.strategy_type_combo.setCurrentIndex(strategy_index)
         preset_index = self.filter_preset_combo.findData(settings.filter_preset)
         if preset_index >= 0:
             self.filter_preset_combo.setCurrentIndex(preset_index)
@@ -2781,6 +2867,7 @@ class AltReversalTraderWindow(QMainWindow):
         self.opt_min_score_spin.setValue(settings.optimization_min_score)
         self.opt_min_return_spin.setValue(settings.optimization_min_return_pct)
         self.max_combo_spin.setValue(settings.max_grid_combinations)
+        self.parameter_optimization_check.setChecked(bool(settings.enable_parameter_optimization))
         self.opt_process_spin.setValue(settings.optimize_processes)
         self.optimize_timeframe_check.setChecked(settings.optimize_timeframe)
         self.auto_trade_favorable_check.setChecked(bool(settings.auto_trade_use_favorable_price))
@@ -2801,6 +2888,7 @@ class AltReversalTraderWindow(QMainWindow):
         self._refresh_order_mode_ui()
         self._refresh_filter_controls()
         self._refresh_optimization_rank_controls()
+        self._refresh_strategy_controls()
         self._refresh_parameter_optimization_hints()
 
     def collect_settings(self) -> AppSettings:
@@ -2852,10 +2940,14 @@ class AltReversalTraderWindow(QMainWindow):
             optimization_min_score=float(self.opt_min_score_spin.value()),
             optimization_min_return_pct=float(self.opt_min_return_spin.value()),
             max_grid_combinations=int(self.max_combo_spin.value()),
+            enable_parameter_optimization=bool(self.parameter_optimization_check.isChecked()),
             scan_workers=int(self.scan_workers_spin.value()),
             optimize_processes=int(self.opt_process_spin.value()),
             optimize_timeframe=bool(self.optimize_timeframe_check.isChecked()),
-            strategy=StrategySettings(**strategy_payload),
+            strategy=StrategySettings(
+                strategy_type=self._selected_strategy_type(),
+                **strategy_payload,
+            ),
             optimize_flags=optimize_flags,
             position_intervals=dict(self.settings.position_intervals),
             position_strategy_settings=dict(self.settings.position_strategy_settings),
@@ -6630,7 +6722,8 @@ class AltReversalTraderWindow(QMainWindow):
         self.pending_history_cache = {}
         self.pending_backtest_cache = {}
         self.pending_chart_indicator_cache = {}
-        self.log("후보 스캔 + 최적화 시작" + (" (기존 목록 유지)" if preserve_existing else ""))
+        phase_name = "후보 스캔 + 최적화 시작" if self.settings.enable_parameter_optimization else "후보 스캔 + 기본값 백테스트 시작"
+        self.log(phase_name + (" (기존 목록 유지)" if preserve_existing else ""))
         self._set_backtest_progress_scanning()
         self._set_refresh_running(True)
         self.scan_worker = ScanWorker(self.settings)
@@ -6672,7 +6765,8 @@ class AltReversalTraderWindow(QMainWindow):
             self._set_backtest_progress_idle("백테스트 대상 없음")
             self._set_refresh_running(False)
             return
-        self.log(f"최적화 시작: {len(targets)}개 종목")
+        phase_name = "최적화" if self.settings.enable_parameter_optimization else "기본값 백테스트"
+        self.log(f"{phase_name} 시작: {len(targets)}개 종목")
         self._begin_backtest_progress(len(targets))
         self.optimize_worker = OptimizeWorker(self.settings, targets)
         self._track_thread(self.optimize_worker, "optimize_worker")
@@ -7168,10 +7262,23 @@ class AltReversalTraderWindow(QMainWindow):
             self.chart_header_symbol_label.setText(symbol)
         if hasattr(self, "chart_header_tf_label"):
             self.chart_header_tf_label.setText(f"TF {self.current_interval}" if self.current_interval else "TF -")
-        self.signal_label.setText(
-            f"신호: Trend {latest['trend']} | Zone {latest['zone']} | "
-            f"Bull {latest['final_bull']} | Bear {latest['final_bear']} | RSI {latest['rsi']:.2f}"
-        )
+        strategy_label = STRATEGY_TYPE_LABELS.get(result.settings.strategy_type, result.settings.strategy_type)
+        if result.settings.strategy_type == "keltner_trend":
+            pending_price = latest.get("pending_entry_price")
+            pending_text = (
+                f" | Pending {pending_price:.6f}"
+                if pending_price is not None and pd.notna(pending_price)
+                else ""
+            )
+            self.signal_label.setText(
+                f"신호: {strategy_label} | Trend {latest['trend']} | "
+                f"UpperCross {latest['final_bull']} | LowerCross {latest['final_bear']}{pending_text}"
+            )
+        else:
+            self.signal_label.setText(
+                f"신호: {strategy_label} | Trend {latest['trend']} | Zone {latest['zone']} | "
+                f"Bull {latest['final_bull']} | Bear {latest['final_bear']} | RSI {latest['rsi']:.2f}"
+            )
         self._update_entry_price_overlay()
         self._refresh_live_labels()
         self._refresh_live_preview_markers(symbol)
@@ -7405,8 +7512,10 @@ class AltReversalTraderWindow(QMainWindow):
 
     def update_summary(self, symbol: str, backtest: BacktestResult, optimization: Optional[OptimizationResult]) -> None:
         metrics = backtest.metrics
+        strategy_label = STRATEGY_TYPE_LABELS.get(backtest.settings.strategy_type, backtest.settings.strategy_type)
         lines = [
             f"Symbol: {symbol}",
+            f"Strategy: {strategy_label}",
             f"Score: {optimization.score:.1f}" if optimization else "Score: -",
             f"Return: {metrics.total_return_pct:.2f}%",
             f"Net Profit: {metrics.net_profit:.2f}",
@@ -7421,6 +7530,7 @@ class AltReversalTraderWindow(QMainWindow):
             lines.append(f"- {key}: {value}")
         lines.append("")
         lines.append("Active Params:")
+        lines.append(f"- strategy_type: {backtest.settings.strategy_type}")
         for spec in PARAMETER_SPECS:
             lines.append(f"- {spec.key}: {getattr(backtest.settings, spec.key)}")
         if optimization:

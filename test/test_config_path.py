@@ -66,6 +66,9 @@ class TestConfigPath(unittest.TestCase):
             self.assertEqual(loaded.strategy.min_score, 3)
             self.assertEqual(loaded.strategy.qtp_sensitivity, 10)
             self.assertTrue(loaded.strategy.beast_mode)
+            self.assertEqual(loaded.strategy.strategy_type, "mean_reversion")
+            self.assertEqual(loaded.strategy.keltner_length, 20)
+            self.assertTrue(loaded.enable_parameter_optimization)
             self.assertTrue(loaded.optimize_flags["beast_mode"])
             self.assertFalse(loaded.optimize_flags["entry_size_pct"])
 
@@ -173,6 +176,34 @@ class TestConfigPath(unittest.TestCase):
                     (pd.Timestamp("2026-01-01 00:20:00"), "L3"),
                 ],
             )
+
+    def test_keltner_strategy_and_parameter_optimization_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / self.config.APP_CONFIG_FILENAME
+            settings = self.config.AppSettings(
+                enable_parameter_optimization=False,
+                strategy=self.config.StrategySettings(
+                    strategy_type="keltner_trend",
+                    entry_size_pct=12.5,
+                    keltner_length=34,
+                    keltner_multiplier=1.7,
+                    keltner_use_ema=False,
+                    keltner_band_style="True Range",
+                    keltner_atr_length=21,
+                ),
+            )
+
+            settings.save(config_path)
+            loaded = self.config.AppSettings.load(config_path)
+
+            self.assertFalse(loaded.enable_parameter_optimization)
+            self.assertEqual(loaded.strategy.strategy_type, "keltner_trend")
+            self.assertEqual(loaded.strategy.entry_size_pct, 12.5)
+            self.assertEqual(loaded.strategy.keltner_length, 34)
+            self.assertEqual(loaded.strategy.keltner_multiplier, 1.7)
+            self.assertFalse(loaded.strategy.keltner_use_ema)
+            self.assertEqual(loaded.strategy.keltner_band_style, "True Range")
+            self.assertEqual(loaded.strategy.keltner_atr_length, 21)
 
     def test_legacy_chart_display_days_migrates_to_hours(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

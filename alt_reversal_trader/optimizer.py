@@ -7,7 +7,13 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import time
 import pandas as pd
 
-from .config import DEFAULT_OPTIMIZATION_PROFILE_SCALE, PARAMETER_SPECS, ParameterSpec, StrategySettings
+from .config import (
+    DEFAULT_OPTIMIZATION_PROFILE_SCALE,
+    PARAMETER_SPECS,
+    ParameterSpec,
+    StrategySettings,
+    parameter_spec_applies,
+)
 from .strategy import BacktestResult, StrategyMetrics, prepare_ohlcv, run_backtest, run_backtest_metrics
 
 
@@ -239,16 +245,17 @@ def _value_range(spec: ParameterSpec, base_value, span_pct: float, steps: int, e
 
 
 def _settings_are_valid(settings: StrategySettings) -> bool:
-    if settings.qip_ema_fast >= settings.qip_ema_slow:
-        return False
-    if settings.qtp_ema_fast_len >= settings.qtp_ema_slow_len:
-        return False
-    if settings.qtp_min_pvt_left > settings.qtp_max_pvt_left:
-        return False
-    if settings.qip_rsi_bull_max >= settings.qip_rsi_bear_min:
-        return False
-    if settings.qtp_rsi_bull_max >= settings.qtp_rsi_bear_min:
-        return False
+    if settings.strategy_type == "mean_reversion":
+        if settings.qip_ema_fast >= settings.qip_ema_slow:
+            return False
+        if settings.qtp_ema_fast_len >= settings.qtp_ema_slow_len:
+            return False
+        if settings.qtp_min_pvt_left > settings.qtp_max_pvt_left:
+            return False
+        if settings.qip_rsi_bull_max >= settings.qip_rsi_bear_min:
+            return False
+        if settings.qtp_rsi_bull_max >= settings.qtp_rsi_bear_min:
+            return False
     return True
 
 
@@ -259,13 +266,14 @@ def generate_parameter_grid(
     steps: int,
     max_combinations: int,
 ) -> Tuple[List[StrategySettings], bool]:
+    strategy_type = str(base_settings.strategy_type)
     values_by_key = {
         spec.key: _value_range(
             spec,
             getattr(base_settings, spec.key),
             span_pct=span_pct,
             steps=steps,
-            enabled=bool(optimize_flags.get(spec.key, False)),
+            enabled=bool(optimize_flags.get(spec.key, False)) and parameter_spec_applies(spec, strategy_type),
         )
         for spec in PARAMETER_SPECS
     }

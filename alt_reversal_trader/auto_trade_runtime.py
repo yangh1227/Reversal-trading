@@ -18,6 +18,18 @@ from .strategy import (
 )
 
 
+def _signal_target_fraction(signal: Optional[Dict[str, object]]) -> float:
+    if not signal:
+        return 0.0
+    target = signal.get("target_fraction")
+    if target is not None:
+        return max(0.0, float(target))
+    zone = int(signal.get("zone") or 0)
+    if zone in {1, 2, 3}:
+        return signal_fraction_for_zone(zone)
+    return max(0.0, float(signal.get("fraction") or 0.0))
+
+
 @dataclass(frozen=True)
 class AutoTradeEvaluationResult:
     candidate: Optional[Dict[str, object]] = None
@@ -113,6 +125,8 @@ def resolve_favorable_auto_trade_zone(
     signal = auto_trade_signal_from_backtest(latest_backtest)
     if signal is None:
         return None
+    if not bool(signal.get("supports_favorable_entries", True)):
+        return None
     signal_side = str(signal.get("side") or "")
     if open_position is not None:
         position_side = "long" if float(open_position.amount) > 0 else "short"
@@ -206,6 +220,8 @@ def favorable_auto_trade_fraction(
     signal = auto_trade_signal_from_backtest(latest_backtest)
     if signal is None:
         return 0.0
+    if not bool(signal.get("supports_favorable_entries", True)):
+        return 0.0
     side = str(signal["side"])
     if open_position is not None:
         position_side = "long" if float(open_position.amount) > 0 else "short"
@@ -224,6 +240,9 @@ def inferred_auto_trade_fraction(backtest: BacktestResult, position: Optional[Po
     cursor = backtest.cursor
     if cursor is None or position is None or abs(float(position.amount)) < 1e-12:
         return 0.0
+    direct_fraction = max(0.0, float(getattr(cursor, "last_entry_signal_fraction", 0.0) or 0.0))
+    if direct_fraction > 0.0:
+        return direct_fraction
     side = "long" if float(position.amount) > 0 else "short"
     zone = 0
     signal_side = str(cursor.last_entry_signal_side or "").lower()
@@ -284,6 +303,8 @@ def evaluate_auto_trade_candidate(
     actionable_side = ""
     actionable_zone = 0
     actionable_kind = ""
+    allow_additional_entries = True
+    supports_favorable_entries = True
     if signal is not None:
         signal_price = float(signal["price"])
         zone_prices = dict(signal.get("zone_prices") or {})
@@ -291,6 +312,8 @@ def evaluate_auto_trade_candidate(
         signal_zone = int(signal.get("zone") or 0)
         fraction = float(signal["fraction"])
         cursor_entry_time = signal.get("cursor_entry_time")
+        allow_additional_entries = bool(signal.get("allow_additional_entries", True))
+        supports_favorable_entries = bool(signal.get("supports_favorable_entries", True))
     normalized_trigger_time = pd.Timestamp(trigger_bar_time).tz_localize(None) if trigger_bar_time is not None else None
     confirmed_entry = (
         latest_confirmed_entry_event(latest_backtest, normalized_trigger_time)
@@ -308,8 +331,10 @@ def evaluate_auto_trade_candidate(
         position_side = "long" if float(open_position.amount) > 0 else "short"
         confirmed_side = str(confirmed_entry["side"])
         confirmed_zone = int(confirmed_entry["zone"])
-        confirmed_fraction = signal_fraction_for_zone(confirmed_zone)
+        confirmed_fraction = _signal_target_fraction(signal)
         if (
+            allow_additional_entries
+            and
             confirmed_side == position_side
             and confirmed_zone in {1, 2, 3}
             and confirmed_fraction > float(filled_fraction) + 1e-9
@@ -339,7 +364,7 @@ def evaluate_auto_trade_candidate(
         if fraction <= 1e-9:
             return AutoTradeEvaluationResult()
         if not has_fresh_confirmed_entry:
-            if not allow_favorable_price_entries:
+            if not allow_favorable_price_entries or not supports_favorable_entries:
                 return AutoTradeEvaluationResult()
             favorable_zone, favorable_fraction = favorable_signal_state(
                 side,
@@ -357,7 +382,7 @@ def evaluate_auto_trade_candidate(
     else:
         # 초기 로드 시에는 신호봉이 과거이므로 confirmed_entry여도 현재가 존 검사 적용
         if not has_fresh_confirmed_entry or from_initial_load:
-            if not allow_favorable_price_entries and not from_initial_load:
+            if ((not allow_favorable_price_entries) or (not supports_favorable_entries)) and not from_initial_load:
                 return AutoTradeEvaluationResult()
             if current_price is None or current_price <= 0:
                 return AutoTradeEvaluationResult()
