@@ -180,6 +180,7 @@ def favorable_signal_state(
     signal_price: float,
     zone_prices: Dict[int, float],
     filled_fraction: float,
+    target_fraction: Optional[float] = None,
 ) -> tuple[int, float]:
     favorable_zone = favorable_zone_for_price(
         side,
@@ -189,7 +190,10 @@ def favorable_signal_state(
     )
     if favorable_zone is None:
         return 0, 0.0
-    return favorable_zone, max(0.0, signal_fraction_for_zone(favorable_zone) - float(filled_fraction))
+    zone_fraction = signal_fraction_for_zone(favorable_zone)
+    if target_fraction is not None and float(target_fraction) > 0.0:
+        zone_fraction = max(zone_fraction, float(target_fraction))
+    return favorable_zone, max(0.0, zone_fraction - float(filled_fraction))
 
 
 def zone_favorable_fraction(
@@ -198,6 +202,7 @@ def zone_favorable_fraction(
     signal_price: float,
     zone_prices: Dict[int, float],
     filled_fraction: float,
+    target_fraction: Optional[float] = None,
 ) -> float:
     _favorable_zone, favorable_fraction = favorable_signal_state(
         side,
@@ -205,6 +210,7 @@ def zone_favorable_fraction(
         float(signal_price),
         dict(zone_prices or {}),
         float(filled_fraction),
+        target_fraction=target_fraction,
     )
     return favorable_fraction
 
@@ -233,6 +239,7 @@ def favorable_auto_trade_fraction(
         float(signal["price"]),
         dict(signal.get("zone_prices") or {}),
         float(filled_fraction),
+        target_fraction=_signal_target_fraction(signal),
     )
 
 
@@ -372,6 +379,7 @@ def evaluate_auto_trade_candidate(
                 signal_price,
                 zone_prices,
                 float(filled_fraction),
+                target_fraction=_signal_target_fraction(signal) if not allow_additional_entries else None,
             )
             if favorable_zone <= 0 or favorable_fraction <= 1e-9:
                 return AutoTradeEvaluationResult()
@@ -392,6 +400,7 @@ def evaluate_auto_trade_candidate(
                 signal_price,
                 zone_prices,
                 0.0,
+                target_fraction=_signal_target_fraction(signal) if not allow_additional_entries else None,
             )
             if favorable_zone <= 0 or favorable_fraction <= 1e-9:
                 return AutoTradeEvaluationResult()

@@ -410,7 +410,7 @@ def active_auto_trade_signal(backtest: Optional["BacktestResult"]) -> Optional[D
                 "fraction": target_fraction,
                 "target_fraction": target_fraction,
                 "allow_additional_entries": not _is_keltner_strategy(backtest.settings),
-                "supports_favorable_entries": not _is_keltner_strategy(backtest.settings),
+                "supports_favorable_entries": True,
                 "cursor_entry_time": pd.Timestamp(cursor.entry_time) if cursor.entry_time is not None else None,
             }
     side = str(getattr(cursor, "last_entry_signal_side", "") or "").lower()
@@ -430,7 +430,7 @@ def active_auto_trade_signal(backtest: Optional["BacktestResult"]) -> Optional[D
         "fraction": target_fraction,
         "target_fraction": target_fraction,
         "allow_additional_entries": not _is_keltner_strategy(backtest.settings),
-        "supports_favorable_entries": not _is_keltner_strategy(backtest.settings),
+        "supports_favorable_entries": True,
         "cursor_entry_time": pd.Timestamp(cursor.entry_time) if cursor.entry_time is not None else None,
     }
 

@@ -503,7 +503,7 @@ class BinanceFuturesClient:
         min_qty = filters["marketMinQty"] or filters["minQty"]
         if quantity < min_qty:
             raise RuntimeError(f"{symbol} quantity below minimum ({quantity} < {min_qty})")
-        min_notional = filters["minNotional"]
+        min_notional = max(float(filters["minNotional"] or 0.0), 5.0)
         if min_notional and quantity * market_price < min_notional:
             raise RuntimeError(f"{symbol} order notional below minimum")
         return quantity

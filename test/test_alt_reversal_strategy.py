@@ -880,7 +880,7 @@ def test_keltner_active_signal_uses_entry_size_fraction() -> None:
     assert signal["fraction"] == 0.1
     assert signal["target_fraction"] == 0.1
     assert signal["allow_additional_entries"] is False
-    assert signal["supports_favorable_entries"] is False
+    assert signal["supports_favorable_entries"] is True
 
 
 def test_pine_ema_matches_recursive_reference() -> None:

@@ -9,12 +9,13 @@ import pandas as pd
 
 from alt_reversal_trader.auto_trade_runtime import (
     evaluate_auto_trade_candidate,
+    favorable_auto_trade_fraction,
     favorable_zone_for_price,
     resolve_favorable_auto_trade_zone,
     resolve_latest_auto_trade_backtest,
     zone_favorable_fraction,
 )
-from alt_reversal_trader.binance_futures import PositionSnapshot
+from alt_reversal_trader.binance_futures import BinanceFuturesClient, PositionSnapshot
 from alt_reversal_trader.config import DEFAULT_HISTORY_DAYS, StrategySettings
 from alt_reversal_trader.strategy import BacktestCursor, BacktestResult, StrategyMetrics, TradeRecord, run_backtest
 from alt_reversal_trader.trade_engine import (
@@ -242,7 +243,7 @@ def test_evaluate_auto_trade_candidate_supports_confirmed_keltner_entry() -> Non
     assert result.candidate["fraction"] == 0.1
 
 
-def test_evaluate_auto_trade_candidate_does_not_offer_favorable_keltner_entry() -> None:
+def test_evaluate_auto_trade_candidate_offers_favorable_keltner_entry() -> None:
     history = make_keltner_ohlcv().iloc[:7].reset_index(drop=True)
     settings = StrategySettings(
         strategy_type="keltner_trend",
@@ -268,7 +269,70 @@ def test_evaluate_auto_trade_candidate_does_not_offer_favorable_keltner_entry() 
         remembered_cursor_entry_time=None,
     )
 
-    assert result.candidate is None
+    assert result.signal_kind == "favorable"
+    assert result.candidate is not None
+    assert result.candidate["signal_kind"] == "favorable"
+    assert result.candidate["fraction"] == 0.1
+
+
+def test_keltner_favorable_entry_keeps_configured_entry_size_fraction() -> None:
+    history = make_keltner_ohlcv().iloc[:7].reset_index(drop=True)
+    settings = StrategySettings(
+        strategy_type="keltner_trend",
+        keltner_length=2,
+        keltner_atr_length=2,
+        keltner_multiplier=0.5,
+        keltner_use_ema=False,
+        keltner_band_style="Average True Range",
+        entry_size_pct=99.0,
+    )
+    backtest = run_backtest(history, settings=settings)
+
+    result = evaluate_auto_trade_candidate(
+        symbol="TESTUSDT",
+        interval="1m",
+        score=7.0,
+        strategy_settings=settings,
+        latest_backtest=backtest,
+        current_price=109.0,
+        open_position=None,
+        remembered_interval=None,
+        filled_fraction=0.0,
+        remembered_cursor_entry_time=None,
+    )
+
+    assert result.candidate is not None
+    assert result.signal_kind == "favorable"
+    assert round(float(result.candidate["fraction"]), 2) == 0.99
+    assert round(favorable_auto_trade_fraction(backtest, 109.0, None, 0.0), 2) == 0.99
+
+
+class _FakeOrderSizingClient(BinanceFuturesClient):
+    def get_latest_price(self, symbol: str) -> float:
+        return 1.0
+
+    def get_symbol_filters(self, symbol: str) -> dict[str, float]:
+        return {
+            "pricePrecision": 4,
+            "quantityPrecision": 4,
+            "stepSize": 0.1,
+            "marketStepSize": 0.1,
+            "minQty": 0.1,
+            "marketMinQty": 0.1,
+            "tickSize": 0.1,
+            "minNotional": 0.0,
+        }
+
+
+def test_build_order_quantity_enforces_futures_min_notional_floor() -> None:
+    client = _FakeOrderSizingClient()
+
+    try:
+        client.build_order_quantity("TESTUSDT", usdt_margin=4.9, leverage=1, price=1.0)
+    except RuntimeError as exc:
+        assert "order notional below minimum" in str(exc)
+    else:
+        raise AssertionError("expected minimum notional failure")
 
 
 def test_evaluate_auto_trade_candidate_keeps_favorable_additional_entry_alive_without_real_exit_trade() -> None:
