@@ -1786,3 +1786,48 @@ def test_trade_engine_price_update_triggers_symbol_scoped_auto_trade_eval() -> N
 
     assert engine.latest_stream_price_by_symbol["TESTUSDT"] == 101.5
     assert calls == [{"trigger_symbol": "TESTUSDT", "trigger_interval": "1m"}]
+
+
+def test_trade_engine_price_update_enters_favorable_keltner_immediately() -> None:
+    engine = _TradeEngine(mp.Queue(), mp.Queue())
+    engine.auto_trade_enabled = True
+    engine.auto_trade_use_favorable_price = True
+    engine.client = FakeTickerClient({"TESTUSDT": 109.0})
+    settings = StrategySettings(
+        strategy_type="keltner_trend",
+        keltner_length=2,
+        keltner_atr_length=2,
+        keltner_multiplier=0.5,
+        keltner_use_ema=False,
+        keltner_band_style="Average True Range",
+        entry_size_pct=99.0,
+    )
+    backtest = run_backtest(make_keltner_ohlcv().iloc[:7].reset_index(drop=True), settings=settings)
+    key = ("TESTUSDT", "1m")
+    engine.watchlist[key] = EngineWatchlistItem(
+        symbol="TESTUSDT",
+        interval="1m",
+        score=7.0,
+        return_pct=12.0,
+        strategy_settings=settings,
+    )
+    engine.symbol_states[key] = _EngineSymbolState(
+        symbol="TESTUSDT",
+        interval="1m",
+        strategy_settings=settings,
+        backtest=backtest,
+    )
+    submitted: list[dict[str, object]] = []
+    engine._enqueue_open_order = lambda **kwargs: submitted.append(kwargs)
+
+    engine._handle_price_update(
+        "TESTUSDT",
+        "1m",
+        pd.Timestamp("2026-01-01 00:06:30"),
+        109.0,
+    )
+
+    assert len(submitted) == 1
+    assert submitted[0]["interval"] == "1m"
+    assert submitted[0]["side"] == "BUY"
+    assert round(float(submitted[0]["fraction"]), 2) == 0.99

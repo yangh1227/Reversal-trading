@@ -1871,6 +1871,14 @@ class _TradeEngine:
             if _dbg_trigger and not candidates:
                 print(f"[자동매매 진단] 트리거={trigger_symbol}/{trigger_interval} 봉시각={normalized_trigger_time}: 후보 없음 → 진입 안함")
             return
+        if trigger_symbol and normalized_trigger_time is None:
+            immediate_price = float(self.latest_stream_price_by_symbol.get(str(chosen["symbol"]), 0.0) or 0.0)
+            print(
+                f"[자동매매 즉시감지] {chosen['symbol']}/{chosen['interval']} "
+                f"{chosen.get('signal_kind', 'unknown')} 진입 감지 | "
+                f"side={chosen['side']} | fraction={float(chosen['fraction']):.3f} | "
+                f"price={immediate_price:.6f}"
+            )
         # Remember the cursor entry_time on first entry so we can detect
         # close→reopen cycles on subsequent evaluations.
         symbol = str(chosen["symbol"])
